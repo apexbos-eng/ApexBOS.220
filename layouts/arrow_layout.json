@@ -1,0 +1,2133 @@
+{
+  "version": "v26.1113.01",
+  "layout_filename": "arrow_layout.json",
+  "thanks_text": "Special thanks to the PTC 220 MHz community, field contributors, and testers supporting ApexBOS.220!",
+  "rrdata": {},
+  "inferred_timeout_sec": 180,
+  "train_logic_interval_sec": 7.0,
+  "packet_cache_size": 1000,
+  "elements": [
+    {
+      "id": "T19",
+      "elem_type": "track",
+      "x": 30,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.68,
+      "neighbors": {
+        "W": [
+          "T25"
+        ],
+        "E": [
+          "T20"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T20",
+      "elem_type": "track",
+      "x": 35,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.5,
+      "neighbors": {
+        "E": [
+          "T21"
+        ],
+        "W": [
+          "T19"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T21",
+      "elem_type": "track",
+      "x": 40,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.25,
+      "neighbors": {
+        "W": [
+          "T21_2"
+        ],
+        "E": [
+          "T21_2"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T22",
+      "elem_type": "track",
+      "x": 46,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.5,
+      "neighbors": {
+        "W": [
+          "W5"
+        ],
+        "E": [
+          "T26"
+        ]
+      },
+      "parallel_track_id": "T33",
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "S1",
+      "elem_type": "signal",
+      "x": 29,
+      "y": 9,
+      "label": "Nevada_CP",
+      "label_pos": "bottom",
+      "wiu_id": 734050256610,
+      "radio_id": null,
+      "gps": [
+        34.063492,
+        -117.208553
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "T19",
+      "rear_element": "T25",
+      "governed_route": null,
+      "sig_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S2",
+      "elem_type": "signal",
+      "x": 34,
+      "y": 9,
+      "label": "SanGab 64.8",
+      "label_pos": "bottom",
+      "wiu_id": 734050257210,
+      "radio_id": null,
+      "gps": [
+        34.059833,
+        -117.19554
+      ],
+      "mile_marker": 64.8,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "T20",
+      "rear_element": "T19",
+      "governed_route": null,
+      "sig_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S3",
+      "elem_type": "signal",
+      "x": 40,
+      "y": 9,
+      "label": "SanGab MP65.6",
+      "label_pos": "bottom",
+      "wiu_id": 734050257810,
+      "radio_id": null,
+      "gps": [
+        34.059084,
+        -117.182842
+      ],
+      "mile_marker": 65.6,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "T21_2",
+      "rear_element": "T21",
+      "governed_route": null,
+      "sig_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S4",
+      "elem_type": "signal",
+      "x": 43,
+      "y": 10,
+      "label": "Zanja",
+      "label_pos": "bottom",
+      "wiu_id": 734050209510,
+      "radio_id": null,
+      "gps": [
+        34.059035,
+        -117.179039
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "W5",
+      "rear_element": "T21_2",
+      "governed_route": null,
+      "sig_bit_offset": 4,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S7",
+      "elem_type": "signal",
+      "x": 36,
+      "y": 6,
+      "label": "SanGab 65.3",
+      "label_pos": "top",
+      "wiu_id": 734050257510,
+      "radio_id": null,
+      "gps": [
+        34.059104,
+        -117.186088
+      ],
+      "mile_marker": 65.3,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "T20",
+      "rear_element": "T21",
+      "governed_route": null,
+      "sig_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S8",
+      "elem_type": "signal",
+      "x": 32,
+      "y": 6,
+      "label": "SanGab 64.6",
+      "label_pos": "top",
+      "wiu_id": 734050256910,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": 64.6,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "T19",
+      "rear_element": "T20",
+      "governed_route": null,
+      "sig_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S10",
+      "elem_type": "signal",
+      "x": 46,
+      "y": 6,
+      "label": "Zanja",
+      "label_pos": "top",
+      "wiu_id": 734050209510,
+      "radio_id": null,
+      "gps": [
+        34.05893,
+        -117.166569
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "W5",
+      "rear_element": "T22",
+      "governed_route": null,
+      "sig_bit_offset": 9,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "T25",
+      "elem_type": "track",
+      "x": 25,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": 60.1,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 1.81,
+      "neighbors": {
+        "E": [
+          "T19"
+        ],
+        "W": [
+          "W2"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T26",
+      "elem_type": "track",
+      "x": 50,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.5,
+      "neighbors": {
+        "W": [
+          "T22"
+        ],
+        "E": [
+          "W6"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "ST1",
+      "elem_type": "station",
+      "x": 38,
+      "y": 10,
+      "label": "Downtown Redlands",
+      "label_pos": "bottom",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.059011,
+        -117.183236
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "",
+      "width": 0,
+      "height": 0
+    },
+    {
+      "id": "Nevada",
+      "elem_type": "crossing",
+      "x": 25,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": 65.2,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "monitored_tracks": [
+        "T19",
+        "T20"
+      ]
+    },
+    {
+      "id": "WL1",
+      "elem_type": "address_table",
+      "x": 63,
+      "y": -6,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "100",
+      "width": 450,
+      "height": 1024
+    },
+    {
+      "id": "PL1",
+      "elem_type": "packet_scroller",
+      "x": -12,
+      "y": 16,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "15",
+      "width": 580,
+      "height": 195
+    },
+    {
+      "id": "TL1",
+      "elem_type": "train_scroller",
+      "x": 23,
+      "y": 14,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "10",
+      "width": 520,
+      "height": 120
+    },
+    {
+      "id": "ST2",
+      "elem_type": "station",
+      "x": 56,
+      "y": 7,
+      "label": "University",
+      "label_pos": "right",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.058943,
+        -117.16578
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "",
+      "width": 0,
+      "height": 0
+    },
+    {
+      "id": "Arrow SCAX, Redlands",
+      "elem_type": "label",
+      "x": 32,
+      "y": -5,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "",
+      "width": 0,
+      "height": 0
+    },
+    {
+      "id": "S11",
+      "elem_type": "signal",
+      "x": 23,
+      "y": 7,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": 734050209210,
+      "radio_id": null,
+      "gps": [
+        34.065838,
+        -117.219797
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "W2",
+      "rear_element": "T25",
+      "governed_route": null,
+      "sig_bit_offset": 7,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "W2",
+      "elem_type": "turnout",
+      "x": 21,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050209210,
+      "radio_id": null,
+      "gps": [
+        34.065744,
+        -117.220465
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "common_neighbor": "T25",
+      "normal_neighbor": "T28_2",
+      "reverse_neighbor": "T27_2",
+      "orientation": "W",
+      "normal_dir": "W",
+      "reverse_dir": "SW",
+      "cmd_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "guarded_by_signals": [
+        "S14",
+        "S13",
+        "S15",
+        "S11"
+      ]
+    },
+    {
+      "id": "T27",
+      "elem_type": "track",
+      "x": 13,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 1.46,
+      "neighbors": {
+        "W": [
+          "W3"
+        ],
+        "E": [
+          "T27_2"
+        ]
+      },
+      "parallel_track_id": "T28",
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T28",
+      "elem_type": "track",
+      "x": 13,
+      "y": 10,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 1.06,
+      "neighbors": {
+        "W": [
+          "W3"
+        ],
+        "E": [
+          "T28_2"
+        ]
+      },
+      "parallel_track_id": "T27",
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "S13",
+      "elem_type": "signal",
+      "x": 18,
+      "y": 7,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050209210,
+      "radio_id": null,
+      "gps": [
+        34.065824,
+        -117.221975
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "W2",
+      "rear_element": "T27_2",
+      "governed_route": null,
+      "sig_bit_offset": 12,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S14",
+      "elem_type": "signal",
+      "x": 18,
+      "y": 11,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": 734050209210,
+      "radio_id": null,
+      "gps": [
+        34.065742,
+        -117.221966
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "W2",
+      "rear_element": "T28_2",
+      "governed_route": null,
+      "sig_bit_offset": 2,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S15",
+      "elem_type": "signal",
+      "x": 23,
+      "y": 6,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050209210,
+      "radio_id": null,
+      "gps": [
+        34.065838,
+        -117.219797
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "bottom",
+      "direction": "W",
+      "protects_element": "W2",
+      "rear_element": "T25",
+      "governed_route": null,
+      "sig_bit_offset": 7,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "W3",
+      "elem_type": "turnout",
+      "x": 9,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050208910,
+      "radio_id": null,
+      "gps": [
+        34.073568,
+        -117.256077
+      ],
+      "mile_marker": 61.1,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "common_neighbor": "T29",
+      "normal_neighbor": "T27",
+      "reverse_neighbor": "T28",
+      "orientation": "E",
+      "normal_dir": "E",
+      "reverse_dir": "SE",
+      "cmd_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "guarded_by_signals": [
+        "S17",
+        "S16",
+        "S18",
+        "S19"
+      ]
+    },
+    {
+      "id": "T29",
+      "elem_type": "track",
+      "x": 6,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 1.46,
+      "neighbors": {
+        "E": [
+          "W3"
+        ],
+        "W": [
+          "T1A"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "S16",
+      "elem_type": "signal",
+      "x": 7,
+      "y": 10,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": 734050208910,
+      "radio_id": null,
+      "gps": [
+        34.073572,
+        -117.259336
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "W3",
+      "rear_element": "T29",
+      "governed_route": null,
+      "sig_bit_offset": 2,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S17",
+      "elem_type": "signal",
+      "x": 7,
+      "y": 9,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050208910,
+      "radio_id": null,
+      "gps": [
+        34.073608,
+        -117.25932
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "bottom",
+      "direction": "E",
+      "protects_element": "W3",
+      "rear_element": "T29",
+      "governed_route": null,
+      "sig_bit_offset": 2,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S18",
+      "elem_type": "signal",
+      "x": 12,
+      "y": 7,
+      "label": "Richardson",
+      "label_pos": "top",
+      "wiu_id": 734050208910,
+      "radio_id": null,
+      "gps": [
+        34.073648,
+        -117.254728
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "W3",
+      "rear_element": "T27",
+      "governed_route": null,
+      "sig_bit_offset": 7,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S19",
+      "elem_type": "signal",
+      "x": 12,
+      "y": 11,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": 734050208910,
+      "radio_id": null,
+      "gps": [
+        34.07343,
+        -117.254733
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "W3",
+      "rear_element": "T28",
+      "governed_route": null,
+      "sig_bit_offset": 12,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "ST3",
+      "elem_type": "station",
+      "x": 7,
+      "y": 6,
+      "label": "Tipicanoue",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.073621,
+        -117.260481
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "",
+      "width": 0,
+      "height": 0
+    },
+    {
+      "id": "X1",
+      "elem_type": "crossing",
+      "x": 8,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.073524,
+        -117.259792
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "monitored_tracks": [
+        "T29",
+        "W3"
+      ]
+    },
+    {
+      "id": "B1",
+      "elem_type": "base",
+      "x": 52,
+      "y": 2,
+      "label": "Running_Springs",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": 4718906,
+      "gps": [
+        34.1892,
+        -117.099718
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "channel": 102
+    },
+    {
+      "id": "B2",
+      "elem_type": "base",
+      "x": -3,
+      "y": 1,
+      "label": "San Bernardino",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": 1594504,
+      "gps": [
+        34.103883,
+        -117.326775
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "channel": 102
+    },
+    {
+      "id": "B3",
+      "elem_type": "base",
+      "x": 29,
+      "y": -17,
+      "label": "Crestline",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": 1594503,
+      "gps": [
+        34.236642,
+        -117.314008
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "channel": 102
+    },
+    {
+      "id": "DT1",
+      "elem_type": "ptc_datetime",
+      "x": 5,
+      "y": 1,
+      "label": "PTC Clock",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "width": 300,
+      "height": 50,
+      "last_datetime_str": "2026-11-09 15:51:03 UTC",
+      "year": 2026,
+      "month": 11,
+      "day": 9,
+      "hour": 15,
+      "minute": 51,
+      "second": 3,
+      "last_source_wiu": 1594503
+    },
+    {
+      "id": "L1",
+      "elem_type": "label",
+      "x": 26,
+      "y": 25,
+      "label": "RTL SDR LOC",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.036516,
+        -117.231181
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "",
+      "width": 0,
+      "height": 0
+    },
+    {
+      "id": "T6A",
+      "elem_type": "track",
+      "x": -5,
+      "y": -1,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.5,
+      "neighbors": {
+        "SE": [
+          "T5A"
+        ],
+        "W": [
+          "W4"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T5A",
+      "elem_type": "track",
+      "x": -3,
+      "y": 0,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "NW-SE",
+      "length_miles": 0.5,
+      "neighbors": {
+        "SE": [
+          "T3A"
+        ],
+        "NW": [
+          "T6A"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T3A",
+      "elem_type": "track",
+      "x": -2,
+      "y": 2,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "N-S",
+      "length_miles": 0.5,
+      "neighbors": {
+        "S": [
+          "T4A"
+        ],
+        "NW": [
+          "T5A"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "S4A",
+      "elem_type": "signal",
+      "x": -3,
+      "y": 2,
+      "label": "Mill",
+      "label_pos": "top",
+      "wiu_id": 734050255410,
+      "radio_id": null,
+      "gps": [
+        34.092437,
+        -117.283266
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "S",
+      "protects_element": "T3A",
+      "rear_element": "T5A",
+      "governed_route": null,
+      "sig_bit_offset": 5,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S5A",
+      "elem_type": "signal",
+      "x": -3,
+      "y": 6,
+      "label": "Waterman",
+      "label_pos": "top",
+      "wiu_id": 734050255710,
+      "radio_id": null,
+      "gps": [
+        34.0777,
+        -117.278385
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "S",
+      "protects_element": "T4A",
+      "rear_element": "T3A",
+      "governed_route": null,
+      "sig_bit_offset": 5,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S2A",
+      "elem_type": "signal",
+      "x": -1,
+      "y": 6,
+      "label": "Waterman",
+      "label_pos": "top",
+      "wiu_id": 734050255710,
+      "radio_id": null,
+      "gps": [
+        34.07774,
+        -117.278406
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "N",
+      "protects_element": "T3A",
+      "rear_element": "T4A",
+      "governed_route": null,
+      "sig_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S3A",
+      "elem_type": "signal",
+      "x": -1,
+      "y": 1,
+      "label": "Mill",
+      "label_pos": "top",
+      "wiu_id": 734050255410,
+      "radio_id": null,
+      "gps": [
+        34.092421,
+        -117.283183
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "N",
+      "protects_element": "T5A",
+      "rear_element": "T3A",
+      "governed_route": null,
+      "sig_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S1A",
+      "elem_type": "signal",
+      "x": 3,
+      "y": 7,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050256010,
+      "radio_id": null,
+      "gps": [
+        34.073625,
+        -117.262389
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "T1A",
+      "rear_element": "T29",
+      "governed_route": null,
+      "sig_bit_offset": 5,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "T1A",
+      "elem_type": "track",
+      "x": 2,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.5,
+      "neighbors": {
+        "W": [
+          "T2A"
+        ],
+        "E": [
+          "T29"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T2A",
+      "elem_type": "track",
+      "x": -1,
+      "y": 7,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "NW-SE",
+      "length_miles": 0.5,
+      "neighbors": {
+        "NW": [
+          "T4A"
+        ],
+        "E": [
+          "T1A"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T4A",
+      "elem_type": "track",
+      "x": -2,
+      "y": 5,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "N-S",
+      "length_miles": 0.5,
+      "neighbors": {
+        "N": [
+          "T3A"
+        ],
+        "SE": [
+          "T2A"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T30",
+      "elem_type": "track",
+      "x": -10,
+      "y": -1,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.58,
+      "neighbors": {
+        "W": [
+          "T31"
+        ],
+        "E": [
+          "W4"
+        ]
+      },
+      "parallel_track_id": "T32",
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T31",
+      "elem_type": "track",
+      "x": -13,
+      "y": -1,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.5,
+      "neighbors": {
+        "E": [
+          "T30"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "SB DnTwn",
+      "elem_type": "station",
+      "x": -13,
+      "y": -4,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "",
+      "width": 0,
+      "height": 0
+    },
+    {
+      "id": "S20",
+      "elem_type": "signal",
+      "x": -12,
+      "y": 0,
+      "label": "Morris",
+      "label_pos": "top",
+      "wiu_id": 734050208410,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "T31",
+      "rear_element": "T30",
+      "governed_route": null,
+      "sig_bit_offset": 32,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "T32",
+      "elem_type": "track",
+      "x": -11,
+      "y": -3,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 1.38,
+      "neighbors": {
+        "E": [
+          "W4"
+        ]
+      },
+      "parallel_track_id": "T6A",
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "W4",
+      "elem_type": "turnout",
+      "x": -6,
+      "y": -1,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050208610,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "common_neighbor": "T6A",
+      "normal_neighbor": "T30",
+      "reverse_neighbor": "T32",
+      "orientation": "W",
+      "normal_dir": "W",
+      "reverse_dir": "NW",
+      "cmd_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "guarded_by_signals": [
+        "S23",
+        "S22",
+        "S24",
+        "S25"
+      ]
+    },
+    {
+      "id": "S22",
+      "elem_type": "signal",
+      "x": -5,
+      "y": -3,
+      "label": "Zemu",
+      "label_pos": "top",
+      "wiu_id": 734050208610,
+      "radio_id": null,
+      "gps": [
+        34.099795,
+        -117.292134
+      ],
+      "mile_marker": 57.7,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "W4",
+      "rear_element": "T6A",
+      "governed_route": null,
+      "sig_bit_offset": 16,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S23",
+      "elem_type": "signal",
+      "x": -5,
+      "y": -2,
+      "label": "Zemu",
+      "label_pos": "bottom",
+      "wiu_id": 734050208610,
+      "radio_id": null,
+      "gps": [
+        34.099773,
+        -117.292139
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "bottom",
+      "direction": "W",
+      "protects_element": "W4",
+      "rear_element": "T6A",
+      "governed_route": null,
+      "sig_bit_offset": 16,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S24",
+      "elem_type": "signal",
+      "x": -9,
+      "y": -4,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050208610,
+      "radio_id": null,
+      "gps": [
+        34.099849,
+        -117.294475
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "W4",
+      "rear_element": "T32",
+      "governed_route": null,
+      "sig_bit_offset": 11,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S25",
+      "elem_type": "signal",
+      "x": -9,
+      "y": 0,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": 734050208610,
+      "radio_id": null,
+      "gps": [
+        34.09976,
+        -117.294475
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "W4",
+      "rear_element": "T30",
+      "governed_route": null,
+      "sig_bit_offset": 6,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "T27_2",
+      "elem_type": "track",
+      "x": 17,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 1.46,
+      "neighbors": {
+        "E": [
+          "W2"
+        ],
+        "W": [
+          "T27"
+        ]
+      },
+      "parallel_track_id": "T28_2",
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T28_2",
+      "elem_type": "track",
+      "x": 17,
+      "y": 10,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 1.06,
+      "neighbors": {
+        "E": [
+          "W2"
+        ],
+        "W": [
+          "T28"
+        ]
+      },
+      "parallel_track_id": "T27_2",
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "S27",
+      "elem_type": "signal",
+      "x": 15,
+      "y": 11,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050256310,
+      "radio_id": null,
+      "gps": [
+        34.071403,
+        -117.243934
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "T28",
+      "rear_element": "T28_2",
+      "governed_route": null,
+      "sig_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S29",
+      "elem_type": "signal",
+      "x": 15,
+      "y": 6,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": 734050256310,
+      "radio_id": null,
+      "gps": [
+        34.071359,
+        -117.244058
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "T27",
+      "rear_element": "T27_2",
+      "governed_route": null,
+      "sig_bit_offset": 15,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S30",
+      "elem_type": "signal",
+      "x": 15,
+      "y": 7,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": 734050256310,
+      "radio_id": null,
+      "gps": [
+        34.07135,
+        -117.243988
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "T27_2",
+      "rear_element": "T27",
+      "governed_route": null,
+      "sig_bit_offset": 5,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S31",
+      "elem_type": "signal",
+      "x": 15,
+      "y": 12,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": 734050256310,
+      "radio_id": null,
+      "gps": [
+        34.071581,
+        -117.244084
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "T28_2",
+      "rear_element": "T28",
+      "governed_route": null,
+      "sig_bit_offset": 10,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "CH1",
+      "elem_type": "chat",
+      "x": 3,
+      "y": -11,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "25",
+      "width": 700,
+      "height": 220
+    },
+    {
+      "id": "ST4",
+      "elem_type": "station",
+      "x": 33,
+      "y": 6,
+      "label": "ESRI",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.05998,
+        -117.196393
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "extra_info": "",
+      "width": 0,
+      "height": 0
+    },
+    {
+      "id": "W5",
+      "elem_type": "turnout",
+      "x": 44,
+      "y": 8,
+      "label": "Zanja",
+      "label_pos": "top",
+      "wiu_id": 734050209510,
+      "radio_id": null,
+      "gps": [
+        34.05904,
+        -117.178886
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "common_neighbor": "T21_2",
+      "normal_neighbor": "T22",
+      "reverse_neighbor": "T33",
+      "orientation": "E",
+      "normal_dir": "E",
+      "reverse_dir": "SE",
+      "cmd_bit_offset": 0,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "guarded_by_signals": [
+        "S4",
+        "S33",
+        "S10",
+        "S34"
+      ]
+    },
+    {
+      "id": "T33",
+      "elem_type": "track",
+      "x": 47,
+      "y": 10,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.058973,
+        -117.177768
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.62,
+      "neighbors": {
+        "W": [
+          "W5"
+        ]
+      },
+      "parallel_track_id": "T22",
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "S33",
+      "elem_type": "signal",
+      "x": 43,
+      "y": 9,
+      "label": "Zanja",
+      "label_pos": "top",
+      "wiu_id": 734050209510,
+      "radio_id": null,
+      "gps": [
+        34.059035,
+        -117.179039
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "bottom",
+      "direction": "E",
+      "protects_element": "W5",
+      "rear_element": "T21_2",
+      "governed_route": null,
+      "sig_bit_offset": 4,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "T21_2",
+      "elem_type": "track",
+      "x": 42,
+      "y": 8,
+      "label": "",
+      "label_pos": "top",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.8,
+      "neighbors": {
+        "E": [
+          "W5"
+        ],
+        "W": [
+          "T21"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "S34",
+      "elem_type": "signal",
+      "x": 46,
+      "y": 12,
+      "label": "Zanja",
+      "label_pos": "top",
+      "wiu_id": 734050209510,
+      "radio_id": null,
+      "gps": [
+        34.058948,
+        -117.17792
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "W5",
+      "rear_element": "T33",
+      "governed_route": null,
+      "sig_bit_offset": 14,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "W6",
+      "elem_type": "turnout",
+      "x": 52,
+      "y": 8,
+      "label": "University",
+      "label_pos": "top",
+      "wiu_id": 734050209810,
+      "radio_id": null,
+      "gps": [
+        34.05887,
+        -117.168044
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "common_neighbor": "T26",
+      "normal_neighbor": "T36",
+      "reverse_neighbor": "T35",
+      "orientation": "E",
+      "normal_dir": "E",
+      "reverse_dir": "SE",
+      "cmd_bit_offset": 2,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "guarded_by_signals": [
+        "T35",
+        "S36",
+        "S35",
+        "S39",
+        "S38"
+      ]
+    },
+    {
+      "id": "T35",
+      "elem_type": "track",
+      "x": 56,
+      "y": 10,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.88,
+      "neighbors": {
+        "W": [
+          "W6"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "T36",
+      "elem_type": "track",
+      "x": 56,
+      "y": 8,
+      "label": "",
+      "label_pos": "bottom",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": null,
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "orientation": "E-W",
+      "length_miles": 0.88,
+      "neighbors": {
+        "W": [
+          "W6"
+        ]
+      },
+      "parallel_track_id": null,
+      "has_occ_bit": false,
+      "occ_bit_offset": null
+    },
+    {
+      "id": "S35",
+      "elem_type": "signal",
+      "x": 50,
+      "y": 5,
+      "label": "University",
+      "label_pos": "top",
+      "wiu_id": 734050209810,
+      "radio_id": null,
+      "gps": [
+        34.05891,
+        -117.168452
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "E",
+      "protects_element": "W6",
+      "rear_element": "T26",
+      "governed_route": null,
+      "sig_bit_offset": 6,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S36",
+      "elem_type": "signal",
+      "x": 50,
+      "y": 6,
+      "label": "University",
+      "label_pos": "bottom",
+      "wiu_id": 734050209810,
+      "radio_id": null,
+      "gps": [
+        34.05891,
+        -117.168452
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "bottom",
+      "direction": "E",
+      "protects_element": "W6",
+      "rear_element": "T26",
+      "governed_route": null,
+      "sig_bit_offset": 6,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S38",
+      "elem_type": "signal",
+      "x": 55,
+      "y": 7,
+      "label": "University",
+      "label_pos": "bottom",
+      "wiu_id": 734050209810,
+      "radio_id": null,
+      "gps": [
+        34.05891,
+        -117.168452
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "W6",
+      "rear_element": "T36",
+      "governed_route": null,
+      "sig_bit_offset": 11,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "S39",
+      "elem_type": "signal",
+      "x": 55,
+      "y": 12,
+      "label": "University",
+      "label_pos": "top",
+      "wiu_id": 734050209810,
+      "radio_id": null,
+      "gps": [
+        34.05891,
+        -117.168452
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "position": "top",
+      "direction": "W",
+      "protects_element": "W6",
+      "rear_element": "T35",
+      "governed_route": null,
+      "sig_bit_offset": 16,
+      "has_occ_bit": false,
+      "occ_bit_offset": null,
+      "signal_rules": "",
+      "signal_override": ""
+    },
+    {
+      "id": "X2",
+      "elem_type": "crossing",
+      "x": -2,
+      "y": 2,
+      "label": "E Mill St",
+      "label_pos": "left",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.09221,
+        -117.283207
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "monitored_tracks": [
+        "T5A",
+        "T4A"
+      ]
+    },
+    {
+      "id": "X4",
+      "elem_type": "crossing",
+      "x": -2,
+      "y": 4,
+      "label": "Waterman",
+      "label_pos": "left",
+      "wiu_id": null,
+      "radio_id": null,
+      "gps": [
+        34.077793,
+        -117.278734
+      ],
+      "mile_marker": null,
+      "ctc_id": "",
+      "ctc_rules": "",
+      "monitored_tracks": [
+        "T4A",
+        "T3A"
+      ]
+    }
+  ],
+  "scroller": {
+    "x": -12,
+    "y": 16,
+    "max_len": 15,
+    "width": 580,
+    "height": 195
+  },
+  "address_table": {
+    "x": 63,
+    "y": -6,
+    "max_len": 100,
+    "width": 450,
+    "height": 1024
+  },
+  "train_scroller": {
+    "x": 23,
+    "y": 14,
+    "max_len": 10,
+    "width": 520,
+    "height": 120
+  },
+  "chat": {
+    "x": 3,
+    "y": -11,
+    "max_len": 25,
+    "width": 700,
+    "height": 220
+  }
+}

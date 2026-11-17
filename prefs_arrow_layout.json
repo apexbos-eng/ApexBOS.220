@@ -1,0 +1,36 @@
+{
+  "version": "v26.1113.01",
+  "layout_filename": "arrow_layout.json",
+  "updated_at": "2026-11-16 20:32:35",
+  "element_overrides": {
+    "SYS_CHAT": {
+      "width": 1228,
+      "height": 329,
+      "x": -17.0,
+      "y": -19.5
+    },
+    "SYS_ADDRESS_TABLE": {
+      "x": 62.0,
+      "y": -10.5,
+      "width": 699,
+      "height": 1012
+    },
+    "SYS_PACKET_SCROLLER": {
+      "x": -16.5,
+      "y": 25.0,
+      "width": 1014,
+      "height": 319
+    },
+    "SYS_TRAIN_SCROLLER": {
+      "x": 16.5,
+      "y": 17.0,
+      "width": 726,
+      "height": 196
+    }
+  },
+  "view_state": {
+    "cam_x": 381.89,
+    "cam_y": 382.2,
+    "zoom": 0.675
+  }
+}

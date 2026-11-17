@@ -1,0 +1,106 @@
+[
+    {
+        "type": "u8",
+        "name": "Prefix"
+    },
+    {
+        "type": "u16",
+        "name": "PacketSize"
+    },
+    {
+        "type": "u8",
+        "name": "Type 0x",
+        "expected": 2,
+        "format": "x"
+    },
+    {
+        "type": "skip",
+        "length": 1
+    },
+    {
+        "type": "u8",
+        "name": "Flags 0x"
+    },
+    {
+        "type": "int_bits",
+        "name": "_node_id_",
+        "length": 24,
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "_src_id_",
+        "expression": "_node_id_"
+    },
+    {
+        "type": "i32",
+        "name": "int_lat",
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "lat",
+        "expression": "0.000001667 * int_lat",
+        "format": "f"
+    },
+    {
+        "type": "i32",
+        "name": "int_lon",
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "lon",
+        "expression": "0.000001667 * int_lon",
+        "format": "f"
+    },
+    {
+        "type": "u8",
+        "name": "Chan"
+    },
+    {
+        "type": "u8",
+        "name": "Rate",
+        "lookup": {
+            "1": "HR",
+            "2": "FR"
+        }
+    },
+    {
+        "type": "u8",
+        "name": "Busy"
+    },
+    {
+        "type": "skip",
+        "length": 1
+    },
+    {
+        "type": "u8",
+        "name": "chan_1"
+    },
+    {
+        "type": "u8",
+        "name": "chan_2"
+    },
+    {
+        "type": "u8",
+        "name": "chan_3"
+    },
+    {
+        "type": "u8",
+        "name": "chan_4"
+    },
+    {
+        "type": "u8",
+        "name": "chan_5"
+    },
+    {
+        "type": "u8",
+        "name": "chan_6"
+    },
+    {
+        "type": "printf",
+        "name": "_scroll_ptc_",
+        "format": "Base Packet: ID: {_node_id_}, ({lat},{lon}) on {Chan}({Rate}):{chan_1},{chan_2},{chan_3},{chan_4},{chan_5},{chan_6}"
+    }
+]

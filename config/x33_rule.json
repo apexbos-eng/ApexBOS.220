@@ -1,0 +1,76 @@
+[
+    {
+        "type": "u8",
+        "name": "Prefix"
+    },
+    {
+        "type": "u16",
+        "name": "PacketSize"
+    },
+    {
+        "type": "u8",
+        "name": "Type",
+        "format": "x",
+        "expected_in": [
+            51,
+            52
+        ]
+    },
+    {
+        "type": "u8",
+        "name": "Channel"
+    },
+    {
+        "type": "int_bits",
+        "name": "_node_id_",
+        "length": 40,
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "_src_id_",
+        "expression": "_node_id_"
+    },
+    {
+        "type": "int_bits",
+        "name": "skip",
+        "length": 16,
+        "format": "b"
+    },
+    {
+        "type": "u8",
+        "name": "_sequence_"
+    },
+    {
+        "type": "calc",
+        "name": "st_ptr_bit",
+        "expression": "__cur_bit__"
+    },
+    {
+        "type": "int_bits",
+        "name": "_packet_rules_",
+        "length": "end",
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "en_ptr_bit",
+        "expression": "__cur_bit__"
+    },
+    {
+        "type": "calc",
+        "name": "_base_",
+        "expression": "en_ptr_bit - st_ptr_bit"
+    },
+    {
+        "type":"calc",
+        "name":"pr",
+        "expression": "_packet_rules_",
+        "format": "b"
+    },
+    {
+        "type": "printf",
+        "name": "_scroll_ptc_",
+        "format": "Packet: {Type}, Addr: {_node_id_}, Rules: {pr}"
+    }
+]

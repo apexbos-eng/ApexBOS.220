@@ -1,0 +1,193 @@
+{
+  "version": "v26.1113.01",
+  "common": {
+    "deployment_mode": "local",
+    "packet_source": "flux",
+    "banc_location": "none",
+    "ip_version": "ipv4",
+    "banc": {
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 23009,
+      "ui_port": 23010,
+      "auth_secret": "",
+      "encryption_key": "",
+      "identity": "ApexNode_d1b7b416",
+      "banc_initial_history_sec": 60
+    },
+    "multicast": {
+      "flux_group": "239.1.1.1",
+      "flux_port": 23003,
+      "engine_group": "224.1.1.1",
+      "engine_port": 5007,
+      "interface": "0.0.0.0"
+    }
+  },
+  "grabber": {
+    "channels": [
+      77,
+      81,
+      85,
+      89,
+      91,
+      92,
+      93,
+      101,
+      102,
+      107,
+      108,
+      113,
+      114,
+      124,
+      125,
+      126,
+      127,
+      128,
+      131,
+      132,
+      134,
+      141,
+      142,
+      147,
+      153,
+      154,
+      165,
+      166,
+      167,
+      171,
+      172
+    ],
+    "chans": "77, 81, 85, 89, 91, 92, 93, 101, 102, 107, 108, 113, 114, 124, 125, 126, 127, 128, 131, 132, 134, 141, 142, 147, 153, 154, 165, 166, 167, 171, 172",
+    "locked_channels": [],
+    "process_count": 2,
+    "procs": "18077,18081",
+    "ports": [
+      18077,
+      18081
+    ],
+    "base_zmq_port": 18077,
+    "sample_rate": 2048000,
+    "gain": "auto",
+    "ppm": 0,
+    "frequency_correction": 0,
+    "auto_tune": false,
+    "bias_t": true,
+    "bias_tee": 1,
+    "device": 0,
+    "sdr_mode": "auto",
+    "rtl_sdr_bin": null,
+    "rtl_tcp_bin": null,
+    "rtlsdr_dll_dir": null,
+    "rtl_tcp_host": "127.0.0.1",
+    "rtl_tcp_port": 1234,
+    "dedup_ttl": 0.4,
+    "processes": [
+      {
+        "index": 0,
+        "device": 0,
+        "ppm": 0,
+        "gain": "auto",
+        "zmq_port": 18077
+      },
+      {
+        "index": 1,
+        "device": 0,
+        "ppm": 0,
+        "gain": "auto",
+        "zmq_port": 18081
+      }
+    ]
+  },
+  "flux": {
+    "sources": "127.0.0.1:18077, 127.0.0.1:18081",
+    "command_port": 56781,
+    "burst_max_packets": 100,
+    "burst_interval_sec": 120,
+    "multicast_group": "239.1.1.1",
+    "multicast_port": 23003,
+    "cloud_server": "None",
+    "cloud_port": 0,
+    "auth_secret": "",
+    "encryption_key": ""
+  },
+  "engine": {
+    "default_layout": "layouts/arrow_layout.json",
+    "layout_port": 5008,
+    "mcast_group": "224.1.1.1",
+    "mcast_port": 5007,
+    "dedup_ttl": 0.4,
+    "time_scale": 360.0,
+    "inferred_timeout_sec": 120,
+    "train_logic_interval_sec": 7.0,
+    "parsers": [
+      "x33_rule.json",
+      "x2_base_rules.json",
+      "x01_rules.json",
+      "x05_rules.json",
+      "x70_rules.json",
+      "x06_rules.json",
+      "x04_rules.json"
+    ],
+    "connections": {
+      "mcast_group": "239.1.1.1",
+      "mcast_port": 23003,
+      "banc_host": "none",
+      "banc_port": "none",
+      "auth_secret": "",
+      "encryption_key": "",
+      "identity": "ApexNode_d1b7b416",
+      "banc_initial_history_sec": 60
+    }
+  },
+  "viewer": {
+    "default_layout": "layouts/arrow_layout.json",
+    "engine_host": "127.0.0.1",
+    "engine_port": 5008,
+    "mcast_group": "224.1.1.1",
+    "mcast_port": 5007,
+    "stale_timeout": 120.0,
+    "banc_host": "none",
+    "banc_port": 23009,
+    "auth_secret": "",
+    "encryption_key": "",
+    "identity": "ApexNode_d1b7b416"
+  },
+  "creator": {
+    "db_path": "wius.db",
+    "default_layout": "layouts/arrow_layout.json",
+    "banc_host": "none",
+    "banc_port": 23009,
+    "auth_secret": "",
+    "encryption_key": "",
+    "identity": "ApexNode_d1b7b416"
+  },
+  "banc": {
+    "port": 23009,
+    "ui_port": 23010,
+    "auth_secret": "",
+    "encryption_key": "",
+    "whitelist_file": "whitelist.txt",
+    "db_path": "banc.db",
+    "db_retention_sec": 86400,
+    "stats_interval_sec": 300,
+    "bind_host": "0.0.0.0",
+    "mirrors": []
+  },
+  "spy": {
+    "connect_endpoints": "127.0.0.1:18077, 127.0.0.1:18081",
+    "dvr_size": 2000,
+    "filter_channel": "",
+    "rules": [
+      "x33_rule.json",
+      "x2_base_rules.json",
+      "x01_rules.json",
+      "x05_rules.json",
+      "x70_rules.json",
+      "x06_rules.json",
+      "x04_rules.json"
+    ]
+  },
+  "packfig": {
+    "default_rules": "signals_default.json"
+  }
+}

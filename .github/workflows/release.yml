@@ -1,0 +1,38 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'         # Triggers on tags like v26.1114.01, v1.0.0, etc.
+      # Alternatively:
+      # - 'release-*'
+
+permissions:
+  contents: write    # Grants permission to create releases and upload assets
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build Distribution Archive
+        run: |
+          python build_distribution.py
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ApexBOS-*.zip
+            dist/ApexBOS-*.zip.sha256
+          name: "ApexBOS ${{ github.ref_name }}"
+          generate_release_notes: true
+          draft: false
+          prerelease: false

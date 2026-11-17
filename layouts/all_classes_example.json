@@ -1,0 +1,1619 @@
+{
+    "GenericSwitch": {
+        "C11": "right_NW_Cmd",
+        "C12": "right_RW_Cmd",
+        "C13": "left_NW_Cmd",
+        "C14": "left_RW_Cmd",
+        "C21": "upperLeft_GO_Cmd",
+        "C22": "upperRight_GO_Cmd",
+        "C23": "lowerLeft_GO_Cmd",
+        "C24": "lowerRight_GO_Cmd",
+        "K11": "right_NW_Ind",
+        "K12": "right_RW_Ind",
+        "K13": "left_NW_Ind",
+        "K14": "left_RW_Ind",
+        "K21": "upperLeft_GO_Ind",
+        "K22": "upperRight_GO_Ind",
+        "K23": "lowerLeft_GO_Ind",
+        "K24": "lowerRight_GO_Ind",
+        "K25": "upperTrack_Ind",
+        "K26": "lowerTrack_Ind",
+        "K27": "upperRight_Approach_Ind",
+        "K28": "upperLeft_Approach_Ind",
+        "K31": "lowerRight_Approach_Ind",
+        "K32": "lowerLeft_Approach_Ind",
+        "K33": "upperRight_Approach_Ind",
+        "K34": "upperLeft_Approach_Ind",
+        "K35": "lowerRight_Approach_Ind",
+        "K36": "lowerLeft_Approach_Ind"
+    },
+    "GenericTrack": {
+        "C11": "right_NW_Cmd",
+        "C12": "right_RW_Cmd",
+        "C13": "left_NW_Cmd",
+        "C14": "left_RW_Cmd",
+        "C21": "right1_GO_Cmd",
+        "C22": "left1_GO_Cmd",
+        "C23": "right2_GO_Cmd",
+        "C24": "left2_GO_Cmd",
+        "K11": "right_NW_Ind",
+        "K12": "right_RW_Ind",
+        "K13": "left_NW_Ind",
+        "K14": "left_RW_Ind",
+        "K21": "right1_GO_Ind",
+        "K22": "left1_GO_Ind",
+        "K23": "right2_GO_Ind",
+        "K24": "left2_GO_Ind",
+        "K225": "track1_Ind",
+        "K226": "track2_Ind",
+        "K27": "right1_Approach_Ind",
+        "K28": "left1_Approach_Ind",
+        "K31": "right2_Approach_Ind",
+        "K32": "left2_Approach_Ind",
+        "K33": "right1_Approach_Ind",
+        "K34": "left1_Approach_Ind",
+        "K35": "right2_Approach_Ind",
+        "K36": "left2_Approach_Ind"
+    },
+    "GenericSignalBlock": {
+        "C11": "active_Cmd-0",
+        "C12": "active_Cmd-1",
+        "C13": "right_GO_Cmd",
+        "C14": "left_GO_Cmd",
+        "K11": "active_Ind-0",
+        "K12": "active_Ind-1",
+        "K13": "track_Ind",
+        "K14": "right_GO_Ind",
+        "K15": "left_GO_Ind",
+        "K21": "left_Approach_Ind",
+        "K22": "right_Approach_Ind"
+    },
+    "HuntsLane1WSigs": {
+        "K12": "left_RW_Ind",
+        "K11": "left_NW_Ind",
+        "K27": "upperRight_GO_Ind",
+        "K26": "upperLeft_GO_Ind",
+        "K23": "lowerTrack_OOS_Ind",
+        "K22": "upperTrack_OOS_Ind",
+        "K21": "upperLeft_Approach_OOS_Ind",
+        "K36": "lowerTrack_Ind",
+        "K35": "upperTrack_Ind",
+        "K34": "upperRight_Approach_Ind",
+        "C12": "left_RW_Cmd",
+        "C11": "left_NW_Cmd",
+        "C28": "upperLeft_GO_Cmd",
+        "C48": "lowerLeft_GO_Cmd",
+        "C27": "upperRight_GO_Cmd",
+        "C26": "upperLeft_GO_Cmd",
+        "C23": "lowerTrack_OOS_Cmd",
+        "C22": "upperTrack_OOS_Cmd",
+        "C21": "upperLeft_Approach_OOS_Cmd"
+    },
+    "HuntsLane23WSigs": {
+        "K18": "upperLeft_Approach_OOS_Ind",
+        "K17": "upperRight_Approach_OOS_Ind",
+        "K16": "right_RW_Ind",
+        "K15": "right_NW_Ind",
+        "K14": "left_RW_Ind",
+        "K13": "left_NW_Ind",
+        "K28": "upperTrack_Ind",
+        "K27": "lowerRight_GO_Ind",
+        "K26": "lowerLeft_GO_Ind",
+        "K25": "upperRight_GO_Ind",
+        "K24": "upperLeft_GO_Ind",
+        "K21": "lowerRight_Approach_OOS_Ind",
+        "K37": "upperRight_Approach_Ind",
+        "K34": "lowerRight_Approach_Ind",
+        "K38": "upperLeft_Approach_Ind",
+        "K32": "lowerLeft_Approach_Ind",
+        "C18": "lowerLeft_Approach_OOS_Ind",
+        "C17": "lowerRight_Approach_OOS_Ind",
+        "C16": "right_RW_Cmd",
+        "C15": "right_NW_Cmd",
+        "C14": "left_RW_Cmd",
+        "C13": "left_NW_Cmd",
+        "C27": "lowerRight_GO_Cmd",
+        "C26": "lowerLeft_GO_Cmd",
+        "C25": "upperRight_GO_Cmd",
+        "C24": "upperLeft_GO_Cmd",
+        "C21": "lowerRight_Approach_OOS_Cmd"
+    },
+    "HuntsLane1TSigs": {
+        "K28": "track1_Ind",
+        "K17": "track1_OOS_Ind",
+        "K24": "go1_Ind",
+        "K33": "go1_Ind",
+        "K25": "go1_Ind",
+        "C16": "track12_RW_Cmd",
+        "C15": "track12_NW_Cmd",
+        "C22": "track1_OOS_Cmd",
+        "C24": "go1_Cmd",
+        "C25": "go1_Cmd"
+    },
+    "ArrowSigs": {
+        "70": "track1_Ind",
+        "C0": "go1_Ind"
+    },
+    "ArrowSwitch": {
+        "90|E0": "lowerTrack_Ind",
+        "70": "lowerLeft_Approach_Ind"
+    },
+    "ArrowSignalBlock": {
+        "90": "track_Ind",
+        "C0": "left_GO_Ind",
+        "70": "left_Approach_Ind"
+    },
+    "Elements": [
+        {
+            "class": "SwitchBlock",
+            "id": "78029430060202",
+            "mcp": "Hunts Lane",
+            "type": "ldb",
+            "x": 53,
+            "y": 15,
+            "signals": "@GenericSwitch",
+            "notes": "MP542"
+        },
+        {
+            "class": "TrackSet",
+            "id": "78029430060202",
+            "mcp": "",
+            "x0": 59,
+            "x1": 70,
+            "y": 15,
+            "NumTracks": 2,
+            "topNote": "",
+            "botNote": "ROSW_HUN",
+            "signals": "@GenericTrack",
+            "type": "LINE",
+            "location": "ROSW"
+        },
+        {
+            "class": "TrackSet",
+            "id": "78020610490202",
+            "mcp": "LOSW",
+            "x0": 70,
+            "x1": 85,
+            "y": 15,
+            "NumTracks": 2,
+            "topNote": "",
+            "botNote": "LOSW ORD",
+            "signals": "@GenericTrack",
+            "location": "LOSW"
+        },
+        {
+            "class": "SwitchBlock",
+            "id1": "78029430080202",
+            "id": "78020610490202",
+            "mcp": "Ordway",
+            "type": "ldb",
+            "x": 88,
+            "y": 15,
+            "signals": "@GenericSwitch",
+            "notes": "MP548.1"
+        },
+        {
+            "class": "TrackSet",
+            "id": "78020610490202",
+            "mcp": "ROSW",
+            "x0": 94,
+            "x1": 115,
+            "y": 15,
+            "NumTracks": 2,
+            "topNote": "",
+            "botNote": "ROSW ORD",
+            "signals": "@GenericTrack",
+            "location": "ROSW"
+        },
+        {
+            "class": "TrackSet",
+            "id": "78020610490202",
+            "mcp": "",
+            "x0": 120,
+            "x1": 138,
+            "y": 15,
+            "NumTracks": 1,
+            "topNote": "",
+            "botNote": "",
+            "signals": "@HuntsLane1TSigs",
+            "location": "ROSW"
+        },
+        {
+            "class": "SwitchBlock",
+            "id": "78020610490202",
+            "mcp": "Hunts",
+            "type": "rds",
+            "x": 130,
+            "y": 17,
+            "signals": "@HuntsLane1WSigs",
+            "notes": "MP548.1"
+        },
+        {
+            "class": "SwitchBlock",
+            "id": "78020610490202",
+            "mcp": "Hunts Lane",
+            "type": "ldb",
+            "x": 141,
+            "y": 15,
+            "signals": "@HuntsLane23WSigs",
+            "notes": "MP542"
+        },
+        {
+            "class": "Stats",
+            "x": 1,
+            "y": 2,
+            "MaxLines": 13
+        },
+        {
+            "class": "Signal",
+            "id_atcs": "78020610490202",
+            "id": "734050256610",
+            "x": 5,
+            "y": 14,
+            "type": "right bound",
+            "symbol": "O",
+            "green_signals": "K14",
+            "red_signals": "K21"
+        },
+        {
+            "class": "Track",
+            "id_atcs": "78020610490202",
+            "id": "734050256610",
+            "x0": 2,
+            "x1": 10,
+            "y": 15,
+            "green_signals": "K13",
+            "red_signals": "K11",
+            "type": "="
+        },
+        {
+            "class": "TrackSignalBlock",
+            "id": "78020610490202",
+            "mcp": "Loma Linda West",
+            "x": 15,
+            "y": 15,
+            "NumTracks": 2,
+            "signals": "@GenericSignalBlock",
+            "notes": "BrynMawr"
+        },
+        {
+            "class": "PacketIndicator",
+            "id_atcsh": "78020610490202",
+            "id": "734050256610",
+            "x": 15,
+            "y": 12,
+            "ind": ">",
+            "cmd": "<",
+            "ack": "x"
+        },
+        {
+            "class": "PacketGraph",
+            "id_atcs": "78020610490202",
+            "id": "734050256610",
+            "mcp": "",
+            "x": 88,
+            "y": 23,
+            "ind": "|",
+            "cmd": "x",
+            "depth": 5
+        },
+        {
+            "class": "PacketGraphPTC",
+            "id_atcs": "78020610490202",
+            "id": "734050256610",
+            "mcp": "TEST MSP",
+            "x": 88,
+            "y": 33,
+            "depth": 5,
+            "blinkTime_sec": 180
+        },
+        {
+            "class": "PacketGraphPTC",
+            "id_atcs": "78020610490202",
+            "id": "934050256610",
+            "mcp": "TEST MSP2",
+            "x": 158,
+            "y": 33,
+            "depth": 5,
+            "blinkTime_sec": 180
+        },
+        {
+            "class": "PacketDisplay",
+            "x": 70,
+            "y": 2,
+            "max": 45
+        },
+        {
+            "class": "ScrollPTC",
+            "x": 80,
+            "y": 6,
+            "depth": 5,
+            "width": 180
+        },
+        {
+            "class": "TrackSignalBlock",
+            "id": "734050256910",
+            "mcp": "Rdlns ESRI",
+            "x": 140,
+            "y": 46,
+            "NumTracks": 1,
+            "signals": "@ArrowSignalBlock",
+            "notes": "ESRI"
+        },
+        {
+            "class": "Signal",
+            "id": "734050256910",
+            "x": 103,
+            "y": 48,
+            "type": "right bound",
+            "symbol": "O",
+            "green_signals": "90",
+            "red_signals": "70"
+        },
+        {
+            "class": "Signal",
+            "id": "734050256910",
+            "x": 103,
+            "y": 47,
+            "type": "right bound",
+            "symbol": "o",
+            "green_signals": "E0",
+            "red_signals": "90|70"
+        },
+        {
+            "class": "Signal",
+            "id": "734050256610",
+            "x": 97,
+            "y": 48,
+            "type": "left bound",
+            "symbol": "O",
+            "green_signals": "C0",
+            "red_signals": "70"
+        },
+        {
+            "class": "Signal",
+            "id": "734050257210",
+            "x": 97,
+            "y": 43,
+            "type": "left bound",
+            "symbol": "o",
+            "green_signals": "C0",
+            "red_signals": "ff"
+        },
+        {
+            "class": "SwitchBlock",
+            "id": "734050256610",
+            "mcp": "Arrow Wlrt",
+            "type": "lds",
+            "x": 100,
+            "y": 44,
+            "signals": "@ArrowSwitch",
+            "notes": "MP542"
+        },
+        {
+            "class": "TrackSet",
+            "id": "734050257210",
+            "mcp": "ARROW WLRT",
+            "x0": 40,
+            "x1": 98,
+            "y": 44,
+            "NumTracks": 1,
+            "topNote": "California St",
+            "botNote": "",
+            "signals": "@ArrowSigs",
+            "location": "ROSW"
+        },
+        {
+            "class": "TrackSet",
+            "id": "734050256610",
+            "mcp": "WLMR MAIN",
+            "x0": 40,
+            "x1": 98,
+            "y": 46,
+            "NumTracks": 1,
+            "topNote": "",
+            "botNote": "",
+            "signals": "@ArrowSigs",
+            "location": "ROSW"
+        },
+        {
+            "class": "TrackSet",
+            "id": "734050256910",
+            "mcp": "ARROW WLRT",
+            "x0": 100,
+            "x1": 140,
+            "y": 46,
+            "NumTracks": 1,
+            "topNote": "Texas St",
+            "botNote": "",
+            "signals": "@ArrowSigs",
+            "location": "LOSW"
+        },
+        {
+            "class": "ptcWUI",
+            "id": "734050256610",
+            "mcp": "TEST MSP2",
+            "x": 171,
+            "y": 21,
+            "depth": 5,
+            "dir": "<",
+            "SwitchCount": 0,
+            "SignalCount": 1,
+            "ObstructionCount": 3,
+            "width": 6
+        },
+        {
+            "class": "ptcWUI",
+            "id": "707643213506",
+            "mcp": "TEST BNSF",
+            "x": 8,
+            "y": 31,
+            "depth": 5,
+            "dir": "><",
+            "SwitchCount": 2,
+            "SignalCount": 2,
+            "ObstructionCount": 2,
+            "width": 10
+        },
+        {
+            "class": "ptcWUI",
+            "id": "780235900504",
+            "mcp": "TEST UP",
+            "x": 8,
+            "y": 41,
+            "depth": 5,
+            "dir": "><",
+            "SwitchCount": 0,
+            "SignalCount": 2,
+            "ObstructionCount": 0,
+            "width": 10
+        },
+        {
+            "class": "StatusPanel",
+            "x": 1,
+            "y": 59,
+            "maxAge": 13,
+            "maxWidth": 80
+        }
+    ],
+    "elements": [
+        {
+            "id": "TK_M1",
+            "elem_type": "track",
+            "x": 4,
+            "y": 10,
+            "label": "West Portal",
+            "label_pos": "top",
+            "wiu_id": 12201,
+            "gps": [
+                34.0522,
+                -117.26
+            ],
+            "mile_marker": 10.0,
+            "orientation": "E-W",
+            "length_miles": 0.5,
+            "neighbors": {
+                "E": [
+                    "TK_M2"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": true,
+            "occ_bit_offset": 10
+        },
+        {
+            "id": "TK_M2",
+            "elem_type": "track",
+            "x": 10,
+            "y": 10,
+            "label": "Mojave Bridge Span",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": [
+                34.0522,
+                -117.25
+            ],
+            "mile_marker": 10.6,
+            "orientation": "E-W",
+            "length_miles": 0.5,
+            "neighbors": {
+                "W": [
+                    "TK_M1"
+                ],
+                "E": [
+                    "TO_WYE"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "TK_M3",
+            "elem_type": "track",
+            "x": 22,
+            "y": 10,
+            "label": "Diamond Interlocking Track",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": [
+                34.0522,
+                -117.235
+            ],
+            "mile_marker": 11.3,
+            "orientation": "E-W",
+            "length_miles": 0.5,
+            "neighbors": {
+                "W": [
+                    "TO_WYE"
+                ],
+                "E": [
+                    "TO_WEST"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "TK_M4",
+            "elem_type": "track",
+            "x": 34,
+            "y": 10,
+            "label": "Mainline Center",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": [
+                34.0522,
+                -117.215
+            ],
+            "mile_marker": 12.1,
+            "orientation": "E-W",
+            "length_miles": 0.5,
+            "neighbors": {
+                "W": [
+                    "TO_WEST"
+                ],
+                "E": [
+                    "TO_EAST"
+                ]
+            },
+            "parallel_track_id": "TK_S1",
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "TK_DIAG_NW",
+            "elem_type": "track",
+            "x": 30,
+            "y": 13,
+            "label": "West Siding Diagonal Lead",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": [
+                34.0515,
+                -117.222
+            ],
+            "mile_marker": 11.8,
+            "orientation": "NW-SE",
+            "length_miles": 0.5,
+            "neighbors": {
+                "NW": [
+                    "TO_WEST"
+                ],
+                "SE": [
+                    "TK_S1"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "TK_S1",
+            "elem_type": "track",
+            "x": 35,
+            "y": 15,
+            "label": "South Passing Siding",
+            "label_pos": "bottom",
+            "wiu_id": 12202,
+            "gps": [
+                34.051,
+                -117.215
+            ],
+            "mile_marker": 12.2,
+            "orientation": "E-W",
+            "length_miles": 0.5,
+            "neighbors": {
+                "W": [
+                    "TK_DIAG_NW"
+                ],
+                "E": [
+                    "TO_EAST"
+                ]
+            },
+            "parallel_track_id": "TK_M4",
+            "has_occ_bit": true,
+            "occ_bit_offset": 13
+        },
+        {
+            "id": "TK_M5",
+            "elem_type": "track",
+            "x": 48,
+            "y": 10,
+            "label": "East Crossing Approach",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": [
+                34.0522,
+                -117.195
+            ],
+            "mile_marker": 13.0,
+            "orientation": "E-W",
+            "length_miles": 0.5,
+            "neighbors": {
+                "W": [
+                    "TO_EAST"
+                ],
+                "E": [
+                    "TO_YD1"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "TK_DIAG_NE",
+            "elem_type": "track",
+            "x": 18,
+            "y": 7,
+            "label": "North Wye Diagonal",
+            "label_pos": "left",
+            "wiu_id": null,
+            "gps": [
+                34.056,
+                -117.24
+            ],
+            "mile_marker": 11.2,
+            "orientation": "NE-SW",
+            "length_miles": 0.5,
+            "neighbors": {
+                "SW": [
+                    "TO_WYE"
+                ],
+                "NE": [
+                    "TO_NORTH"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "TK_N1",
+            "elem_type": "track",
+            "x": 22,
+            "y": 8,
+            "label": "Diamond N-S Connector",
+            "label_pos": "right",
+            "wiu_id": 12204,
+            "gps": [
+                34.0545,
+                -117.235
+            ],
+            "mile_marker": 11.4,
+            "orientation": "N-S",
+            "length_miles": 0.5,
+            "neighbors": {
+                "S": [
+                    "TK_S_SPUR"
+                ],
+                "N": [
+                    "TO_NORTH"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": true,
+            "occ_bit_offset": 14
+        },
+        {
+            "id": "TK_S_SPUR",
+            "elem_type": "track",
+            "x": 22,
+            "y": 17,
+            "label": "South Industrial Spur",
+            "label_pos": "right",
+            "wiu_id": 12204,
+            "gps": [
+                34.0485,
+                -117.235
+            ],
+            "mile_marker": 10.8,
+            "orientation": "N-S",
+            "length_miles": 0.5,
+            "neighbors": {
+                "N": [
+                    "TK_N1"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": true,
+            "occ_bit_offset": 15
+        },
+        {
+            "id": "TK_N2",
+            "elem_type": "track",
+            "x": 22,
+            "y": 4,
+            "label": "North Canyon Track",
+            "label_pos": "right",
+            "wiu_id": null,
+            "gps": [
+                34.06,
+                -117.235
+            ],
+            "mile_marker": 11.9,
+            "orientation": "N-S",
+            "length_miles": 0.5,
+            "neighbors": {
+                "S": [
+                    "TO_NORTH"
+                ],
+                "N": [
+                    "TK_N3"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "TK_N3",
+            "elem_type": "track",
+            "x": 22,
+            "y": 1,
+            "label": "North Summit Terminal",
+            "label_pos": "right",
+            "wiu_id": 12204,
+            "gps": [
+                34.066,
+                -117.235
+            ],
+            "mile_marker": 12.5,
+            "orientation": "N-S",
+            "length_miles": 0.5,
+            "neighbors": {
+                "S": [
+                    "TK_N2"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": true,
+            "occ_bit_offset": 16
+        },
+        {
+            "id": "TK_YD1",
+            "elem_type": "track",
+            "x": 66,
+            "y": 7,
+            "label": "Yard Track 1 (North)",
+            "label_pos": "top",
+            "wiu_id": 10031,
+            "gps": [
+                34.0535,
+                -117.178
+            ],
+            "mile_marker": 13.9,
+            "orientation": "NE-SW",
+            "length_miles": 0.5,
+            "neighbors": {
+                "SW": [
+                    "TO_YD1"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": true,
+            "occ_bit_offset": 11
+        },
+        {
+            "id": "TK_YD2",
+            "elem_type": "track",
+            "x": 66,
+            "y": 10,
+            "label": "Yard Track 2 (Main)",
+            "label_pos": "top",
+            "wiu_id": 10031,
+            "gps": [
+                34.0522,
+                -117.178
+            ],
+            "mile_marker": 13.9,
+            "orientation": "E-W",
+            "length_miles": 0.5,
+            "neighbors": {
+                "W": [
+                    "TO_YD2"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": true,
+            "occ_bit_offset": 12
+        },
+        {
+            "id": "TK_YD3",
+            "elem_type": "track",
+            "x": 66,
+            "y": 13,
+            "label": "Yard Track 3 (South)",
+            "label_pos": "bottom",
+            "wiu_id": 10031,
+            "gps": [
+                34.051,
+                -117.178
+            ],
+            "mile_marker": 13.9,
+            "orientation": "NW-SE",
+            "length_miles": 0.5,
+            "neighbors": {
+                "NW": [
+                    "TO_YD2"
+                ]
+            },
+            "parallel_track_id": null,
+            "has_occ_bit": true,
+            "occ_bit_offset": 13
+        },
+        {
+            "id": "TO_WYE",
+            "elem_type": "turnout",
+            "x": 16,
+            "y": 10,
+            "label": "Wye Junction Switch",
+            "label_pos": "bottom",
+            "wiu_id": 12204,
+            "gps": [
+                34.0522,
+                -117.243
+            ],
+            "mile_marker": 10.9,
+            "common_neighbor": "TK_M2",
+            "normal_neighbor": "TK_M3",
+            "reverse_neighbor": "TK_DIAG_NE",
+            "orientation": "E",
+            "normal_dir": "E",
+            "reverse_dir": "NE",
+            "cmd_bit_offset": 0,
+            "has_occ_bit": false,
+            "occ_bit_offset": null,
+            "guarded_by_signals": [
+                "SIG_WYE_TOP",
+                "SIG_WYE_MID"
+            ]
+        },
+        {
+            "id": "TO_NORTH",
+            "elem_type": "turnout",
+            "x": 22,
+            "y": 6,
+            "label": "North Branch Switch",
+            "label_pos": "left",
+            "wiu_id": 12204,
+            "gps": [
+                34.0575,
+                -117.235
+            ],
+            "mile_marker": 11.6,
+            "common_neighbor": "TK_N2",
+            "normal_neighbor": "TK_N1",
+            "reverse_neighbor": "TK_DIAG_NE",
+            "orientation": "S",
+            "normal_dir": "S",
+            "reverse_dir": "SW",
+            "cmd_bit_offset": 2,
+            "has_occ_bit": false,
+            "occ_bit_offset": null,
+            "guarded_by_signals": [
+                "SIG_NB_N",
+                "SIG_NB_S_TOP"
+            ]
+        },
+        {
+            "id": "TO_WEST",
+            "elem_type": "turnout",
+            "x": 28,
+            "y": 10,
+            "label": "West Siding Switch",
+            "label_pos": "top",
+            "wiu_id": 12202,
+            "gps": [
+                34.0522,
+                -117.225
+            ],
+            "mile_marker": 11.6,
+            "common_neighbor": "TK_M3",
+            "normal_neighbor": "TK_M4",
+            "reverse_neighbor": "TK_DIAG_NW",
+            "orientation": "E",
+            "normal_dir": "E",
+            "reverse_dir": "SE",
+            "cmd_bit_offset": 0,
+            "has_occ_bit": true,
+            "occ_bit_offset": 12,
+            "guarded_by_signals": [
+                "SIG_TW_E_TOP",
+                "SIG_TW_E_MID",
+                "SIG_TW_W"
+            ]
+        },
+        {
+            "id": "TO_EAST",
+            "elem_type": "turnout",
+            "x": 42,
+            "y": 10,
+            "label": "East Siding Switch",
+            "label_pos": "bottom",
+            "wiu_id": 10031,
+            "gps": [
+                34.0522,
+                -117.205
+            ],
+            "mile_marker": 12.6,
+            "common_neighbor": "TK_M5",
+            "normal_neighbor": "TK_M4",
+            "reverse_neighbor": "TK_S1",
+            "orientation": "W",
+            "normal_dir": "W",
+            "reverse_dir": "W",
+            "cmd_bit_offset": 0,
+            "has_occ_bit": false,
+            "occ_bit_offset": null,
+            "guarded_by_signals": [
+                "SIG_XING_E"
+            ]
+        },
+        {
+            "id": "TO_YD1",
+            "elem_type": "turnout",
+            "x": 56,
+            "y": 10,
+            "label": "Yard Lead Switch 1",
+            "label_pos": "top",
+            "wiu_id": 10031,
+            "gps": [
+                34.0522,
+                -117.188
+            ],
+            "mile_marker": 13.4,
+            "common_neighbor": "TK_M5",
+            "normal_neighbor": "TO_YD2",
+            "reverse_neighbor": "TK_YD1",
+            "orientation": "E",
+            "normal_dir": "E",
+            "reverse_dir": "NE",
+            "cmd_bit_offset": 2,
+            "has_occ_bit": false,
+            "occ_bit_offset": null,
+            "guarded_by_signals": [
+                "SIG_YD_TOP",
+                "SIG_YD_MID",
+                "SIG_YD_BOT"
+            ]
+        },
+        {
+            "id": "TO_YD2",
+            "elem_type": "turnout",
+            "x": 61,
+            "y": 10,
+            "label": "Yard Ladder Switch 2",
+            "label_pos": "bottom",
+            "wiu_id": 10031,
+            "gps": [
+                34.0522,
+                -117.183
+            ],
+            "mile_marker": 13.6,
+            "common_neighbor": "TO_YD1",
+            "normal_neighbor": "TK_YD2",
+            "reverse_neighbor": "TK_YD3",
+            "orientation": "E",
+            "normal_dir": "E",
+            "reverse_dir": "SE",
+            "cmd_bit_offset": 4,
+            "has_occ_bit": false,
+            "occ_bit_offset": null,
+            "guarded_by_signals": [
+                "SIG_YD_TOP",
+                "SIG_YD_MID",
+                "SIG_YD_BOT"
+            ]
+        },
+        {
+            "id": "SIG_M1_E",
+            "elem_type": "signal",
+            "x": 8,
+            "y": 9,
+            "label": "West Approach E/B",
+            "label_pos": "top",
+            "wiu_id": 12201,
+            "gps": [
+                34.0522,
+                -117.255
+            ],
+            "mile_marker": 10.3,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TK_M2",
+            "rear_element": "TK_M1",
+            "governed_route": null,
+            "sig_bit_offset": 0,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_M2_W",
+            "elem_type": "signal",
+            "x": 13,
+            "y": 11,
+            "label": "West Approach W/B",
+            "label_pos": "top",
+            "wiu_id": 12201,
+            "gps": [
+                34.0522,
+                -117.245
+            ],
+            "mile_marker": 10.8,
+            "position": "top",
+            "direction": "W",
+            "protects_element": "TK_M2",
+            "rear_element": "TO_WYE",
+            "governed_route": null,
+            "sig_bit_offset": 5,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_WYE_E",
+            "elem_type": "signal",
+            "x": 15,
+            "y": 9,
+            "label": "Wye Jct E/B (2-Head)",
+            "label_pos": "top",
+            "wiu_id": 1004,
+            "gps": [
+                34.0522,
+                -117.244
+            ],
+            "mile_marker": 10.9,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TO_WYE",
+            "rear_element": "TK_M2",
+            "governed_route": null,
+            "sig_bit_offset": 4,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_NB_N",
+            "elem_type": "signal",
+            "x": 21,
+            "y": 5,
+            "label": "North Branch N/B",
+            "label_pos": "right",
+            "wiu_id": 12204,
+            "gps": [
+                34.057,
+                -117.236
+            ],
+            "mile_marker": 11.5,
+            "position": "top",
+            "direction": "N",
+            "protects_element": "TK_N2",
+            "rear_element": "TO_NORTH",
+            "governed_route": null,
+            "sig_bit_offset": 9,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_NB_S",
+            "elem_type": "signal",
+            "x": 23,
+            "y": 3,
+            "label": "North Branch S/B (Dedicated WIU)",
+            "label_pos": "top",
+            "wiu_id": 2003,
+            "gps": [
+                34.062,
+                -117.234
+            ],
+            "mile_marker": 12.1,
+            "position": "top",
+            "direction": "S",
+            "protects_element": "TK_N2",
+            "rear_element": "TK_N3",
+            "governed_route": null,
+            "sig_bit_offset": 0,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_TW_E",
+            "elem_type": "signal",
+            "x": 27,
+            "y": 9,
+            "label": "West Switch E/B (2-Head)",
+            "label_pos": "top",
+            "wiu_id": 1002,
+            "gps": [
+                34.0522,
+                -117.226
+            ],
+            "mile_marker": 11.5,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TO_WEST",
+            "rear_element": "TK_M3",
+            "governed_route": null,
+            "sig_bit_offset": 2,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_TW_W",
+            "elem_type": "signal",
+            "x": 30,
+            "y": 11,
+            "label": "West Switch W/B",
+            "label_pos": "top",
+            "wiu_id": 12202,
+            "gps": [
+                34.0522,
+                -117.223
+            ],
+            "mile_marker": 11.7,
+            "position": "top",
+            "direction": "W",
+            "protects_element": "TO_WEST",
+            "rear_element": "TK_M4",
+            "governed_route": null,
+            "sig_bit_offset": 7,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_INT_DARK",
+            "elem_type": "signal",
+            "x": 38,
+            "y": 9,
+            "label": "Mid-Main Intermediate (Dark WIU)",
+            "label_pos": "top",
+            "wiu_id": 20010,
+            "gps": [
+                34.0522,
+                -117.21
+            ],
+            "mile_marker": 12.3,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TO_EAST",
+            "rear_element": "TK_M4",
+            "governed_route": null,
+            "sig_bit_offset": 0,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_XING_E",
+            "elem_type": "signal",
+            "x": 44,
+            "y": 9,
+            "label": "East Siding Dep E/B",
+            "label_pos": "top",
+            "wiu_id": 20020,
+            "gps": [
+                34.0522,
+                -117.202
+            ],
+            "mile_marker": 12.7,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TK_M5",
+            "rear_element": "TO_EAST",
+            "governed_route": null,
+            "sig_bit_offset": 0,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_YD_E",
+            "elem_type": "signal",
+            "x": 54,
+            "y": 9,
+            "label": "Yard Entry E/B (3-Head)",
+            "label_pos": "top",
+            "wiu_id": 1003,
+            "gps": [
+                34.0522,
+                -117.189
+            ],
+            "mile_marker": 13.3,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TO_YD1",
+            "rear_element": "TK_M5",
+            "governed_route": null,
+            "sig_bit_offset": 6,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "XING_MAIN",
+            "elem_type": "crossing",
+            "x": 48,
+            "y": 10,
+            "label": "Route 66 Mainline Xing",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": null,
+            "mile_marker": null,
+            "monitored_tracks": [
+                "TK_M5",
+                "TO_EAST"
+            ]
+        },
+        {
+            "id": "XING_NORTH",
+            "elem_type": "crossing",
+            "x": 22,
+            "y": 4,
+            "label": "Canyon Rd Branch Xing",
+            "label_pos": "left",
+            "wiu_id": null,
+            "gps": null,
+            "mile_marker": null,
+            "monitored_tracks": [
+                "TK_N2",
+                "TO_NORTH"
+            ]
+        },
+        {
+            "id": "BASE_WEST",
+            "elem_type": "base",
+            "x": 10,
+            "y": 1,
+            "label": "West Ridge Tower",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": null,
+            "mile_marker": null,
+            "channel": 1
+        },
+        {
+            "id": "BASE_NORTH",
+            "elem_type": "base",
+            "x": 28,
+            "y": 1,
+            "label": "Summit Repeater",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": null,
+            "mile_marker": null,
+            "channel": 3
+        },
+        {
+            "id": "BASE_YARD",
+            "elem_type": "base",
+            "x": 60,
+            "y": 1,
+            "label": "Yard Master Base",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": null,
+            "mile_marker": null,
+            "channel": 2
+        },
+        {
+            "id": "STN_CENTRAL",
+            "elem_type": "station",
+            "x": 34,
+            "y": 7,
+            "label": "Central Passenger Depot",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": [
+                34.0528,
+                -117.215
+            ],
+            "mile_marker": null,
+            "extra_info": ""
+        },
+        {
+            "id": "STN_SUMMIT",
+            "elem_type": "station",
+            "x": 27,
+            "y": 2,
+            "label": "North Summit Station",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": [
+                34.0655,
+                -117.234
+            ],
+            "mile_marker": null,
+            "extra_info": ""
+        },
+        {
+            "id": "BRG_RIVER",
+            "elem_type": "bridge",
+            "x": 10,
+            "y": 10,
+            "label": "Mojave River Bridge",
+            "label_pos": "bottom",
+            "wiu_id": null,
+            "gps": [
+                34.0522,
+                -117.25
+            ],
+            "mile_marker": null,
+            "extra_info": ""
+        },
+        {
+            "id": "BRG_CANYON",
+            "elem_type": "bridge",
+            "x": 22,
+            "y": 5,
+            "label": "Canyon Creek Trestle",
+            "label_pos": "left",
+            "wiu_id": null,
+            "gps": [
+                34.059,
+                -117.235
+            ],
+            "mile_marker": null,
+            "extra_info": ""
+        },
+        {
+            "id": "DMD_MAIN",
+            "elem_type": "diamond",
+            "x": 22,
+            "y": 10,
+            "label": "Central N-S / E-W Diamond",
+            "label_pos": "bottom",
+            "wiu_id": null,
+            "gps": [
+                34.0522,
+                -117.235
+            ],
+            "mile_marker": null,
+            "extra_info": ""
+        },
+        {
+            "id": "LBL_MAIN",
+            "elem_type": "label",
+            "x": 30,
+            "y": 0,
+            "label": "CAJON SUBDIVISION - DISPATCH PANEL (v26.117.2)",
+            "label_pos": "top",
+            "wiu_id": null,
+            "gps": null,
+            "mile_marker": null,
+            "extra_info": ""
+        },
+        {
+            "id": "SIG_WYE_TOP",
+            "elem_type": "signal",
+            "x": 15,
+            "y": 9,
+            "label": "Wye Jct E/B Top",
+            "label_pos": "top",
+            "wiu_id": 12204,
+            "gps": [
+                34.0522,
+                -117.244
+            ],
+            "mile_marker": 10.9,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TO_WYE",
+            "rear_element": "TK_M2",
+            "governed_route": null,
+            "sig_bit_offset": 4,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_WYE_MID",
+            "elem_type": "signal",
+            "x": 15,
+            "y": 8,
+            "label": "Wye Jct E/B Mid",
+            "label_pos": "top",
+            "wiu_id": 12204,
+            "gps": [
+                34.0522,
+                -117.244
+            ],
+            "mile_marker": 10.9,
+            "position": "middle",
+            "direction": "NE",
+            "protects_element": "TO_WYE",
+            "rear_element": "TK_M2",
+            "governed_route": null,
+            "sig_bit_offset": 4,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_NB_S_TOP",
+            "elem_type": "signal",
+            "x": 23,
+            "y": 3,
+            "label": "North Branch S/B Top",
+            "label_pos": "left",
+            "wiu_id": 20030,
+            "gps": [
+                34.062,
+                -117.234
+            ],
+            "mile_marker": 12.1,
+            "position": "top",
+            "direction": "S",
+            "protects_element": "TK_N2",
+            "rear_element": "TK_N3",
+            "governed_route": null,
+            "sig_bit_offset": 0,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_NB_S_MID",
+            "elem_type": "signal",
+            "x": 24,
+            "y": 3,
+            "label": "North Branch S/B Mid",
+            "label_pos": "left",
+            "wiu_id": 20030,
+            "gps": [
+                34.062,
+                -117.234
+            ],
+            "mile_marker": 12.1,
+            "position": "middle",
+            "direction": "S",
+            "protects_element": "TK_N2",
+            "rear_element": "TK_N3",
+            "governed_route": null,
+            "sig_bit_offset": 0,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_TW_E_TOP",
+            "elem_type": "signal",
+            "x": 27,
+            "y": 9,
+            "label": "West Switch E/B Top",
+            "label_pos": "top",
+            "wiu_id": 12202,
+            "gps": [
+                34.0522,
+                -117.226
+            ],
+            "mile_marker": 11.5,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TO_WEST",
+            "rear_element": "TK_M3",
+            "governed_route": null,
+            "sig_bit_offset": 2,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_TW_E_MID",
+            "elem_type": "signal",
+            "x": 27,
+            "y": 8,
+            "label": "West Switch E/B Mid",
+            "label_pos": "top",
+            "wiu_id": 12202,
+            "gps": [
+                34.0522,
+                -117.226
+            ],
+            "mile_marker": 11.5,
+            "position": "middle",
+            "direction": "SE",
+            "protects_element": "TO_WEST",
+            "rear_element": "TK_M3",
+            "governed_route": null,
+            "sig_bit_offset": 2,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_YD_TOP",
+            "elem_type": "signal",
+            "x": 54,
+            "y": 9,
+            "label": "Yard Entry Top",
+            "label_pos": "top",
+            "wiu_id": 10031,
+            "gps": [
+                34.0522,
+                -117.189
+            ],
+            "mile_marker": 13.3,
+            "position": "top",
+            "direction": "E",
+            "protects_element": "TO_YD1",
+            "rear_element": "TK_M5",
+            "governed_route": null,
+            "sig_bit_offset": 6,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_YD_MID",
+            "elem_type": "signal",
+            "x": 54,
+            "y": 8,
+            "label": "Yard Entry Mid",
+            "label_pos": "top",
+            "wiu_id": 10031,
+            "gps": [
+                34.0522,
+                -117.189
+            ],
+            "mile_marker": 13.3,
+            "position": "middle",
+            "direction": "NE",
+            "protects_element": "TO_YD1",
+            "rear_element": "TK_M5",
+            "governed_route": null,
+            "sig_bit_offset": 6,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        },
+        {
+            "id": "SIG_YD_BOT",
+            "elem_type": "signal",
+            "x": 54,
+            "y": 7,
+            "label": "Yard Entry Bot",
+            "label_pos": "top",
+            "wiu_id": 10031,
+            "gps": [
+                34.0522,
+                -117.189
+            ],
+            "mile_marker": 13.3,
+            "position": "bottom",
+            "direction": "SE",
+            "protects_element": "TO_YD1",
+            "rear_element": "TK_M5",
+            "governed_route": null,
+            "sig_bit_offset": 6,
+            "has_occ_bit": false,
+            "occ_bit_offset": null
+        }
+    ],
+    "scroller": {
+        "x": 0,
+        "y": 25,
+        "max_len": 10
+    },
+    "address_table": {
+        "x": 55,
+        "y": 25
+    },
+    "train_scroller": {
+        "x": 50,
+        "y": 22,
+        "max_len": 10,
+        "width": 430,
+        "height": 150
+    }
+}

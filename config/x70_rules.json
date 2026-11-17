@@ -1,0 +1,45 @@
+[
+    {
+        "type": "u8",
+        "name": "SIG"
+    },
+    
+    {
+        "type": "u16",
+        "name": "Chan"
+    },
+    {
+        "type": "int_bits",
+        "name": "msb_type",
+        "length": 4,
+        "format": "i",
+        "expected_in": [5,7]
+    },
+    {
+        "type": "int_bits",
+        "name": "lsb_type",
+        "length": 4,
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "_type_",
+        "expression":"(msb_type << 4) + lsb_type",
+        "format": "x"
+    },
+    {
+        "type": "skip",
+        "length": 1
+    },
+    {
+        "type": "int_bits",
+        "name": "_node_id_",
+        "length": 24,
+        "format": "i"
+    },
+    {
+        "type": "printf",
+        "name": "_scroll_ptc_",
+        "format": "--------- EMP 0x{_type_}: {_node_id_} ---------"
+    }
+]

@@ -1,0 +1,30 @@
+[
+    {
+        "type": "u8",
+        "name": "Prefix"
+    },
+    {
+        "type": "u16",
+        "name": "PacketSize"
+    },
+    {
+        "type": "u8",
+        "name": "_type_",
+        "expected": 4
+    },
+    {
+        "type": "skip",
+        "length": 1
+    },
+    {
+        "type": "int_bits",
+        "name": "_node_id_",
+        "length": 24,
+        "format": "i"
+    },
+    {
+        "type": "printf",
+        "name": "_scroll_ptc_",
+        "format": "ACQ Pkt Addr: {_node_id_}"
+    }
+]
