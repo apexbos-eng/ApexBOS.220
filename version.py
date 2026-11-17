@@ -5,6 +5,6 @@ All user-facing applications and engine modules import and display
 their version from this single module.
 """
 
-VERSION = "v26.1116.33"
+VERSION = "v26.1117.04"
 __version__ = VERSION
-VERSION_NUMBER = "26.1116.33"
+VERSION_NUMBER = "26.1117.04"

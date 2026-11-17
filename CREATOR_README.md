@@ -78,10 +78,11 @@ Built on Pygame with anti-aliased vector rendering, the Creator allows hobbyists
    - [Verifying Cleared Green Paths & Route Interlocking](#verifying-cleared-green-paths--route-interlocking)
    - [Automated Layout Topology Audit (`'v'`)](#automated-layout-topology-audit-v)
    - [Recorded Packet Stream Playback (`Space`, `[`, `]`)](#recorded-packet-stream-playback-space---)
-9. [Sub-Layout Fragments, Cloud Sync & Merging](#sub-layout-fragments-cloud-sync--merging)
+9. [Sub-Layout Fragments, Cloud Sync, Merging & Importing](#sub-layout-fragments-cloud-sync-merging--importing)
    - [Saving & Loading Layout Fragments (`Ctrl+F` / `Ctrl+Shift+F`)](#saving--loading-layout-fragments-ctrlf--ctrlshiftf)
    - [ApexBOSBanc Cloud Layout Publishing (`Ctrl+Shift+B`)](#apexbosbanc-cloud-layout-publishing-ctrlshiftb)
    - [Merging External Layout Files (`'m'`)](#merging-external-layout-files-m)
+   - [Importing Legacy ATCSMonitor Layouts (`Import from ATCS`)](#importing-legacy-atcsmonitor-layouts-import-from-atcs)
 10. [Command-Line Options & Configuration](#command-line-options--configuration)
 11. [Interactive Keyboard & Mouse Reference](#interactive-keyboard--mouse-reference)
 
@@ -446,7 +447,7 @@ The Creator can load raw captured packet logs and play them back frame-by-frame:
 
 ---
 
-## Sub-Layout Fragments, Cloud Sync & Merging
+## Sub-Layout Fragments, Cloud Sync, Merging & Importing
 
 ### Saving & Loading Layout Fragments (`Ctrl+F` / `Ctrl+Shift+F`)
 
@@ -463,6 +464,29 @@ Publish authored layouts directly to [ApexBOSBanc](BANC_README.md) servers:
 ### Merging External Layout Files (`'m'`)
 
 Pressing `'m'` prompts for an external layout file to merge into the current canvas, allowing multiple authors to develop adjacent subdivisions and unite them into a continuous transcontinental mainline.
+
+### Importing Legacy ATCSMonitor Layouts (`Import from ATCS`)
+
+**ApexBOS Creator** includes a Creator-only **`Import from ATCS`** button in the File Operations toolbar (powered by [atcs_converter.py](atcs_converter.py)) to import legacy binary `.lay` layout files created with **Track Builder 3** for **ATCSMonitor** — an older amateur hobbyist railroad monitoring system.
+
+1. **Importing a `.lay` File**:
+   - Click **`Import from ATCS`** in the top toolbar. If you have unsaved edits on the current canvas, Creator prompts you to save, discard, or cancel first.
+   - Enter or pick the `.lay` file path (autocomplete filters for `.lay` files) and press `Enter`.
+   - Creator parses the binary Track Builder 3 layout in under a second and loads the converted schematic directly onto the canvas, marking the layout as unsaved (`Save*`).
+2. **What the Converter Extracts Automatically**:
+   - **2D Schematic Geometry & Topology**: Decodes the two-layer column-major tile grid (horizontal mainlines, crossovers, diagonal tracks, turnouts with 3-leg normal/reverse bindings, and East/West signal heads), merges collinear tangent runs, and synthesizes short spur stubs for off-edge diverging legs.
+   - **Control Point Metadata & Legacy MCP Addresses**: Reads the Wayside Address Table and element records to pre-populate each Control Point's legacy 14-digit ATCS MCP address as an initial `wiu_id` with unique, non-overlapping bit offsets (`sig_bit_offset`, `cmd_bit_offset`, `occ_bit_offset`).
+   - **Station & Territory Labels**: Extracts station, yard, milepost, and radio notes as standalone `label` elements aligned to the schematic grid and automatically de-overlapped.
+   - **Per-CP Reusable Fragments**: Saves individual Control Point interlockings into `frags/atcs/<layout_name>/` so they can be reused later with `LoadFrag` (`Ctrl+F`).
+3. **Assigning WIU IDs & Saving as an ApexBOS Layout**:
+   - Because legacy ATCSMonitor MCP addresses differ from 220 MHz Wayside Interface Unit (WIU) addresses, double-click any imported interlocking element (or select elements on the canvas) to open the **In-Place Property Editor** and update `wiu_id` and bit offsets to match your local 220 MHz telemetry nodes.
+   - Optionally connect multi-strip line breaks with **Track Jumps (`0`)** and run **Verify (`V`)** to audit connections.
+   - Click **`Save`** or **`SaveAs`** (`Ctrl+Shift+S`) to save the finished schematic as a native ApexBOS `.json` layout ready for `ApexBOS.220.py` and `View_ApexBOS.220.py`.
+4. **Standalone Command-Line Conversion**:
+   You can also batch-convert `.lay` files from the terminal:
+   ```bash
+   python atcs_converter.py up_yuma_0201_20.lay -o layouts/up_yuma_subdivision.json --frags-dir frags/atcs
+   ```
 
 ---
 
@@ -532,6 +556,8 @@ python ApexBOSCreator.py --lat 34.1234 --lon -118.6543 --radius 25.0 layouts/my_
 ## Summary of Ecosystem Integration Files
 
 - [ApexBOSCreator.py](ApexBOSCreator.py) — Core layout designer and verification studio.
+- [atcs_converter.py](atcs_converter.py) — Legacy ATCSMonitor (`.lay`) binary layout importer and fragment converter.
+- [itcvl_converter.py](itcvl_converter.py) — ITCVL (`.itcvl`) layout and template converter.
 - [View_ApexBOS.220.py](View_ApexBOS.220.py) — Client graphical terminal renderer.
 - [dispatcher_engine.py](dispatcher_engine.py) — Core simulation and runtime dispatching engine.
 - [train_logic.py](train_logic.py) — Train kinematics, GPS interpolation, and collision detection.

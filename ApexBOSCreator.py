@@ -1917,7 +1917,7 @@ class InPlaceElementEditor:
                 {"key": "gps", "label": "GPS (lat, lon)", "val": gps_str, "req": False, "choices": [], "tooltip": "Physical geographic coordinates (Latitude, Longitude)."},
             ])
 
-        self._refresh_wiu_choices()
+        self._sync_ctc_for_wiu()
         self._sync_ctc_for_wiu(force_auto_fill=bool(self.is_newly_created and not (getattr(el, "ctc_id", "") or "").strip()))
 
     def select_field(self, idx: int):
@@ -4619,6 +4619,13 @@ class ApexBOSCreatorApp:
             else:
                 default_itcvl = "UPMOFAT.itcvl" if os.path.exists("UPMOFAT.itcvl") else ("SoCalAll.itcvl" if os.path.exists("SoCalAll.itcvl") else "")
                 self.open_file_prompt("import_itcvl", default_itcvl)
+        elif isinstance(target, tuple) and len(target) == 2 and target[0] == "import_atcs":
+            _, atcs_path = target
+            if atcs_path:
+                self.import_atcs_layout(atcs_path)
+            else:
+                default_atcs = "up_yuma_0201_20.lay" if os.path.exists("up_yuma_0201_20.lay") else ""
+                self.open_file_prompt("import_atcs", default_atcs)
         elif isinstance(target, str):
             self._execute_load_layout(target)
 
@@ -4712,6 +4719,65 @@ class ApexBOSCreatorApp:
             )
         except Exception as exc:
             self.status_toast = f"[ERROR] Failed to import ITCVL '{filepath}': {exc}"
+
+    def request_import_atcs(self, target_path: Optional[str] = None):
+        """
+        Prompts to import an ATCSMonitor .lay layout file. If unsaved changes are pending,
+        asks to save, discard, or cancel first.
+        """
+        if getattr(self, "dirty", False):
+            self.confirm_load_modal = True
+            self.pending_load_target = ("import_atcs", target_path)
+            return
+        if target_path:
+            self.import_atcs_layout(target_path)
+        else:
+            default_atcs = "up_yuma_0201_20.lay" if os.path.exists("up_yuma_0201_20.lay") else ""
+            self.open_file_prompt("import_atcs", default_atcs)
+
+    def import_atcs_layout(self, filepath: str):
+        """
+        Imports a legacy ATCSMonitor (.lay) binary layout file using atcs_converter,
+        saving per-Control-Point fragments in frags/atcs, loading the converted layout
+        into the Creator, and marking it ready to update WIU IDs and save as an ApexBOS layout.
+        """
+        if not os.path.exists(filepath):
+            self.status_toast = f"[ERROR] ATCS file '{filepath}' does not exist."
+            return
+        try:
+            import atcs_converter
+            frags_base = getattr(self, "FRAGS_DIR", getattr(sys.modules.get("ApexBOSCreator", None), "FRAGS_DIR", FRAGS_DIR))
+            atcs_frags_base = os.path.join(frags_base, "atcs")
+            atcs_frags_dir = atcs_converter.resolve_atcs_frags_subdir(filepath, atcs_frags_base)
+            stem = os.path.splitext(os.path.basename(filepath))[0]
+            sub_folder_name = os.path.basename(atcs_frags_dir)
+            own_filename = f"{stem}.json"
+            own_filepath = os.path.join(os.path.dirname(os.path.abspath(filepath)) or os.getcwd(), own_filename)
+
+            layout_dict = atcs_converter.convert_atcs_file(
+                filepath,
+                output_layout_path=None,
+                frags_dir=atcs_frags_dir,
+            )
+            self.push_undo_state()
+            self.layout_filepath = own_filepath
+            self.engine.load_layout_data(
+                layout_dict,
+                layout_filename=own_filename,
+                config_dir=os.path.dirname(own_filepath) or os.getcwd(),
+                filepath=own_filepath,
+            )
+            self._sync_monotonic_counters()
+            self.selected_ids.clear()
+            self.dirty = True
+            self.crank_engine()
+            self.center_view_on_layout()
+            self.status_toast = (
+                f"Imported ATCS '{os.path.basename(filepath)}' ({len(self.engine.elements)} elements, "
+                f"CP fragments -> frags/atcs/{sub_folder_name}). Update WIU IDs and Save / SaveAs as '{own_filename}'."
+            )
+        except Exception as exc:
+            self.status_toast = f"[ERROR] Failed to import ATCS '{filepath}': {exc}"
 
     def save_current_layout(self, filepath: Optional[str] = None):
         target = filepath or self.layout_filepath
@@ -4821,8 +4887,12 @@ class ApexBOSCreatorApp:
                 pass
 
     def crank_engine(self):
+        from train_logic import TrainInferenceManager
+        TrainInferenceManager.invalidate_caches()
         self.engine._evaluate_system_logic(time.time(), force=True)
         state = self.engine.get_render_state()
+        self._cached_render_state = state
+        self._cached_render_state_ts = time.time()
         self._dispatch_broadcast(state)
 
     def _open_train_assignment(self, trn: dict):
@@ -4969,8 +5039,13 @@ class ApexBOSCreatorApp:
 
     def pick_track_endpoint_handle_at_screen(self, sx: int, sy: int) -> Optional[Tuple[str, int, Tuple[float, float]]]:
         hit_radius = max(9.0, 11.0 * self.zoom)
+        mlx, mly = self.screen_to_logical(sx, sy)
+        max_log_r = hit_radius / max(1e-3, LOGICAL_GRID_SCALE * self.zoom) + 0.5
         for eid, el in self.engine.elements.items():
             if not isinstance(el, TrackSegment): continue
+            half_span = max(0.5, float(getattr(el, "length_miles", 0.5) or 0.5) * 2.0) + max_log_r
+            if abs(el.x - mlx) > half_span or abs(el.y - mly) > half_span:
+                continue
             p0, p1 = LayoutTopologyAssistant.get_track_endpoints_logical(el)
             s0 = self.logical_to_screen(p0[0], p0[1])
             s1 = self.logical_to_screen(p1[0], p1[1])
@@ -4990,29 +5065,38 @@ class ApexBOSCreatorApp:
         return math.hypot(px - proj_x, py - proj_y)
 
     def pick_element_at_screen(self, sx: int, sy: int) -> Optional[str]:
+        best_id = None
+        best_dist = max(14.0, 18.0 * self.zoom)
+        mlx, mly = self.screen_to_logical(sx, sy)
+        max_log_r = best_dist / max(1e-3, LOGICAL_GRID_SCALE * self.zoom) + 0.5
+
         for eid, el in self.engine.elements.items():
-            if el.elem_type in SYSTEM_LIST_TYPES:
+            et = el.elem_type
+            if et in SYSTEM_LIST_TYPES:
                 px, py = self.logical_to_screen(el.x, el.y)
-                pw = getattr(el, "width", 0) or (580 if el.elem_type == "packet_scroller" else (450 if el.elem_type == "address_table" else (460 if el.elem_type == "chat" else 430)))
-                ph = getattr(el, "height", 0) or (195 if el.elem_type == "packet_scroller" else (220 if el.elem_type == "chat" else 150))
+                pw = getattr(el, "width", 0) or (580 if et == "packet_scroller" else (450 if et == "address_table" else (460 if et == "chat" else 430)))
+                ph = getattr(el, "height", 0) or (195 if et == "packet_scroller" else (220 if et == "chat" else 150))
                 rect = pygame.Rect(px, py, int(pw * self.zoom), int(ph * self.zoom))
                 if rect.collidepoint(sx, sy): return eid
-            if el.elem_type in ("ptc_datetime", "date_time", "datetime"):
+                continue
+            if et in ("ptc_datetime", "date_time", "datetime"):
                 px, py = self.logical_to_screen(el.x, el.y)
                 pw = getattr(el, "width", 0) or 240
                 ph = getattr(el, "height", 0) or 50
                 rect = pygame.Rect(px, py, int(pw * self.zoom), int(ph * self.zoom))
                 if rect.collidepoint(sx, sy): return eid
-        best_id = None
-        best_dist = max(14.0, 18.0 * self.zoom)
-        for eid, el in self.engine.elements.items():
-            if el.elem_type in SYSTEM_LIST_TYPES: continue
-            if el.elem_type == "track":
+                continue
+            if et == "track":
+                half_span = max(0.5, float(getattr(el, "length_miles", 0.5) or 0.5) * 2.0) + max_log_r
+                if abs(el.x - mlx) > half_span or abs(el.y - mly) > half_span:
+                    continue
                 p0, p1 = LayoutTopologyAssistant.get_track_endpoints_logical(el)
                 s0 = self.logical_to_screen(p0[0], p0[1])
                 s1 = self.logical_to_screen(p1[0], p1[1])
                 dist = self._dist_to_segment_px(sx, sy, s0[0], s0[1], s1[0], s1[1])
             else:
+                if abs(el.x - mlx) > max_log_r or abs(el.y - mly) > max_log_r:
+                    continue
                 ex, ey = self.logical_to_screen(el.x, el.y)
                 dist = math.hypot(sx - ex, sy - ey)
             if dist <= best_dist:
@@ -5280,6 +5364,8 @@ class ApexBOSCreatorApp:
 
     def handle_events(self) -> bool:
         for event in pygame.event.get():
+            if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.KEYDOWN):
+                self._cached_render_state = None
             if event.type == pygame.QUIT:
                 if not self.request_exit(): return False
             elif event.type == pygame.VIDEORESIZE:
@@ -5473,6 +5559,8 @@ class ApexBOSCreatorApp:
             valid_exts = {".log", ".jsonl", ".txt", ".json"}
         elif mode == "import_itcvl":
             valid_exts = {".itcvl"}
+        elif mode == "import_atcs":
+            valid_exts = {".lay"}
         elif mode == "save_frag":
             valid_exts = {".json"}
         else:
@@ -5609,6 +5697,8 @@ class ApexBOSCreatorApp:
                     self.request_load_layout(target_path)
                 elif mode == "import_itcvl":
                     self.import_itcvl_layout(target_path)
+                elif mode == "import_atcs":
+                    self.import_atcs_layout(target_path)
                 elif mode == "merge": self.merge_layout_from_file(target_path)
                 elif mode == "load_log": self.load_raw_packet_log(target_path)
                 elif mode == "set_map_radius":
@@ -6747,6 +6837,8 @@ class ApexBOSCreatorApp:
             self.request_load_layout()
         elif bkey == "import_itcvl":
             self.request_import_itcvl()
+        elif bkey == "import_atcs":
+            self.request_import_atcs()
         elif bkey == "save": self.save_current_layout()
         elif bkey == "save_as":
             self.file_prompt_mode = "save_as"; self.file_prompt_buffer = self.layout_filepath or "new_layout.json"
@@ -6806,6 +6898,32 @@ class ApexBOSCreatorApp:
         if el_dict.get("green_path"): return COLOR_TRACK_GREEN
         return COLOR_TRACK_WHITE
 
+    def _render_cached_text(self, font: pygame.font.Font, text: str, color: Tuple[int, int, int]) -> pygame.Surface:
+        cache = getattr(self, "_text_surf_cache", None)
+        if cache is None:
+            cache = {}
+            self._text_surf_cache = cache
+        key = (id(font), text, color)
+        surf = cache.get(key)
+        if surf is None:
+            if len(cache) >= 4096:
+                cache.clear()
+            surf = font.render(text, True, color)
+            cache[key] = surf
+        return surf
+
+    def _is_point_visible(self, sx: int, sy: int, margin_x: int = 80, margin_y: int = 80) -> bool:
+        return (-margin_x <= sx <= self.width + margin_x) and (-margin_y <= sy <= self.height + margin_y)
+
+    def _is_seg_visible(self, s0: Tuple[int, int], s1: Tuple[int, int], margin: int = 80) -> bool:
+        x0, y0 = s0
+        x1, y1 = s1
+        if (x0 < -margin and x1 < -margin) or (x0 > self.width + margin and x1 > self.width + margin):
+            return False
+        if (y0 < -margin and y1 < -margin) or (y0 > self.height + margin and y1 > self.height + margin):
+            return False
+        return True
+
     # -----------------------------------------------------------------
     # Directional Arrowheads for Lined Green Track Paths
     # -----------------------------------------------------------------
@@ -6819,13 +6937,16 @@ class ApexBOSCreatorApp:
         notch = (int(round(cx - vx * L_arr * 0.15)), int(round(cy - vy * L_arr * 0.15)))
         pts = [tip, barb_r, notch, barb_l]
         pygame.draw.polygon(self.screen, (235, 255, 240), pts)
-        pygame.draw.polygon(self.screen, (10, 40, 20), pts, 1)
+        if self.zoom >= 0.7:
+            pygame.draw.polygon(self.screen, (10, 40, 20), pts, 1)
 
     def _draw_track_bar_arrows(self, p1: Tuple[int, int], p2: Tuple[int, int], direction: str):
+        if self.zoom < 0.45 or not direction:
+            return
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         length = math.hypot(dx, dy)
-        if length < 18.0 * self.zoom or not direction:
+        if length < 22.0 * self.zoom:
             return
         ux, uy = dx / length, dy / length
         dir_vec = DIR_SCREEN_VECTORS.get(direction.upper(), (1.0, 0.0))
@@ -6837,24 +6958,25 @@ class ApexBOSCreatorApp:
         else:
             vx, vy = dir_vec[0], dir_vec[1]
 
-        sz = max(3.8, 5.0 * self.zoom)
-        if length >= 90.0 * self.zoom:
-            t_vals = (0.18, 0.34, 0.66, 0.82)
-        elif length >= 38.0 * self.zoom:
-            t_vals = (0.28, 0.72)
+        sz = max(3.6, 4.8 * self.zoom)
+        if length >= 150.0 * self.zoom:
+            t_vals = (0.30, 0.70)
         else:
-            t_vals = (0.28,)
+            t_vals = (0.50,)
 
         for t in t_vals:
             cx = p1[0] + ux * length * t
             cy = p1[1] + uy * length * t
-            self._draw_green_path_arrowhead(cx, cy, vx, vy, sz)
+            if self._is_point_visible(int(cx), int(cy), 20, 20):
+                self._draw_green_path_arrowhead(cx, cy, vx, vy, sz)
 
     def _draw_link_green_arrows(self, p1: Tuple[int, int], p2: Tuple[int, int], direction: str):
+        if self.zoom < 0.55 or not direction:
+            return
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         length = math.hypot(dx, dy)
-        if length < 18.0 * self.zoom or not direction:
+        if length < 38.0 * self.zoom:
             return
         ux, uy = dx / length, dy / length
         dir_vec = DIR_SCREEN_VECTORS.get(direction.upper(), (1.0, 0.0))
@@ -6866,94 +6988,134 @@ class ApexBOSCreatorApp:
         else:
             vx, vy = dir_vec[0], dir_vec[1]
 
-        sz = max(3.8, 5.0 * self.zoom)
-        if length >= 50.0 * self.zoom:
-            n = max(2, int(round(length / (42.0 * self.zoom))))
-            t_vals = [i / (n + 1) for i in range(1, n + 1)]
-        else:
-            t_vals = [0.5]
-
-        for t in t_vals:
-            cx = p1[0] + ux * length * t
-            cy = p1[1] + uy * length * t
+        sz = max(3.6, 4.8 * self.zoom)
+        cx = p1[0] + ux * length * 0.5
+        cy = p1[1] + uy * length * 0.5
+        if self._is_point_visible(int(cx), int(cy), 20, 20):
             self._draw_green_path_arrowhead(cx, cy, vx, vy, sz)
 
     def _draw_turnout_diamond_arrow(self, sx: int, sy: int, sz: float, direction: str):
-        if not direction:
+        if not direction or self.zoom < 0.5:
             return
         dir_vec = DIR_SCREEN_VECTORS.get(direction.upper(), (1.0, 0.0))
         self._draw_green_path_arrowhead(sx, sy, dir_vec[0], dir_vec[1], sz=sz * 0.65)
 
     def _draw_octilinear_link(self, p1_log: Tuple[float, float], p2_log: Tuple[float, float], col1: Tuple[int, int, int], col2: Tuple[int, int, int], line_w: int, green_dir: Optional[str] = None):
+        s_start = self.logical_to_screen(p1_log[0], p1_log[1])
+        s_end = self.logical_to_screen(p2_log[0], p2_log[1])
+        if not self._is_seg_visible(s_start, s_end, margin=100):
+            return
         poly_log = LayoutTopologyAssistant.compute_45deg_polyline(p1_log, p2_log)
-        scr_pts = [self.logical_to_screen(px, py) for px, py in poly_log]
-        if len(scr_pts) == 2:
-            mx, my = (scr_pts[0][0] + scr_pts[1][0]) // 2, (scr_pts[0][1] + scr_pts[1][1]) // 2
-            pygame.draw.line(self.screen, col1, scr_pts[0], (mx, my), line_w)
-            pygame.draw.line(self.screen, col2, (mx, my), scr_pts[1], line_w)
-            pygame.draw.circle(self.screen, col1, (mx, my), max(2, line_w // 2))
-        elif len(scr_pts) >= 3:
+        if len(poly_log) == 2:
+            scr_pts = [s_start, s_end]
+            if col1 == col2:
+                pygame.draw.line(self.screen, col1, s_start, s_end, line_w)
+            else:
+                mx, my = (s_start[0] + s_end[0]) // 2, (s_start[1] + s_end[1]) // 2
+                pygame.draw.line(self.screen, col1, s_start, (mx, my), line_w)
+                pygame.draw.line(self.screen, col2, (mx, my), s_end, line_w)
+                if self.zoom >= 0.6:
+                    pygame.draw.circle(self.screen, col1, (mx, my), max(2, line_w // 2))
+        else:
+            scr_pts = [s_start, self.logical_to_screen(poly_log[1][0], poly_log[1][1]), s_end]
             pygame.draw.line(self.screen, col1, scr_pts[0], scr_pts[1], line_w)
-            pygame.draw.circle(self.screen, col1, scr_pts[1], max(2, line_w // 2))
+            if self.zoom >= 0.6:
+                pygame.draw.circle(self.screen, col1, scr_pts[1], max(2, line_w // 2))
             pygame.draw.line(self.screen, col2, scr_pts[1], scr_pts[2], line_w)
 
         if col1 == COLOR_TRACK_GREEN and col2 == COLOR_TRACK_GREEN and green_dir:
             for i in range(len(scr_pts) - 1):
                 self._draw_link_green_arrows(scr_pts[i], scr_pts[i + 1], green_dir)
 
-    def _draw_section_separators(self, track_endpoints: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]]):
-        """Draws dim dotted lines perpendicular to each track at its ends to show track section boundaries."""
+    def _draw_section_separators(self, visible_track_screen_pts: List[Tuple[Tuple[int, int], Tuple[int, int]]]):
+        """Draws dim perpendicular markers at visible track ends to show track section boundaries."""
+        if self.zoom < 0.55:
+            return
         col = (92, 104, 124)
-        half = max(7, int(10 * self.zoom))
+        half = max(5, int(9 * self.zoom))
+        use_dots = (self.zoom >= 1.15)
         dot_r = max(1, int(round(1.3 * self.zoom)))
-        n_dots = 6
-        for p0, p1 in track_endpoints.values():
-            s0 = self.logical_to_screen(p0[0], p0[1])
-            s1 = self.logical_to_screen(p1[0], p1[1])
+        n_dots = 5
+        for s0, s1 in visible_track_screen_pts:
             dx, dy = s1[0] - s0[0], s1[1] - s0[1]
             ln = math.hypot(dx, dy)
-            if ln < 1.0:
+            if ln < 2.0:
                 continue
             nx, ny = -dy / ln, dx / ln
             for sx, sy in (s0, s1):
-                for i in range(n_dots):
-                    t = -half + (2.0 * half) * i / (n_dots - 1)
-                    pygame.draw.circle(self.screen, col, (int(sx + nx * t), int(sy + ny * t)), dot_r)
+                if not self._is_point_visible(sx, sy, 25, 25):
+                    continue
+                if use_dots:
+                    for i in range(n_dots):
+                        t = -half + (2.0 * half) * i / (n_dots - 1)
+                        pygame.draw.circle(self.screen, col, (int(sx + nx * t), int(sy + ny * t)), dot_r)
+                else:
+                    pygame.draw.line(
+                        self.screen,
+                        col,
+                        (int(sx - nx * half), int(sy - ny * half)),
+                        (int(sx + nx * half), int(sy + ny * half)),
+                        1,
+                    )
 
     def draw_layout_state(self, state: dict, flash_on: bool):
         self._train_scroller_row_rects.clear()
         self._train_scroller_del_rects.clear()
         elements = state.get("elements", {})
         drawn_pairs = set()
-        line_w = max(3, int(5 * self.zoom))
+        line_w = max(2 if self.zoom < 0.45 else 3, int(5 * self.zoom))
 
         track_endpoints: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
+        track_screen_pts: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {}
+        visible_track_screen_pts: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        track_colors: Dict[str, Tuple[int, int, int]] = {}
+        tile_buckets: Dict[Tuple[int, int], List[Tuple[str, Tuple[float, float]]]] = {}
+
         for eid, el in elements.items():
-            if el["elem_type"] == "track":
-                track_endpoints[eid] = LayoutTopologyAssistant.get_track_endpoints_logical(el)
+            et = el["elem_type"]
+            if et == "track":
+                p0, p1 = LayoutTopologyAssistant.get_track_endpoints_logical(el)
+                track_endpoints[eid] = (p0, p1)
+                s0 = self.logical_to_screen(p0[0], p0[1])
+                s1 = self.logical_to_screen(p1[0], p1[1])
+                track_screen_pts[eid] = (s0, s1)
+                track_colors[eid] = self._track_color(el, flash_on)
+                t0 = (int(round(p0[0])), int(round(p0[1])))
+                t1 = (int(round(p1[0])), int(round(p1[1])))
+                if self._is_point_visible(s0[0], s0[1], 80, 80):
+                    tile_buckets.setdefault(t0, []).append((eid, p0))
+                if t1 != t0 and self._is_point_visible(s1[0], s1[1], 80, 80):
+                    tile_buckets.setdefault(t1, []).append((eid, p1))
+            elif et == "turnout":
+                track_colors[eid] = self._track_color(el, flash_on)
 
         # 1. Draw Track Bars & Topological Links
         for eid, el in elements.items():
             etype = el["elem_type"]
             if etype not in ("track", "turnout"): continue
-            col1 = self._track_color(el, flash_on)
+            col1 = track_colors[eid]
 
             if etype == "track":
                 p0, p1 = track_endpoints[eid]
-                s0 = self.logical_to_screen(p0[0], p0[1])
-                s1 = self.logical_to_screen(p1[0], p1[1])
-                pygame.draw.line(self.screen, col1, s0, s1, line_w)
-                if col1 == COLOR_TRACK_GREEN and el.get("green_path_dir"):
-                    self._draw_track_bar_arrows(s0, s1, el["green_path_dir"])
+                s0, s1 = track_screen_pts[eid]
+                is_vis = self._is_seg_visible(s0, s1, margin=120)
+                if is_vis and self._is_seg_visible(s0, s1, margin=60):
+                    visible_track_screen_pts.append((s0, s1))
+                    pygame.draw.line(self.screen, col1, s0, s1, line_w)
+                    if col1 == COLOR_TRACK_GREEN and el.get("green_path_dir"):
+                        self._draw_track_bar_arrows(s0, s1, el["green_path_dir"])
+
+                if not is_vis:
+                    continue
 
                 nbr_ids = [nid for d_list in el.get("neighbors", {}).values() for nid in d_list]
                 for nid in nbr_ids:
-                    pair_key = tuple(sorted((eid, nid)))
+                    pair_key = (eid, nid) if eid < nid else (nid, eid)
                     if pair_key in drawn_pairs or nid not in elements: continue
                     nbr = elements[nid]
                     if nbr["elem_type"] == "turnout": continue
                     drawn_pairs.add(pair_key)
-                    col2 = self._track_color(nbr, flash_on)
+                    col2 = track_colors.get(nid) or self._track_color(nbr, flash_on)
                     if nid in track_endpoints:
                         np0, np1 = track_endpoints[nid]
                         best_pair = min(
@@ -6965,6 +7127,9 @@ class ApexBOSCreatorApp:
 
             elif etype == "turnout":
                 t_log = (float(el["x"]), float(el["y"]))
+                tsx, tsy = self.logical_to_screen(t_log[0], t_log[1])
+                if not self._is_point_visible(tsx, tsy, margin_x=180, margin_y=180):
+                    continue
                 common_id = el.get("common_neighbor", "")
                 norm_id = el.get("normal_neighbor", "")
                 rev_id = el.get("reverse_neighbor", "")
@@ -6977,12 +7142,12 @@ class ApexBOSCreatorApp:
                     if inactive_id in track_endpoints:
                         ip0, ip1 = track_endpoints[inactive_id]
                         target_pt = min((ip0, ip1), key=lambda p: math.hypot(p[0] - t_log[0], p[1] - t_log[1]))
-                    self._draw_octilinear_link(t_log, target_pt, COLOR_TURNOUT_TIE, COLOR_TURNOUT_TIE, max(2, line_w - 2))
+                    self._draw_octilinear_link(t_log, target_pt, COLOR_TURNOUT_TIE, COLOR_TURNOUT_TIE, max(1, line_w - 2))
 
                 for leg_id in (common_id, active_id):
                     if leg_id and leg_id in elements:
                         lnbr = elements[leg_id]
-                        leg_col = self._track_color(lnbr, flash_on)
+                        leg_col = track_colors.get(leg_id) or self._track_color(lnbr, flash_on)
                         target_pt = (float(lnbr["x"]), float(lnbr["y"]))
                         if leg_id in track_endpoints:
                             lp0, lp1 = track_endpoints[leg_id]
@@ -6990,8 +7155,8 @@ class ApexBOSCreatorApp:
                         g_dir = (el.get("green_path_dir") or lnbr.get("green_path_dir")) if (col1 == COLOR_TRACK_GREEN and leg_col == COLOR_TRACK_GREEN) else None
                         self._draw_octilinear_link(t_log, target_pt, col1, leg_col, line_w, green_dir=g_dir)
 
-        # 1a. Dim dotted track section separators
-        self._draw_section_separators(track_endpoints)
+        # 1a. Dim track section separators (visible tracks only)
+        self._draw_section_separators(visible_track_screen_pts)
 
         # 1b. Draw TrackJump Line-Break Links to Connected Track/Turnout
         for eid, el in elements.items():
@@ -7000,7 +7165,7 @@ class ApexBOSCreatorApp:
                 if conn_id and conn_id in elements:
                     j_log = (float(el["x"]), float(el["y"]))
                     cnbr = elements[conn_id]
-                    c_col = self._track_color(cnbr, flash_on)
+                    c_col = track_colors.get(conn_id) or self._track_color(cnbr, flash_on)
                     target_pt = (float(cnbr["x"]), float(cnbr["y"]))
                     if conn_id in track_endpoints:
                         cp0, cp1 = track_endpoints[conn_id]
@@ -7008,18 +7173,25 @@ class ApexBOSCreatorApp:
                     g_dir = cnbr.get("green_path_dir") if c_col == COLOR_TRACK_GREEN else None
                     self._draw_octilinear_link(j_log, target_pt, c_col, c_col, line_w, green_dir=g_dir)
 
-        # 2. Gapless 1-Cell Welding
-        track_id_list = list(track_endpoints.keys())
-        for i, tid_a in enumerate(track_id_list):
-            col_a = self._track_color(elements[tid_a], flash_on)
-            for tid_b in track_id_list[i + 1 :]:
-                if tuple(sorted((tid_a, tid_b))) in drawn_pairs: continue
-                col_b = self._track_color(elements[tid_b], flash_on)
-                for pa in track_endpoints[tid_a]:
-                    for pb in track_endpoints[tid_b]:
-                        if LayoutTopologyAssistant.endpoints_in_same_tile(pa, pb):
-                            g_dir = (elements[tid_a].get("green_path_dir") or elements[tid_b].get("green_path_dir")) if (col_a == COLOR_TRACK_GREEN and col_b == COLOR_TRACK_GREEN) else None
-                            self._draw_octilinear_link(pa, pb, col_a, col_b, line_w, green_dir=g_dir)
+        # 2. Gapless 1-Cell Welding (O(N) via spatial tile buckets)
+        for bucket in tile_buckets.values():
+            n_b = len(bucket)
+            if n_b < 2:
+                continue
+            for i in range(n_b):
+                tid_a, pa = bucket[i]
+                col_a = track_colors[tid_a]
+                for j in range(i + 1, n_b):
+                    tid_b, pb = bucket[j]
+                    if tid_a == tid_b:
+                        continue
+                    pair_key = (tid_a, tid_b) if tid_a < tid_b else (tid_b, tid_a)
+                    if pair_key in drawn_pairs:
+                        continue
+                    drawn_pairs.add(pair_key)
+                    col_b = track_colors[tid_b]
+                    g_dir = (elements[tid_a].get("green_path_dir") or elements[tid_b].get("green_path_dir")) if (col_a == COLOR_TRACK_GREEN and col_b == COLOR_TRACK_GREEN) else None
+                    self._draw_octilinear_link(pa, pb, col_a, col_b, line_w, green_dir=g_dir)
 
         if self.dragging_track_end:
             _, _, fixed_pt = self.dragging_track_end
@@ -7029,17 +7201,35 @@ class ApexBOSCreatorApp:
                 pygame.draw.lines(self.screen, COLOR_HANDLE_ACTIVE, False, scr_prev, max(2, line_w - 1))
 
         # 3. Draw Track Endpoint Handles, Signals & Placed System Lists
-        r_sig = max(6, int(7.5 * self.zoom))
-        handle_r = max(4, int(5.5 * self.zoom))
+        r_sig = max(4 if self.zoom < 0.55 else 6, int(7.5 * self.zoom))
+        handle_r = max(3, int(5.5 * self.zoom))
+        show_elem_labels = self.show_labels and (self.zoom >= 0.42)
+        draw_handles_all = (self.zoom >= 0.55)
+        lbl_font_reg = self._get_element_label_font(bold=False) if self.show_labels else self.font_sm
+        lbl_font_bold = self._get_element_label_font(bold=True) if self.show_labels else self.font_sm_bold
 
         for eid, el in elements.items():
             etype = el["elem_type"]
             sx, sy = self.logical_to_screen(el["x"], el["y"])
+            is_sel = (eid in self.selected_ids)
+
+            if etype not in SYSTEM_LIST_TYPES and etype not in ("ptc_datetime", "date_time", "datetime"):
+                if etype == "track":
+                    s0, s1 = track_screen_pts[eid]
+                    if not is_sel and not self._is_seg_visible(s0, s1, margin=80):
+                        continue
+                elif etype == "label":
+                    if not is_sel and not self._is_point_visible(sx, sy, margin_x=240, margin_y=60):
+                        continue
+                else:
+                    if not is_sel and not self._is_point_visible(sx, sy, margin_x=80, margin_y=80):
+                        continue
+
             label = el.get("label", "")
             disp_tag = f"{eid} ({label})" if label else eid
             lpos = el.get("label_pos", "top")
 
-            if eid in self.selected_ids and etype not in SYSTEM_LIST_TYPES:
+            if is_sel and etype not in SYSTEM_LIST_TYPES:
                 pygame.draw.circle(self.screen, COLOR_SELECT_RING, (sx, sy), int(15 * self.zoom) + 5, 2)
 
             if el.get("collision_warning") and flash_on:
@@ -7051,40 +7241,45 @@ class ApexBOSCreatorApp:
                 lamp_rgb = LAMP_COLORS.get(base_col_name, LAMP_COLORS["GRAY"])
                 if el.get("flashing", False) and not flash_on:
                     lamp_rgb = LAMP_COLORS["BLACK"]
-                pygame.draw.circle(self.screen, (18, 22, 28), (sx, sy), r_sig + 2)
-                pygame.draw.circle(self.screen, lamp_rgb, (sx, sy), r_sig)
-                pygame.draw.circle(self.screen, COLOR_SIGNAL_MAST, (sx, sy), r_sig + 2, 1)
-                self._draw_signal_chevron(sx, sy, max(3, r_sig - 2), el.get("direction", "E"))
-                
-                if self.show_labels or el.get("ctc_active"):
+                if self.zoom < 0.55:
+                    pygame.draw.circle(self.screen, lamp_rgb, (sx, sy), r_sig)
+                else:
+                    pygame.draw.circle(self.screen, (18, 22, 28), (sx, sy), r_sig + 2)
+                    pygame.draw.circle(self.screen, lamp_rgb, (sx, sy), r_sig)
+                    pygame.draw.circle(self.screen, COLOR_SIGNAL_MAST, (sx, sy), r_sig + 2, 1)
+                    self._draw_signal_chevron(sx, sy, max(3, r_sig - 2), el.get("direction", "E"))
+
+                if show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels):
                     pos_tag = el.get("position", "top")[0].upper()
                     disp_str = f"{eid}[{pos_tag}:{el.get('direction','E')}]" if self.show_labels else eid
-                    s_surf = self._get_element_label_font(bold=False).render(disp_str, True, COLOR_TEXT)
+                    s_surf = self._render_cached_text(lbl_font_reg, disp_str, COLOR_TEXT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, s_surf.get_width(), s_surf.get_height(), lpos, r_sig + 5)
                     self.screen.blit(s_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
                         pygame.draw.rect(self.screen, (0, 240, 255), (lbl_x - 3, lbl_y - 2, s_surf.get_width() + 6, s_surf.get_height() + 4), 1, border_radius=2)
 
             elif etype == "track":
-                p0, p1 = track_endpoints[eid]
-                for end_idx, ep in enumerate((p0, p1)):
-                    esx, esy = self.logical_to_screen(ep[0], ep[1])
-                    is_dragging_this = (
-                        self.dragging_track_end is not None
-                        and self.dragging_track_end[0] == eid
-                        and self.dragging_track_end[1] == end_idx
-                    )
-                    h_col = COLOR_HANDLE_ACTIVE if (is_dragging_this or eid in self.selected_ids) else COLOR_HANDLE
-                    pygame.draw.rect(
-                        self.screen, h_col,
-                        (esx - handle_r, esy - handle_r, handle_r * 2, handle_r * 2),
-                        0 if is_dragging_this else 2, border_radius=2,
-                    )
+                if draw_handles_all or is_sel or (self.dragging_track_end is not None and self.dragging_track_end[0] == eid):
+                    s0, s1 = track_screen_pts[eid]
+                    for end_idx, (esx, esy) in enumerate((s0, s1)):
+                        if not is_sel and not self._is_point_visible(esx, esy, 20, 20):
+                            continue
+                        is_dragging_this = (
+                            self.dragging_track_end is not None
+                            and self.dragging_track_end[0] == eid
+                            and self.dragging_track_end[1] == end_idx
+                        )
+                        h_col = COLOR_HANDLE_ACTIVE if (is_dragging_this or is_sel) else COLOR_HANDLE
+                        pygame.draw.rect(
+                            self.screen, h_col,
+                            (esx - handle_r, esy - handle_r, handle_r * 2, handle_r * 2),
+                            0 if is_dragging_this else 2, border_radius=2,
+                        )
 
-                if self.show_labels or el.get("ctc_active"):
+                if (show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels)) and self._is_point_visible(sx, sy, 140, 50):
                     len_mi = el.get("length_miles", 0.5)
                     tk_title = f"{disp_tag} [{len_mi}mi]" if self.show_labels else disp_tag
-                    id_surf = self._get_element_label_font(bold=True).render(tk_title, True, COLOR_TEXT)
+                    id_surf = self._render_cached_text(lbl_font_bold, tk_title, COLOR_TEXT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, id_surf.get_width(), id_surf.get_height(), lpos, int(15 * self.zoom))
                     self.screen.blit(id_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
@@ -7101,7 +7296,7 @@ class ApexBOSCreatorApp:
                         spd_txt = f"{spd:.1f}MPH" if spd is not None else ("Unk." if is_inferred else "")
                         badge_txt = f"{tname} {tdir} {spd_txt}{dim_tag}".strip()
                         b_col = (175, 185, 195) if is_dimmed else (240, 248, 255)
-                        b_surf = self.font_sm_bold.render(badge_txt, True, b_col)
+                        b_surf = self._render_cached_text(self.font_sm_bold, badge_txt, b_col)
                         pad_w, pad_h = b_surf.get_width() + 12, b_surf.get_height() + 6
                         badge_box = pygame.Surface((pad_w, pad_h), pygame.SRCALPHA)
                         bg_rgba = (35, 45, 60, 130) if is_dimmed else (25, 95, 215, 165)
@@ -7109,23 +7304,23 @@ class ApexBOSCreatorApp:
                         pygame.draw.rect(badge_box, bg_rgba, (0, 0, pad_w, pad_h), border_radius=5)
                         pygame.draw.rect(badge_box, border_rgba, (0, 0, pad_w, pad_h), 1, border_radius=5)
                         badge_box.blit(b_surf, (6, 3))
-                        
+
                         badge_pos = "bottom" if lpos == "top" else ("top" if lpos == "bottom" else ("right" if lpos == "left" else "left"))
                         bx, by = self._get_label_rect(sx, sy, pad_w, pad_h, badge_pos, int(12 * self.zoom))
                         self.screen.blit(badge_box, (bx, by))
 
             elif etype == "turnout":
-                sz = max(6, int(7 * self.zoom))
+                sz = max(4 if self.zoom < 0.55 else 6, int(7 * self.zoom))
                 pts = [(sx, sy - sz), (sx + sz, sy), (sx, sy + sz), (sx - sz, sy)]
-                t_col = self._track_color(el, flash_on)
+                t_col = track_colors[eid]
                 pygame.draw.polygon(self.screen, t_col, pts)
                 if t_col == COLOR_TRACK_GREEN and el.get("green_path_dir"):
                     self._draw_turnout_diamond_arrow(sx, sy, sz, el["green_path_dir"])
-                
-                if self.show_labels or el.get("ctc_active"):
+
+                if show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels):
                     align_char = "N" if el.get("state", 0) == 0 else "R"
                     t_title = f"{disp_tag}[{align_char}]" if self.show_labels else disp_tag
-                    t_surf = self._get_element_label_font(bold=True).render(t_title, True, COLOR_EDIT_ACCENT)
+                    t_surf = self._render_cached_text(lbl_font_bold, t_title, COLOR_EDIT_ACCENT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, t_surf.get_width(), t_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(t_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
@@ -7137,9 +7332,9 @@ class ApexBOSCreatorApp:
                 sz = max(7, int(9 * self.zoom))
                 pygame.draw.line(self.screen, col, (sx - sz, sy - sz), (sx + sz, sy + sz), 3)
                 pygame.draw.line(self.screen, col, (sx - sz, sy + sz), (sx + sz, sy - sz), 3)
-                
-                if self.show_labels:
-                    c_surf = self.font_sm.render(f"{disp_tag}[{gate}]", True, col)
+
+                if show_elem_labels or (is_sel and self.show_labels):
+                    c_surf = self._render_cached_text(self.font_sm, f"{disp_tag}[{gate}]", col)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, c_surf.get_width(), c_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(c_surf, (lbl_x, lbl_y))
 
@@ -7178,18 +7373,18 @@ class ApexBOSCreatorApp:
                 pygame.draw.circle(self.screen, col, (sx, sy - sz - 3), 3, 0 if is_active else 1)
                 if is_active and age < 2.0:
                     pygame.draw.circle(self.screen, col, (sx, sy - sz - 3), max(5, int(6.5 * self.zoom)), 1)
-                
-                if self.show_labels:
-                    b_surf = self.font_sm.render(f"{disp_tag}{rad_tag}(Ch{el.get('channel')})", True, col)
+
+                if show_elem_labels or (is_sel and self.show_labels):
+                    b_surf = self._render_cached_text(self.font_sm, f"{disp_tag}{rad_tag}(Ch{el.get('channel')})", col)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
 
             elif etype == "station":
                 w, h = max(14, int(18 * self.zoom)), max(10, int(12 * self.zoom))
                 pygame.draw.rect(self.screen, COLOR_LANDMARK, (sx - w // 2, sy - h // 2, w, h), border_radius=3)
-                
-                if self.show_labels:
-                    s_surf = self.font_sm.render(disp_tag, True, COLOR_LANDMARK)
+
+                if show_elem_labels or (is_sel and self.show_labels):
+                    s_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_LANDMARK)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, s_surf.get_width(), s_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(s_surf, (lbl_x, lbl_y))
 
@@ -7197,9 +7392,9 @@ class ApexBOSCreatorApp:
                 w, h = max(18, int(24 * self.zoom)), max(10, int(14 * self.zoom))
                 pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy - h // 2), (sx + w // 2, sy - h // 2), 2)
                 pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy + h // 2), (sx + w // 2, sy + h // 2), 2)
-                
-                if self.show_labels:
-                    b_surf = self.font_sm.render(disp_tag, True, COLOR_TEXT_DIM)
+
+                if show_elem_labels or (is_sel and self.show_labels):
+                    b_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
 
@@ -7207,15 +7402,16 @@ class ApexBOSCreatorApp:
                 sz = max(8, int(11 * self.zoom))
                 pts = [(sx, sy - sz), (sx + sz, sy), (sx, sy + sz), (sx - sz, sy)]
                 pygame.draw.polygon(self.screen, COLOR_LANDMARK, pts, 2)
-                
-                if self.show_labels:
-                    d_surf = self.font_sm.render(disp_tag, True, COLOR_TEXT_DIM)
+
+                if show_elem_labels or (is_sel and self.show_labels):
+                    d_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, d_surf.get_width(), d_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(d_surf, (lbl_x, lbl_y))
 
             elif etype == "label":
                 if self.show_labels:
-                    l_surf = self.font_lg.render(label or eid, True, COLOR_LANDMARK)
+                    l_font = self.font_sm if self.zoom < 0.65 else self.font_lg
+                    l_surf = self._render_cached_text(l_font, label or eid, COLOR_LANDMARK)
                     self.screen.blit(l_surf, (sx - l_surf.get_width() // 2, sy))
 
             elif etype == "track_jump":
@@ -7224,11 +7420,11 @@ class ApexBOSCreatorApp:
                 rad = max(11, int(13 * self.zoom))
                 pygame.draw.circle(self.screen, (26, 38, 58), (sx, sy), rad)
                 pygame.draw.circle(self.screen, COLOR_EDIT_ACCENT, (sx, sy), rad, 2)
-                ltr_surf = self.font_md.render(letter, True, (255, 230, 90))
+                ltr_surf = self._render_cached_text(self.font_md, letter, (255, 230, 90))
                 self.screen.blit(ltr_surf, (sx - ltr_surf.get_width() // 2, sy - ltr_surf.get_height() // 2))
-                if self.show_labels:
+                if show_elem_labels or (is_sel and self.show_labels):
                     pair_tag = f"->{paired_id}" if paired_id else ""
-                    j_surf = self.font_sm.render(f"{eid}[{letter}{pair_tag}]", True, COLOR_EDIT_ACCENT)
+                    j_surf = self._render_cached_text(self.font_sm, f"{eid}[{letter}{pair_tag}]", COLOR_EDIT_ACCENT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, j_surf.get_width(), j_surf.get_height(), lpos, rad + 4)
                     self.screen.blit(j_surf, (lbl_x, lbl_y))
 
@@ -7438,6 +7634,7 @@ class ApexBOSCreatorApp:
                 ("new", "New"),
                 ("load", "Load"),
                 ("import_itcvl", "Import ITCVL"),
+                ("import_atcs", "Import from ATCS"),
                 ("merge", "Merge(M)"),
                 ("save", "Save*" if self.dirty else "Save"),
                 ("save_as", "SaveAs"),
@@ -7501,7 +7698,7 @@ class ApexBOSCreatorApp:
                     bg = (42, 70, 105)
                 elif bkey in ("save", "save_as", "load", "merge"):
                     bg = (48, 72, 120)
-                elif bkey == "import_itcvl":
+                elif bkey in ("import_itcvl", "import_atcs"):
                     bg = (52, 95, 130)
                 elif bkey == "new":
                     bg = (38, 95, 110)
@@ -7759,6 +7956,8 @@ class ApexBOSCreatorApp:
                 prompt = f"ENTER 1X LAYOUT VIEW RADIUS (MILES) > {self.file_prompt_buffer}_   (Enter=Confirm, Esc=Cancel)"
             elif self.file_prompt_mode == "save_frag":
                 prompt = f"SAVE FRAGMENT NAME > {self.file_prompt_buffer}_   (Saved to frags/, Enter=Confirm, Esc=Cancel, Ctrl+BS=Clear)"
+            elif self.file_prompt_mode == "import_atcs":
+                prompt = f"IMPORT ATCS (.lay) FILEPATH > {self.file_prompt_buffer}_   (Enter=Import, Esc=Cancel, Ctrl+BS=Clear)"
             else:
                 prompt = f"{self.file_prompt_mode.upper()} FILEPATH > {self.file_prompt_buffer}_   (Enter=Confirm, Esc=Cancel, Ctrl+BS=Clear)"
             self.screen.blit(self.font_md.render(prompt, True, COLOR_EDIT_ACCENT), (14, self.height - 25))
@@ -8118,17 +8317,28 @@ class ApexBOSCreatorApp:
                     self._last_engine_eval_ts = now_tick
                     if getattr(self, "enable_inference_logic", True):
                         self.engine._evaluate_system_logic(now_tick, force=False)
+                    self._cached_render_state = None
 
                 # Advance raw packet log playback if active
                 if self.playback_active and self.playback_packets:
                     if now_tick - self.playback_last_tick >= self.playback_delay_sec:
                         self.playback_last_tick = now_tick
                         self.step_playback(forward=True)
+                        self._cached_render_state = None
 
                 self.screen.fill(COLOR_BG)
                 self.draw_grid()
 
-                state = self.engine.get_render_state()
+                state = getattr(self, "_cached_render_state", None)
+                if (
+                    state is None
+                    or getattr(self, "dragging_selection", False)
+                    or getattr(self, "dragging_track_end", None) is not None
+                    or len(state.get("elements", {})) != len(self.engine.elements)
+                ):
+                    state = self.engine.get_render_state()
+                    self._cached_render_state = state
+                    self._cached_render_state_ts = now_tick
                 self.draw_layout_state(state, flash_on)
 
                 if self.inplace_editor:

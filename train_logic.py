@@ -367,8 +367,52 @@ class TrainInferenceManager:
     potential train de-duplication, speed estimation, dimming, and timeout logic.
     """
 
-    @staticmethod
+    _cached_elem_id: Optional[int] = None
+    _cached_elem_len: int = -1
+    _cached_jumps_by_conn: Dict[str, Any] = {}
+    _cached_sig_boundaries: Set[Tuple[str, str, str]] = set()
+    _cached_sigs_by_elem: Dict[str, List[Any]] = {}
+    _cached_reachable: Dict[Tuple[str, str, int], Set[str]] = {}
+
+    @classmethod
+    def invalidate_caches(cls):
+        cls._cached_elem_id = None
+        cls._cached_elem_len = -1
+        cls._cached_reachable.clear()
+
+    @classmethod
+    def _ensure_topology_caches(cls, elements: Dict[str, Any]):
+        if cls._cached_elem_id != id(elements) or cls._cached_elem_len != len(elements):
+            j_map: Dict[str, Any] = {}
+            s_set: Set[Tuple[str, str, str]] = set()
+            s_by_el: Dict[str, List[Any]] = {}
+            for el in elements.values():
+                et = getattr(el, "elem_type", "")
+                if et == "track_jump":
+                    conn = getattr(el, "connected_element", None)
+                    if conn:
+                        j_map[conn] = el
+                elif et == "signal" or hasattr(el, "is_permissive"):
+                    s_dir = getattr(el, "direction", "")
+                    s_rear = getattr(el, "rear_element", None)
+                    s_prot = getattr(el, "protects_element", None)
+                    if s_prot:
+                        s_by_el.setdefault(s_prot, []).append(el)
+                    if s_rear and s_rear != s_prot:
+                        s_by_el.setdefault(s_rear, []).append(el)
+                    if s_rear and s_prot and s_dir:
+                        s_set.add((s_rear, s_prot, s_dir))
+                        s_set.add((s_prot, s_rear, s_dir))
+            cls._cached_elem_id = id(elements)
+            cls._cached_elem_len = len(elements)
+            cls._cached_jumps_by_conn = j_map
+            cls._cached_sig_boundaries = s_set
+            cls._cached_sigs_by_elem = s_by_el
+            cls._cached_reachable.clear()
+
+    @classmethod
     def resolve_through_jump(
+        cls,
         elements: Dict[str, Any],
         next_id: Optional[str],
         next_dir: str,
@@ -381,10 +425,16 @@ class TrainInferenceManager:
             if getattr(cand, "elem_type", "") == "track_jump":
                 jump_el = cand
         elif curr_id and curr_id in elements:
-            for el in elements.values():
-                if getattr(el, "elem_type", "") == "track_jump" and getattr(el, "connected_element", None) == curr_id:
-                    jump_el = el
-                    break
+            cls._ensure_topology_caches(elements)
+            cand_j = cls._cached_jumps_by_conn.get(curr_id)
+            if cand_j is not None and getattr(cand_j, "connected_element", None) == curr_id and getattr(cand_j, "id", "") in elements:
+                jump_el = cand_j
+            elif cls._cached_jumps_by_conn:
+                for el in elements.values():
+                    if getattr(el, "elem_type", "") == "track_jump" and getattr(el, "connected_element", None) == curr_id:
+                        jump_el = el
+                        cls._cached_jumps_by_conn[curr_id] = el
+                        break
         if not jump_el:
             return next_id, next_dir
 
@@ -442,6 +492,9 @@ class TrainInferenceManager:
 
         jump_fn = resolve_jump_fn or (lambda nid, ndir, cid: cls.resolve_through_jump(elements, nid, ndir, cid))
 
+        cls._ensure_topology_caches(elements)
+        sigs_by_elem = cls._cached_sigs_by_elem
+
         while curr_id and curr_id not in visited:
             visited.add(curr_id)
             curr_el = elements.get(curr_id)
@@ -487,10 +540,10 @@ class TrainInferenceManager:
                         break
 
             # If an intervening signal facing in this direction is strictly restricted (red), stop trace
+            cand_sigs = sigs_by_elem.get(next_id, ())
             facing_sigs = [
-                s for s in elements.values()
-                if (getattr(s, "elem_type", "") == "signal" or hasattr(s, "is_permissive"))
-                and getattr(s, "direction", "") == curr_dir
+                s for s in cand_sigs
+                if getattr(s, "direction", "") == curr_dir
                 and (
                     (getattr(s, "rear_element", None) == curr_id and getattr(s, "protects_element", None) == next_id)
                     or (getattr(s, "protects_element", None) == curr_id and getattr(s, "rear_element", None) == next_id)
@@ -513,15 +566,25 @@ class TrainInferenceManager:
         elements: Dict[str, Any]
     ) -> List[str]:
         """Extracts all downstream signals along the path in order."""
+        if not path:
+            return []
         sig_id = getattr(sig, "id", "")
         downstream: List[str] = []
+        cls._ensure_topology_caches(elements)
+        sigs_by_elem = cls._cached_sigs_by_elem
+
         for i in range(len(path)):
             curr_id, curr_dir = path[i]
             next_id = path[i + 1][0] if i + 1 < len(path) else None
             step_sigs = []
-            for s in elements.values():
-                if not (getattr(s, "elem_type", "") == "signal" or hasattr(s, "is_permissive")):
+            seen_cand: Set[int] = set()
+            cands = list(sigs_by_elem.get(curr_id, ()))
+            if next_id:
+                cands.extend(sigs_by_elem.get(next_id, ()))
+            for s in cands:
+                if id(s) in seen_cand:
                     continue
+                seen_cand.add(id(s))
                 s_id = getattr(s, "id", "")
                 if s_id == sig_id or getattr(s, "direction", "") != curr_dir:
                     continue
@@ -598,12 +661,10 @@ class TrainInferenceManager:
             if el1_id in (com2, getattr(el2, "normal_neighbor", None), getattr(el2, "reverse_neighbor", None)):
                 return True
 
-        # Signal boundary check
-        for s in elements.values():
-            if (getattr(s, "elem_type", "") == "signal" or hasattr(s, "is_permissive")) and getattr(s, "direction", "") == travel_dir:
-                if (getattr(s, "rear_element", None) == el1_id and getattr(s, "protects_element", None) == el2_id) or \
-                   (getattr(s, "protects_element", None) == el1_id and getattr(s, "rear_element", None) == el2_id):
-                    return True
+        # Signal boundary check (O(1) via cached boundary set)
+        cls._ensure_topology_caches(elements)
+        if (el1_id, el2_id, travel_dir) in cls._cached_sig_boundaries:
+            return True
 
         return False
 
@@ -620,6 +681,14 @@ class TrainInferenceManager:
         """Determines if target_id can be reached from start_id within max_depth steps."""
         if not start_id or not target_id:
             return False
+        if start_id == target_id:
+            return True
+        cls._ensure_topology_caches(elements)
+        cache_key = (start_id, travel_dir, max_depth)
+        reached = cls._cached_reachable.get(cache_key)
+        if reached is not None:
+            return target_id in reached
+
         curr_id = start_id
         curr_dir = travel_dir
         prev_id = None
@@ -627,8 +696,6 @@ class TrainInferenceManager:
         jump_fn = resolve_jump_fn or (lambda nid, ndir, cid: cls.resolve_through_jump(elements, nid, ndir, cid))
 
         for _ in range(max_depth):
-            if curr_id == target_id:
-                return True
             visited.add(curr_id)
             el = elements.get(curr_id)
             if not el:
@@ -644,9 +711,9 @@ class TrainInferenceManager:
             if not nxt_id or nxt_id in visited:
                 break
             prev_id, curr_id = curr_id, nxt_id
-            if curr_id == target_id:
-                return True
-        return False
+            visited.add(curr_id)
+        cls._cached_reachable[cache_key] = visited
+        return target_id in visited
 
     @classmethod
     def are_trains_on_same_continuous_path(
@@ -759,6 +826,7 @@ class TrainInferenceManager:
         Rule 2: Review all potential trains and if there are any already one on any part
         of the same continuous path going the same direction, merge/discard duplicates.
         """
+        non_cont_pairs: Set[Tuple[str, str]] = set()
         while True:
             merged = False
             train_items = list(train_tracker.trains.items())
@@ -770,14 +838,19 @@ class TrainInferenceManager:
                     key2, trn2 = train_items[j]
                     if trn2.get("status") != "Potential":
                         continue
+                    pair_k = (key1, key2) if key1 < key2 else (key2, key1)
+                    if pair_k in non_cont_pairs:
+                        continue
                     is_cont, trn1_is_up = cls.are_trains_on_same_continuous_path(trn1, trn2, elements, resolve_jump_fn)
                     if is_cont:
-                        if trn1_is_up:
-                            cls.merge_two_potential_trains(train_tracker, key1, key2)
-                        else:
-                            cls.merge_two_potential_trains(train_tracker, key2, key1)
+                        up_k = key1 if trn1_is_up else key2
+                        down_k = key2 if trn1_is_up else key1
+                        cls.merge_two_potential_trains(train_tracker, up_k, down_k)
+                        non_cont_pairs = {pk for pk in non_cont_pairs if up_k not in pk and down_k not in pk}
                         merged = True
                         break
+                    else:
+                        non_cont_pairs.add(pair_k)
                 if merged:
                     break
 
@@ -789,11 +862,17 @@ class TrainInferenceManager:
                     for key_act, trn_act in list(train_tracker.trains.items()):
                         if trn_act.get("status") not in ("Inferred", "Confirmed") or key_pot == key_act:
                             continue
+                        pair_k = (key_act, key_pot)
+                        if pair_k in non_cont_pairs:
+                            continue
                         is_cont, act_is_up = cls.are_trains_on_same_continuous_path(trn_act, trn_pot, elements, resolve_jump_fn)
                         if is_cont and act_is_up:
                             cls.merge_two_potential_trains(train_tracker, key_act, key_pot)
+                            non_cont_pairs = {pk for pk in non_cont_pairs if key_act not in pk and key_pot not in pk}
                             merged = True
                             break
+                        else:
+                            non_cont_pairs.add(pair_k)
                     if merged:
                         break
 
@@ -1086,6 +1165,8 @@ class TrainInferenceManager:
         """
         active_occ_ids: Set[str] = set()
         gps_resolver = get_signal_gps_fn or (lambda s: get_signal_gps(s, elements))
+        cls._ensure_topology_caches(elements)
+        cls._cached_reachable.clear()
 
         # Clear green path flags and expired inferred occupancies on tracks
         for el in elements.values():

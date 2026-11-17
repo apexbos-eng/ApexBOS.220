@@ -3185,21 +3185,47 @@ class DispatcherPygameRenderer:
             self._elem_label_font_cache[key] = pygame.font.SysFont("Consolas,DejaVu Sans Mono,monospace", sz, bold=bold)
         return self._elem_label_font_cache[key]
 
+    def _render_cached_text(self, font: pygame.font.Font, text: str, color: Tuple[int, int, int]) -> pygame.Surface:
+        cache = getattr(self, "_text_surf_cache", None)
+        if cache is None:
+            cache = {}
+            self._text_surf_cache = cache
+        key = (id(font), text, color)
+        surf = cache.get(key)
+        if surf is None:
+            if len(cache) >= 4096:
+                cache.clear()
+            surf = font.render(text, True, color)
+            cache[key] = surf
+        return surf
+
+    def _is_point_visible(self, sx: int, sy: int, margin_x: int = 80, margin_y: int = 80) -> bool:
+        return (-margin_x <= sx <= self.width + margin_x) and (-margin_y <= sy <= self.height + margin_y)
+
+    def _is_seg_visible(self, s0: Tuple[int, int], s1: Tuple[int, int], margin: int = 80) -> bool:
+        x0, y0 = s0
+        x1, y1 = s1
+        if (x0 < -margin and x1 < -margin) or (x0 > self.width + margin and x1 > self.width + margin):
+            return False
+        if (y0 < -margin and y1 < -margin) or (y0 > self.height + margin and y1 > self.height + margin):
+            return False
+        return True
+
     def render_aged_label(self, text: str, el: dict, ref_now: float, active_rgb: Tuple[int, int, int] = (245, 250, 255)) -> pygame.Surface:
         is_stale, age = self.get_element_inactivity(el, ref_now)
         use_zoom_font = el.get("elem_type") in ("track", "signal", "turnout")
         if age < 3.5:
             font = self._get_element_label_font(bold=True) if use_zoom_font else self.font_sm_bold
-            return font.render(text, True, active_rgb)
+            return self._render_cached_text(font, text, active_rgb)
 
         ratio = min(1.0, max(0.0, (age - 3.5) / max(1.0, self.stale_timeout_sec)))
         barely_visible_gray = (52, 58, 68)
-        r = int(active_rgb[0] * (1.0 - ratio) + barely_visible_gray[0] * ratio)
-        g = int(active_rgb[1] * (1.0 - ratio) + barely_visible_gray[1] * ratio)
-        b = int(active_rgb[2] * (1.0 - ratio) + barely_visible_gray[2] * ratio)
+        r = int(active_rgb[0] * (1.0 - ratio) + barely_visible_gray[0] * ratio) & ~3
+        g = int(active_rgb[1] * (1.0 - ratio) + barely_visible_gray[1] * ratio) & ~3
+        b = int(active_rgb[2] * (1.0 - ratio) + barely_visible_gray[2] * ratio) & ~3
         is_bold = ratio < 0.35
         font = self._get_element_label_font(bold=is_bold) if use_zoom_font else (self.font_sm_bold if is_bold else self.font_sm_thin)
-        return font.render(text, True, (r, g, b))
+        return self._render_cached_text(font, text, (r, g, b))
 
     def _get_label_rect(self, sx: int, sy: int, w: int, h: int, pos: str, offset: int) -> Tuple[int, int]:
         """Returns (x, y) top-left coordinates for blitting a label relative to element center (sx, sy)."""
@@ -3323,21 +3349,30 @@ class DispatcherPygameRenderer:
         elements = state.get("elements", {})
         best_id = None
         best_dist = max(15.0, 18.0 * self.zoom)
+        mlx, mly = self.screen_to_logical(sx, sy)
+        max_log_r = best_dist / max(1e-3, LOGICAL_GRID_SCALE * self.zoom) + 0.5
         for eid, el in elements.items():
             etype = el.get("elem_type")
             lx, ly = self.get_elem_logical_pos(el)
-            ex, ey = self.logical_to_screen(lx, ly)
             if etype in ("ptc_datetime", "date_time", "datetime"):
+                ex, ey = self.logical_to_screen(lx, ly)
                 ew = int((el.get("width") or 220) * self.zoom)
                 eh = int((el.get("height") or 46) * self.zoom)
                 if pygame.Rect(ex, ey, ew, eh).collidepoint(sx, sy):
                     return eid
+                continue
             if etype == "track":
+                half_span = max(0.5, float(el.get("length_miles", 0.5) or 0.5) * 2.0) + max_log_r
+                if abs(lx - mlx) > half_span or abs(ly - mly) > half_span:
+                    continue
                 p0, p1 = self._get_track_endpoints_logical(el)
                 s0 = self.logical_to_screen(p0[0], p0[1])
                 s1 = self.logical_to_screen(p1[0], p1[1])
                 dist = self._dist_to_segment_px(sx, sy, s0[0], s0[1], s1[0], s1[1])
             else:
+                if abs(lx - mlx) > max_log_r or abs(ly - mly) > max_log_r:
+                    continue
+                ex, ey = self.logical_to_screen(lx, ly)
                 dist = math.hypot(sx - ex, sy - ey)
             if dist <= best_dist:
                 best_dist = dist
@@ -3350,21 +3385,30 @@ class DispatcherPygameRenderer:
         elements = state.get("elements", {})
         best_id = None
         best_dist = max(15.0, 18.0 * self.zoom)
+        mlx, mly = self.screen_to_logical(sx, sy)
+        max_log_r = best_dist / max(1e-3, LOGICAL_GRID_SCALE * self.zoom) + 0.5
         for eid, el in elements.items():
             etype = el.get("elem_type")
             lx, ly = self.get_elem_logical_pos(el)
-            ex, ey = self.logical_to_screen(lx, ly)
             if etype in ("ptc_datetime", "date_time", "datetime"):
+                ex, ey = self.logical_to_screen(lx, ly)
                 ew = int((el.get("width") or 220) * self.zoom)
                 eh = int((el.get("height") or 46) * self.zoom)
                 if pygame.Rect(ex, ey, ew, eh).collidepoint(sx, sy):
                     return eid
+                continue
             if etype == "track":
+                half_span = max(0.5, float(el.get("length_miles", 0.5) or 0.5) * 2.0) + max_log_r
+                if abs(lx - mlx) > half_span or abs(ly - mly) > half_span:
+                    continue
                 p0, p1 = self._get_track_endpoints_logical(el)
                 s0 = self.logical_to_screen(p0[0], p0[1])
                 s1 = self.logical_to_screen(p1[0], p1[1])
                 dist = self._dist_to_segment_px(sx, sy, s0[0], s0[1], s1[0], s1[1])
             else:
+                if abs(lx - mlx) > max_log_r or abs(ly - mly) > max_log_r:
+                    continue
+                ex, ey = self.logical_to_screen(lx, ly)
                 dist = math.hypot(sx - ex, sy - ey)
             if dist <= best_dist:
                 best_dist = dist
@@ -4689,13 +4733,16 @@ class DispatcherPygameRenderer:
         notch = (int(round(cx - vx * L_arr * 0.15)), int(round(cy - vy * L_arr * 0.15)))
         pts = [tip, barb_r, notch, barb_l]
         pygame.draw.polygon(self.screen, (235, 255, 240), pts)
-        pygame.draw.polygon(self.screen, (10, 40, 20), pts, 1)
+        if self.zoom >= 0.7:
+            pygame.draw.polygon(self.screen, (10, 40, 20), pts, 1)
 
     def _draw_track_bar_arrows(self, p1: Tuple[int, int], p2: Tuple[int, int], direction: str):
+        if self.zoom < 0.45 or not direction:
+            return
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         length = math.hypot(dx, dy)
-        if length < 18.0 * self.zoom or not direction:
+        if length < 22.0 * self.zoom:
             return
         ux, uy = dx / length, dy / length
         dir_vec = DIR_SCREEN_VECTORS.get(direction.upper(), (1.0, 0.0))
@@ -4707,24 +4754,25 @@ class DispatcherPygameRenderer:
         else:
             vx, vy = dir_vec[0], dir_vec[1]
 
-        sz = max(3.8, 5.0 * self.zoom)
-        if length >= 90.0 * self.zoom:
-            t_vals = (0.18, 0.34, 0.66, 0.82)
-        elif length >= 38.0 * self.zoom:
-            t_vals = (0.28, 0.72)
+        sz = max(3.6, 4.8 * self.zoom)
+        if length >= 150.0 * self.zoom:
+            t_vals = (0.30, 0.70)
         else:
-            t_vals = (0.28,)
+            t_vals = (0.50,)
 
         for t in t_vals:
             cx = p1[0] + ux * length * t
             cy = p1[1] + uy * length * t
-            self._draw_green_path_arrowhead(cx, cy, vx, vy, sz)
+            if self._is_point_visible(int(cx), int(cy), 20, 20):
+                self._draw_green_path_arrowhead(cx, cy, vx, vy, sz)
 
     def _draw_link_green_arrows(self, p1: Tuple[int, int], p2: Tuple[int, int], direction: str):
+        if self.zoom < 0.55 or not direction:
+            return
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         length = math.hypot(dx, dy)
-        if length < 18.0 * self.zoom or not direction:
+        if length < 38.0 * self.zoom:
             return
         ux, uy = dx / length, dy / length
         dir_vec = DIR_SCREEN_VECTORS.get(direction.upper(), (1.0, 0.0))
@@ -4736,20 +4784,14 @@ class DispatcherPygameRenderer:
         else:
             vx, vy = dir_vec[0], dir_vec[1]
 
-        sz = max(3.8, 5.0 * self.zoom)
-        if length >= 50.0 * self.zoom:
-            n = max(2, int(round(length / (42.0 * self.zoom))))
-            t_vals = [i / (n + 1) for i in range(1, n + 1)]
-        else:
-            t_vals = [0.5]
-
-        for t in t_vals:
-            cx = p1[0] + ux * length * t
-            cy = p1[1] + uy * length * t
+        sz = max(3.6, 4.8 * self.zoom)
+        cx = p1[0] + ux * length * 0.5
+        cy = p1[1] + uy * length * 0.5
+        if self._is_point_visible(int(cx), int(cy), 20, 20):
             self._draw_green_path_arrowhead(cx, cy, vx, vy, sz)
 
     def _draw_turnout_diamond_arrow(self, sx: int, sy: int, sz: float, direction: str):
-        if not direction:
+        if not direction or self.zoom < 0.5:
             return
         dir_vec = DIR_SCREEN_VECTORS.get(direction.upper(), (1.0, 0.0))
         self._draw_green_path_arrowhead(sx, sy, dir_vec[0], dir_vec[1], sz=sz * 0.65)
@@ -4763,80 +4805,129 @@ class DispatcherPygameRenderer:
         line_w: int,
         green_dir: Optional[str] = None,
     ):
+        s_start = self.logical_to_screen(p1_log[0], p1_log[1])
+        s_end = self.logical_to_screen(p2_log[0], p2_log[1])
+        if not self._is_seg_visible(s_start, s_end, margin=100):
+            return
         poly_log = self._compute_45deg_polyline(p1_log, p2_log)
-        scr_pts = [self.logical_to_screen(px, py) for px, py in poly_log]
-        if len(scr_pts) == 2:
-            mx, my = (scr_pts[0][0] + scr_pts[1][0]) // 2, (scr_pts[0][1] + scr_pts[1][1]) // 2
-            pygame.draw.line(self.screen, col1, scr_pts[0], (mx, my), line_w)
-            pygame.draw.line(self.screen, col2, (mx, my), scr_pts[1], line_w)
-            pygame.draw.circle(self.screen, col1, (mx, my), max(2, line_w // 2))
-        elif len(scr_pts) >= 3:
+        if len(poly_log) == 2:
+            scr_pts = [s_start, s_end]
+            if col1 == col2:
+                pygame.draw.line(self.screen, col1, s_start, s_end, line_w)
+            else:
+                mx, my = (s_start[0] + s_end[0]) // 2, (s_start[1] + s_end[1]) // 2
+                pygame.draw.line(self.screen, col1, s_start, (mx, my), line_w)
+                pygame.draw.line(self.screen, col2, (mx, my), s_end, line_w)
+                if self.zoom >= 0.6:
+                    pygame.draw.circle(self.screen, col1, (mx, my), max(2, line_w // 2))
+        else:
+            scr_pts = [s_start, self.logical_to_screen(poly_log[1][0], poly_log[1][1]), s_end]
             pygame.draw.line(self.screen, col1, scr_pts[0], scr_pts[1], line_w)
-            pygame.draw.circle(self.screen, col1, scr_pts[1], max(2, line_w // 2))
+            if self.zoom >= 0.6:
+                pygame.draw.circle(self.screen, col1, scr_pts[1], max(2, line_w // 2))
             pygame.draw.line(self.screen, col2, scr_pts[1], scr_pts[2], line_w)
 
         if green_dir:
             for i in range(len(scr_pts) - 1):
                 self._draw_link_green_arrows(scr_pts[i], scr_pts[i + 1], green_dir)
 
-    def _draw_section_separators(self, track_endpoints: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]]):
-        """Draws dim dotted lines perpendicular to each track at its ends to show track section boundaries."""
+    def _draw_section_separators(self, visible_track_screen_pts: List[Tuple[Tuple[int, int], Tuple[int, int]]]):
+        """Draws dim perpendicular markers at visible track ends to show track section boundaries."""
+        if self.zoom < 0.55:
+            return
         col = (92, 104, 124)
-        half = max(7, int(10 * self.zoom))
+        half = max(5, int(9 * self.zoom))
+        use_dots = (self.zoom >= 1.15)
         dot_r = max(1, int(round(1.3 * self.zoom)))
-        n_dots = 6
-        for p0, p1 in track_endpoints.values():
-            s0 = self.logical_to_screen(p0[0], p0[1])
-            s1 = self.logical_to_screen(p1[0], p1[1])
+        n_dots = 5
+        for s0, s1 in visible_track_screen_pts:
             dx, dy = s1[0] - s0[0], s1[1] - s0[1]
             ln = math.hypot(dx, dy)
-            if ln < 1.0:
+            if ln < 2.0:
                 continue
             nx, ny = -dy / ln, dx / ln
             for sx, sy in (s0, s1):
-                for i in range(n_dots):
-                    t = -half + (2.0 * half) * i / (n_dots - 1)
-                    pygame.draw.circle(self.screen, col, (int(sx + nx * t), int(sy + ny * t)), dot_r)
+                if not self._is_point_visible(sx, sy, 25, 25):
+                    continue
+                if use_dots:
+                    for i in range(n_dots):
+                        t = -half + (2.0 * half) * i / (n_dots - 1)
+                        pygame.draw.circle(self.screen, col, (int(sx + nx * t), int(sy + ny * t)), dot_r)
+                else:
+                    pygame.draw.line(
+                        self.screen,
+                        col,
+                        (int(sx - nx * half), int(sy - ny * half)),
+                        (int(sx + nx * half), int(sy + ny * half)),
+                        1,
+                    )
 
     def draw_layout_state(self, state: dict, flash_on: bool, ref_now: Optional[float] = None):
         if ref_now is None:
             ref_now = self.get_reference_now(state)
         elements = state.get("elements", {})
         drawn_pairs = set()
-        line_w = max(3, int(5 * self.zoom))
+        line_w = max(2 if self.zoom < 0.45 else 3, int(5 * self.zoom))
 
         track_endpoints: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
+        track_screen_pts: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {}
+        visible_track_screen_pts: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        track_colors: Dict[str, Tuple[int, int, int]] = {}
+        spatial_grid: Dict[Tuple[int, int], List[Tuple[str, Tuple[float, float]]]] = {}
+
         for eid, el in elements.items():
-            if el.get("elem_type") == "track":
-                track_endpoints[eid] = self._get_track_endpoints_logical(el)
+            et = el.get("elem_type")
+            if et == "track":
+                p0, p1 = self._get_track_endpoints_logical(el)
+                track_endpoints[eid] = (p0, p1)
+                s0 = self.logical_to_screen(p0[0], p0[1])
+                s1 = self.logical_to_screen(p1[0], p1[1])
+                track_screen_pts[eid] = (s0, s1)
+                track_colors[eid] = self._track_color(el, flash_on, ref_now)
+                if self._is_point_visible(s0[0], s0[1], 80, 80):
+                    c0 = (int(math.floor(p0[0] / 2.0)), int(math.floor(p0[1] / 2.0)))
+                    spatial_grid.setdefault(c0, []).append((eid, p0))
+                if self._is_point_visible(s1[0], s1[1], 80, 80):
+                    c1 = (int(math.floor(p1[0] / 2.0)), int(math.floor(p1[1] / 2.0)))
+                    spatial_grid.setdefault(c1, []).append((eid, p1))
+            elif et == "turnout":
+                track_colors[eid] = self._track_color(el, flash_on, ref_now)
+
+        self._frame_track_colors = track_colors
+        self._frame_track_screen_pts = track_screen_pts
 
         # 1. Draw Track Bars & Topological Links
         for eid, el in elements.items():
             etype = el.get("elem_type")
             if etype not in ("track", "turnout"):
                 continue
-            col1 = self._track_color(el, flash_on, ref_now)
+            col1 = track_colors[eid]
 
             if etype == "track":
                 p0, p1 = track_endpoints[eid]
-                s0 = self.logical_to_screen(p0[0], p0[1])
-                s1 = self.logical_to_screen(p1[0], p1[1])
-                pygame.draw.line(self.screen, col1, s0, s1, line_w)
-                if el.get("green_path") and el.get("green_path_dir"):
-                    self._draw_track_bar_arrows(s0, s1, el["green_path_dir"])
+                s0, s1 = track_screen_pts[eid]
+                is_vis = self._is_seg_visible(s0, s1, margin=120)
+                if is_vis and self._is_seg_visible(s0, s1, margin=60):
+                    visible_track_screen_pts.append((s0, s1))
+                    pygame.draw.line(self.screen, col1, s0, s1, line_w)
+                    if el.get("green_path") and el.get("green_path_dir"):
+                        self._draw_track_bar_arrows(s0, s1, el["green_path_dir"])
+
+                if not is_vis:
+                    continue
 
                 nbr_ids = []
                 if isinstance(el.get("neighbors"), dict):
                     nbr_ids = [nid for d_list in el.get("neighbors", {}).values() for nid in d_list]
                 for nid in nbr_ids:
-                    pair_key = tuple(sorted((eid, nid)))
+                    pair_key = (eid, nid) if eid < nid else (nid, eid)
                     if pair_key in drawn_pairs or nid not in elements:
                         continue
                     nbr = elements[nid]
                     if nbr.get("elem_type") == "turnout":
                         continue
                     drawn_pairs.add(pair_key)
-                    col2 = self._track_color(nbr, flash_on, ref_now)
+                    col2 = track_colors.get(nid) or self._track_color(nbr, flash_on, ref_now)
                     if nid in track_endpoints:
                         np0, np1 = track_endpoints[nid]
                         best_pair = min(
@@ -4848,6 +4939,9 @@ class DispatcherPygameRenderer:
 
             elif etype == "turnout":
                 t_log = self.get_elem_logical_pos(el)
+                tsx, tsy = self.logical_to_screen(t_log[0], t_log[1])
+                if not self._is_point_visible(tsx, tsy, margin_x=180, margin_y=180):
+                    continue
                 common_id = el.get("common_neighbor", "")
                 norm_id = el.get("normal_neighbor", "")
                 rev_id = el.get("reverse_neighbor", "")
@@ -4860,12 +4954,12 @@ class DispatcherPygameRenderer:
                     if inactive_id in track_endpoints:
                         ip0, ip1 = track_endpoints[inactive_id]
                         target_pt = min((ip0, ip1), key=lambda p: math.hypot(p[0] - t_log[0], p[1] - t_log[1]))
-                    self._draw_octilinear_link(t_log, target_pt, COLOR_TURNOUT_TIE, COLOR_TURNOUT_TIE, max(2, line_w - 2))
+                    self._draw_octilinear_link(t_log, target_pt, COLOR_TURNOUT_TIE, COLOR_TURNOUT_TIE, max(1, line_w - 2))
 
                 for leg_id in (common_id, active_id):
                     if leg_id and leg_id in elements:
                         lnbr = elements[leg_id]
-                        leg_col = self._track_color(lnbr, flash_on, ref_now)
+                        leg_col = track_colors.get(leg_id) or self._track_color(lnbr, flash_on, ref_now)
                         target_pt = self.get_elem_logical_pos(lnbr)
                         if leg_id in track_endpoints:
                             lp0, lp1 = track_endpoints[leg_id]
@@ -4873,8 +4967,8 @@ class DispatcherPygameRenderer:
                         g_dir = (el.get("green_path_dir") or lnbr.get("green_path_dir")) if (el.get("green_path") and lnbr.get("green_path")) else None
                         self._draw_octilinear_link(t_log, target_pt, col1, leg_col, line_w, green_dir=g_dir)
 
-        # 1a. Dim dotted track section separators
-        self._draw_section_separators(track_endpoints)
+        # 1a. Dim track section separators (visible tracks only)
+        self._draw_section_separators(visible_track_screen_pts)
 
         # 1b. Draw TrackJump Line-Break Links to Connected Track/Turnout
         for eid, el in elements.items():
@@ -4883,7 +4977,7 @@ class DispatcherPygameRenderer:
                 if conn_id and conn_id in elements:
                     j_log = self.get_elem_logical_pos(el)
                     cnbr = elements[conn_id]
-                    c_col = self._track_color(cnbr, flash_on, ref_now)
+                    c_col = track_colors.get(conn_id) or self._track_color(cnbr, flash_on, ref_now)
                     target_pt = self.get_elem_logical_pos(cnbr)
                     if conn_id in track_endpoints:
                         cp0, cp1 = track_endpoints[conn_id]
@@ -4891,17 +4985,31 @@ class DispatcherPygameRenderer:
                     g_dir = cnbr.get("green_path_dir") if cnbr.get("green_path") else None
                     self._draw_octilinear_link(j_log, target_pt, c_col, c_col, line_w, green_dir=g_dir)
 
-        # 2. Gapless 1-Cell Welding
-        track_id_list = list(track_endpoints.keys())
-        for i, tid_a in enumerate(track_id_list):
-            col_a = self._track_color(elements[tid_a], flash_on, ref_now)
-            for tid_b in track_id_list[i + 1 :]:
-                if tuple(sorted((tid_a, tid_b))) in drawn_pairs:
+        # 2. Gapless 1-Cell Welding (O(N) via 2.0-unit spatial grid buckets)
+        NEIGHBOR_OFFSETS = ((0, 0), (1, 0), (0, 1), (1, 1), (-1, 1))
+        for (gx, gy), bucket_a in spatial_grid.items():
+            for ox, oy in NEIGHBOR_OFFSETS:
+                bucket_b = spatial_grid.get((gx + ox, gy + oy))
+                if not bucket_b:
                     continue
-                col_b = self._track_color(elements[tid_b], flash_on, ref_now)
-                for pa in track_endpoints[tid_a]:
-                    for pb in track_endpoints[tid_b]:
-                        if math.hypot(pa[0] - pb[0], pa[1] - pb[1]) <= 1.5:
+                same_cell = (ox == 0 and oy == 0)
+                n_a = len(bucket_a)
+                for i in range(n_a):
+                    tid_a, pa = bucket_a[i]
+                    col_a = track_colors[tid_a]
+                    start_j = (i + 1) if same_cell else 0
+                    for j in range(start_j, len(bucket_b)):
+                        tid_b, pb = bucket_b[j]
+                        if tid_a == tid_b:
+                            continue
+                        pair_key = (tid_a, tid_b) if tid_a < tid_b else (tid_b, tid_a)
+                        if pair_key in drawn_pairs:
+                            continue
+                        dx = pa[0] - pb[0]
+                        dy = pa[1] - pb[1]
+                        if dx * dx + dy * dy <= 2.25:  # <= 1.5 units
+                            drawn_pairs.add(pair_key)
+                            col_b = track_colors[tid_b]
                             g_dir = (elements[tid_a].get("green_path_dir") or elements[tid_b].get("green_path_dir")) if (elements[tid_a].get("green_path") and elements[tid_b].get("green_path")) else None
                             self._draw_octilinear_link(pa, pb, col_a, col_b, line_w, green_dir=g_dir)
 
@@ -4914,14 +5022,17 @@ class DispatcherPygameRenderer:
             groups.setdefault(key, []).append(el)
 
         pos_rank = {"top": 0, "middle": 1, "bottom": 2}
-        r = max(6, int(7.5 * self.zoom))
+        r = max(4 if self.zoom < 0.55 else 6, int(7.5 * self.zoom))
         spacing = r * 2 + 4
+        show_sig_labels = self.show_labels and (self.zoom >= 0.42)
 
         for (_, _, direction, protects_id), heads in groups.items():
             heads.sort(key=lambda h: pos_rank.get(str(h.get("position", "top")).lower(), 0))
             anchor_head = heads[0]
             alx, aly = self.get_elem_logical_pos(anchor_head)
             asx, asy = self.logical_to_screen(alx, aly)
+            if not self._is_point_visible(asx, asy, margin_x=120, margin_y=120):
+                continue
 
             prot_el = elements.get(protects_id)
             if prot_el:
@@ -4940,7 +5051,7 @@ class DispatcherPygameRenderer:
 
             is_stale, _ = self.get_element_inactivity(anchor_head, ref_now)
             mast_col = COLOR_TRACK_STALE_GRAY if is_stale else COLOR_SIGNAL_MAST
-            if len(heads) > 1:
+            if len(heads) > 1 and self.zoom >= 0.55:
                 end_x = asx + step_dx * (len(heads) - 1)
                 end_y = asy + step_dy * (len(heads) - 1)
                 pygame.draw.line(self.screen, mast_col, (asx, asy), (end_x, end_y), 3)
@@ -4986,10 +5097,8 @@ class DispatcherPygameRenderer:
                     if h_el.get("flashing", False) and not flash_on:
                         lamp_rgb = LAMP_COLORS["BLACK"]
                 elif h_stale or age >= self.stale_timeout_sec:
-                    # When fading signals, fade them to a darker version of their last reported color instead of dark gray
                     lamp_rgb = dark_rgb
                 else:
-                    # Smoothly fade from active color to darker version of last reported color
                     fade_ratio = min(1.0, max(0.0, (age - 3.5) / max(1.0, self.stale_timeout_sec - 3.5)))
                     r_c = int(round(active_rgb[0] * (1.0 - fade_ratio) + dark_rgb[0] * fade_ratio))
                     g_c = int(round(active_rgb[1] * (1.0 - fade_ratio) + dark_rgb[1] * fade_ratio))
@@ -4998,12 +5107,15 @@ class DispatcherPygameRenderer:
                     if h_el.get("flashing", False) and not flash_on and fade_ratio < 0.65:
                         lamp_rgb = LAMP_COLORS["BLACK"]
 
-                pygame.draw.circle(self.screen, (18, 22, 28), (hx, hy), r + 2)
-                pygame.draw.circle(self.screen, lamp_rgb, (hx, hy), r)
-                pygame.draw.circle(self.screen, mast_col, (hx, hy), r + 2, 1)
-                self._draw_signal_direction_arrow(hx, hy, max(3, r - 2), direction)
+                if self.zoom < 0.55:
+                    pygame.draw.circle(self.screen, lamp_rgb, (hx, hy), r)
+                else:
+                    pygame.draw.circle(self.screen, (18, 22, 28), (hx, hy), r + 2)
+                    pygame.draw.circle(self.screen, lamp_rgb, (hx, hy), r)
+                    pygame.draw.circle(self.screen, mast_col, (hx, hy), r + 2, 1)
+                    self._draw_signal_direction_arrow(hx, hy, max(3, r - 2), direction)
 
-            if (self.show_labels or anchor_head.get("ctc_active")) and head_screen_pts:
+            if (show_sig_labels or anchor_head.get("ctc_active") or (anchor_head["id"] == self.selected_id and self.show_labels)) and head_screen_pts:
                 lbl = self.get_elem_label(anchor_head)
                 disp_tag = f"{anchor_head['id']} ({lbl})" if (lbl and self.show_labels) else anchor_head['id']
                 lbl_surf = self.render_aged_label(disp_tag, anchor_head, ref_now, active_rgb=(215, 230, 250))
@@ -5062,6 +5174,8 @@ class DispatcherPygameRenderer:
         curr_state = self.current_state()
         ts_data = curr_state.get("train_scroller", {}) if isinstance(curr_state, dict) else {}
         self._draw_all_signals(elements, flash_on, ref_now)
+        frame_colors = getattr(self, "_frame_track_colors", {})
+        show_elem_labels = self.show_labels and (self.zoom >= 0.42)
 
         for eid, el in elements.items():
             etype = el["elem_type"]
@@ -5070,12 +5184,22 @@ class DispatcherPygameRenderer:
 
             lx, ly = self.get_elem_logical_pos(el)
             sx, sy = self.logical_to_screen(lx, ly)
+            is_sel = (eid == self.selected_id)
+
+            if etype not in ("ptc_datetime", "date_time", "datetime", "packet_scroller", "address_table", "train_scroller", "chat"):
+                if etype == "label":
+                    if not is_sel and not self._is_point_visible(sx, sy, margin_x=240, margin_y=60):
+                        continue
+                else:
+                    if not is_sel and not self._is_point_visible(sx, sy, margin_x=120, margin_y=80):
+                        continue
+
             label = self.get_elem_label(el)
             disp_tag = f"{eid} ({label})" if label else eid
             is_stale, age = self.get_element_inactivity(el, ref_now)
             lpos = el.get("label_pos", "top")
 
-            if eid == self.selected_id:
+            if is_sel:
                 pygame.draw.circle(self.screen, COLOR_SELECT_RING, (sx, sy), int(15 * self.zoom) + 4, 2)
             elif self.edit_mode:
                 pygame.draw.circle(self.screen, COLOR_GRID_MAJOR, (sx, sy), int(10 * self.zoom) + 2, 1)
@@ -5087,12 +5211,13 @@ class DispatcherPygameRenderer:
                 pygame.draw.circle(self.screen, (255, 190, 40), (sx, sy), rad2, 2)
 
             if etype == "track":
-                col = self._track_color(el, flash_on, ref_now)
-                r = max(4, int(5 * self.zoom))
-                pygame.draw.circle(self.screen, col, (sx, sy), r)
-                pygame.draw.circle(self.screen, COLOR_BG, (sx, sy), max(2, r - 2))
+                col = frame_colors.get(eid) or self._track_color(el, flash_on, ref_now)
+                if self.zoom >= 0.55 or is_sel:
+                    r = max(4, int(5 * self.zoom))
+                    pygame.draw.circle(self.screen, col, (sx, sy), r)
+                    pygame.draw.circle(self.screen, COLOR_BG, (sx, sy), max(2, r - 2))
 
-                if self.show_labels or el.get("ctc_active"):
+                if show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels):
                     len_mi = el.get("length_miles", 0.5)
                     tk_title = f"{disp_tag} [{len_mi}mi]" if self.show_labels else disp_tag
                     id_surf = self.render_aged_label(tk_title, el, ref_now, active_rgb=(235, 245, 255))
@@ -5127,12 +5252,12 @@ class DispatcherPygameRenderer:
                         dim_tag = " (DIMMED)" if is_dimmed else ""
                         spd_txt = f"{spd:.1f}MPH" if spd is not None else ("Unk." if is_inferred else "")
                         badge_txt = f"{rx_dot}{tname} [{trn_st[:4]}] {tdir} {spd_txt}{dim_tag}".strip()
-                        
+
                         b_col = (175, 185, 195) if is_dimmed else (240, 248, 255)
-                        b_surf = self.font_sm_bold.render(badge_txt, True, b_col)
+                        b_surf = self._render_cached_text(self.font_sm_bold, badge_txt, b_col)
                         pad_w, pad_h = b_surf.get_width() + 12, b_surf.get_height() + 6
                         badge_box = pygame.Surface((pad_w, pad_h), pygame.SRCALPHA)
-                        
+
                         bg_rgba = (35, 45, 60, 130) if is_dimmed else (25, 95, 215, 175)
                         border_rgba = (95, 105, 120, 160) if is_dimmed else (90, 175, 255, 215)
                         pygame.draw.rect(badge_box, bg_rgba, (0, 0, pad_w, pad_h), border_radius=5)
@@ -5144,15 +5269,16 @@ class DispatcherPygameRenderer:
                         self.screen.blit(badge_box, (bx, by))
 
             elif etype == "turnout":
-                col = self._track_color(el, flash_on, ref_now)
-                sz = max(6, int(7 * self.zoom))
+                col = frame_colors.get(eid) or self._track_color(el, flash_on, ref_now)
+                sz = max(4 if self.zoom < 0.55 else 6, int(7 * self.zoom))
                 pts = [(sx, sy - sz), (sx + sz, sy), (sx, sy + sz), (sx - sz, sy)]
                 pygame.draw.polygon(self.screen, col, pts)
-                pygame.draw.polygon(self.screen, COLOR_BG, pts, 1)
+                if self.zoom >= 0.55:
+                    pygame.draw.polygon(self.screen, COLOR_BG, pts, 1)
                 if el.get("green_path") and el.get("green_path_dir"):
                     self._draw_turnout_diamond_arrow(sx, sy, sz, el["green_path_dir"])
-                
-                if self.show_labels or el.get("ctc_active"):
+
+                if show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels):
                     align_char = "N" if el.get("state", 0) == 0 else "R"
                     t_title = f"{disp_tag}[{align_char}]" if self.show_labels else disp_tag
                     t_surf = self.render_aged_label(t_title, el, ref_now, active_rgb=COLOR_EDIT_ACCENT)
@@ -5167,8 +5293,8 @@ class DispatcherPygameRenderer:
                 sz = max(7, int(9 * self.zoom))
                 pygame.draw.line(self.screen, col, (sx - sz, sy - sz), (sx + sz, sy + sz), 3)
                 pygame.draw.line(self.screen, col, (sx - sz, sy + sz), (sx + sz, sy - sz), 3)
-                
-                if self.show_labels:
+
+                if show_elem_labels or (is_sel and self.show_labels):
                     c_surf = self.render_aged_label(f"{disp_tag} [{gate}]", el, ref_now, active_rgb=col)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, c_surf.get_width(), c_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(c_surf, (lbl_x, lbl_y))
@@ -5200,8 +5326,8 @@ class DispatcherPygameRenderer:
                 if is_active and age < 2.0:
                     pygame.draw.circle(self.screen, col, (sx, sy - sz - 3), max(5, int(6.5 * self.zoom)), 1)
                     pygame.draw.circle(self.screen, (245, 235, 255), (sx, sy - sz - 3), 2)
-                
-                if self.show_labels:
+
+                if show_elem_labels or (is_sel and self.show_labels):
                     rad_id = el.get("radio_id")
                     rad_str = f" [ID:{rad_id}]" if rad_id is not None else ""
                     b_surf = self.render_aged_label(f"{disp_tag}{rad_str} (Ch{el.get('channel')}: {el.get('packets_relayed', 0)})", el, ref_now, active_rgb=active_col)
@@ -5212,9 +5338,9 @@ class DispatcherPygameRenderer:
                 w, h = max(14, int(18 * self.zoom)), max(10, int(12 * self.zoom))
                 rect = pygame.Rect(sx - w // 2, sy - h // 2, w, h)
                 pygame.draw.rect(self.screen, COLOR_LANDMARK, rect, border_radius=3)
-                
-                if self.show_labels:
-                    s_surf = self.font_sm_thin.render(disp_tag, True, COLOR_LANDMARK)
+
+                if show_elem_labels or (is_sel and self.show_labels):
+                    s_surf = self._render_cached_text(self.font_sm_thin, disp_tag, COLOR_LANDMARK)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, s_surf.get_width(), s_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(s_surf, (lbl_x, lbl_y))
 
@@ -5222,9 +5348,9 @@ class DispatcherPygameRenderer:
                 w, h = max(18, int(24 * self.zoom)), max(10, int(14 * self.zoom))
                 pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy - h // 2), (sx + w // 2, sy - h // 2), 2)
                 pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy + h // 2), (sx + w // 2, sy + h // 2), 2)
-                
-                if self.show_labels:
-                    b_surf = self.font_sm_thin.render(disp_tag, True, COLOR_TEXT_DIM)
+
+                if show_elem_labels or (is_sel and self.show_labels):
+                    b_surf = self._render_cached_text(self.font_sm_thin, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
 
@@ -5232,15 +5358,16 @@ class DispatcherPygameRenderer:
                 sz = max(8, int(11 * self.zoom))
                 pts = [(sx, sy - sz), (sx + sz, sy), (sx, sy + sz), (sx - sz, sy)]
                 pygame.draw.polygon(self.screen, COLOR_LANDMARK, pts, 2)
-                
-                if self.show_labels:
-                    d_surf = self.font_sm_thin.render(disp_tag, True, COLOR_TEXT_DIM)
+
+                if show_elem_labels or (is_sel and self.show_labels):
+                    d_surf = self._render_cached_text(self.font_sm_thin, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, d_surf.get_width(), d_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(d_surf, (lbl_x, lbl_y))
 
             elif etype == "label":
                 if self.show_labels:
-                    l_surf = self.font_lg.render(label or eid, True, COLOR_LANDMARK)
+                    l_font = self.font_sm if self.zoom < 0.65 else self.font_lg
+                    l_surf = self._render_cached_text(l_font, label or eid, COLOR_LANDMARK)
                     self.screen.blit(l_surf, (sx - l_surf.get_width() // 2, sy))
 
             elif etype == "track_jump":
@@ -5249,11 +5376,11 @@ class DispatcherPygameRenderer:
                 rad = max(11, int(13 * self.zoom))
                 pygame.draw.circle(self.screen, (26, 38, 58), (sx, sy), rad)
                 pygame.draw.circle(self.screen, COLOR_EDIT_ACCENT, (sx, sy), rad, 2)
-                ltr_surf = self.font_md.render(letter, True, (255, 230, 90))
+                ltr_surf = self._render_cached_text(self.font_md, letter, (255, 230, 90))
                 self.screen.blit(ltr_surf, (sx - ltr_surf.get_width() // 2, sy - ltr_surf.get_height() // 2))
-                if self.show_labels:
+                if show_elem_labels or (is_sel and self.show_labels):
                     pair_tag = f"->{paired_id}" if paired_id else ""
-                    j_surf = self.font_sm_bold.render(f"{eid}[{letter}{pair_tag}]", True, COLOR_EDIT_ACCENT)
+                    j_surf = self._render_cached_text(self.font_sm_bold, f"{eid}[{letter}{pair_tag}]", COLOR_EDIT_ACCENT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, j_surf.get_width(), j_surf.get_height(), lpos, rad + 4)
                     self.screen.blit(j_surf, (lbl_x, lbl_y))
 

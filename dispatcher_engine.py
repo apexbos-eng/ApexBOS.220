@@ -318,44 +318,42 @@ class BaseElement:
     def update_rssi_from_packet(self, parsed_pkt: dict) -> bool:
         if not parsed_pkt or not isinstance(parsed_pkt, dict):
             return False
+        rad_id = getattr(self, "radio_id", None)
+        rad_id2 = getattr(self, "radioid", None)
+        if self.wiu_id is None and rad_id is None and rad_id2 is None:
+            return False
 
-        src_id = None
-        for k, v in parsed_pkt.items():
-            if str(k).strip().lower() in ("_src_id_", "_src_id", "src_id", "_srcid_"):
-                if v is not None and str(v).strip() != "":
-                    src_id = v
-                    break
+        src_id = parsed_pkt.get("_src_Id_")
+        if src_id is None:
+            src_id = parsed_pkt.get("_src_id_")
+        if src_id is None:
+            src_id = parsed_pkt.get("src_id")
+        if src_id is None:
+            for k, v in parsed_pkt.items():
+                if isinstance(k, str) and k.strip().lower() in ("_src_id_", "_src_id", "src_id", "_srcid_"):
+                    if v is not None and str(v).strip() != "":
+                        src_id = v
+                        break
+        elif isinstance(src_id, str) and not src_id.strip():
+            src_id = None
 
         matched = False
         if src_id is not None:
-            target_ids = [self.wiu_id, getattr(self, "radio_id", None), getattr(self, "radioid", None)]
-            for tid in target_ids:
-                if tid is not None:
-                    try:
-                        if int(tid) == int(src_id):
-                            matched = True
-                            break
-                    except (ValueError, TypeError):
-                        if str(tid).strip().lower() == str(src_id).strip().lower():
-                            matched = True
-                            break
+            for tid in (self.wiu_id, rad_id, rad_id2):
+                if tid is not None and self._wiu_matches(tid, src_id):
+                    matched = True
+                    break
         else:
             node_id = parsed_pkt.get("_node_id_")
-            target_ids = []
-            if getattr(self, "elem_type", "") == "base":
-                target_ids = [getattr(self, "radio_id", None), getattr(self, "radioid", None), self.wiu_id]
-            else:
-                target_ids = [self.wiu_id, getattr(self, "radio_id", None), getattr(self, "radioid", None)]
-            for tid in target_ids:
-                if tid is not None and node_id is not None:
-                    try:
-                        if int(tid) == int(node_id):
-                            matched = True
-                            break
-                    except (ValueError, TypeError):
-                        if str(tid).strip().lower() == str(node_id).strip().lower():
-                            matched = True
-                            break
+            if node_id is not None:
+                if getattr(self, "elem_type", "") == "base":
+                    tids = (rad_id, rad_id2, self.wiu_id)
+                else:
+                    tids = (self.wiu_id, rad_id, rad_id2)
+                for tid in tids:
+                    if tid is not None and self._wiu_matches(tid, node_id):
+                        matched = True
+                        break
 
         if matched:
             rssi = parsed_pkt.get("rssi")
@@ -418,6 +416,10 @@ class BaseElement:
     @staticmethod
     def _wiu_matches(wiu_id: Any, node_id: Any) -> bool:
         if wiu_id is None or node_id is None:
+            return False
+        if wiu_id == node_id:
+            return True
+        if type(wiu_id) is int and type(node_id) is int:
             return False
         try:
             return int(wiu_id) == int(node_id)
@@ -493,8 +495,21 @@ class BaseElement:
         return pkt_rules, base_bits
 
     def to_config_dict(self) -> dict:
-        d = asdict(self)
-        return {k: v for k, v in d.items() if not k.startswith("_")}
+        cls = self.__class__
+        pub_fields = getattr(cls, "_PUBLIC_FIELD_NAMES", None)
+        if pub_fields is None:
+            pub_fields = tuple(f.name for f in fields(cls) if not f.name.startswith("_"))
+            cls._PUBLIC_FIELD_NAMES = pub_fields
+        d = {}
+        for k in pub_fields:
+            v = getattr(self, k)
+            if isinstance(v, dict):
+                d[k] = {dk: list(dv) if isinstance(dv, list) else dv for dk, dv in v.items()}
+            elif isinstance(v, list):
+                d[k] = list(v)
+            else:
+                d[k] = v
+        return d
 
     def to_state_dict(self, layout_wiu_ids: Optional[set] = None, rrdata: Optional[Dict[str, str]] = None) -> dict:
         d = self.to_config_dict()
@@ -504,11 +519,11 @@ class BaseElement:
         d["last_raw_hex"] = self._last_raw_hex
         d["ctc_id"] = self.ctc_id
         d["ctc_rules"] = self.ctc_rules
-        now = time.time()
-        d["ctc_active"] = (now - self._last_ctc_ts < 5.0) if self._last_ctc_ts > 0 else False
+        d["ctc_active"] = (time.time() - self._last_ctc_ts < 5.0) if self._last_ctc_ts > 0 else False
+        r_avg = self.rssi_avg
         d["last_rssi"] = self._last_rssi
-        d["avg_rssi"] = self.rssi_avg
-        d["rssi_avg"] = self.rssi_avg
+        d["avg_rssi"] = r_avg
+        d["rssi_avg"] = r_avg
         return d
 
 
@@ -3030,10 +3045,24 @@ class DispatcherEngine:
             if isinstance(cand, TrackJump):
                 jump_el = cand
         elif curr_id:
-            for el in self.elements.values():
-                if isinstance(el, TrackJump) and el.connected_element == curr_id:
-                    jump_el = el
-                    break
+            # Fast cached lookup of TrackJumps by connected_element
+            cache_key = len(self.elements)
+            if getattr(self, "_jump_cache_len", -1) != cache_key:
+                self._jumps_by_conn = {
+                    el.connected_element: el
+                    for el in self.elements.values()
+                    if isinstance(el, TrackJump) and el.connected_element
+                }
+                self._jump_cache_len = cache_key
+            cand_j = self._jumps_by_conn.get(curr_id)
+            if cand_j is not None and cand_j.connected_element == curr_id and cand_j.id in self.elements:
+                jump_el = cand_j
+            else:
+                for el in self.elements.values():
+                    if isinstance(el, TrackJump) and el.connected_element == curr_id:
+                        jump_el = el
+                        self._jumps_by_conn[curr_id] = el
+                        break
         if not jump_el:
             return next_id, next_dir
 
@@ -3547,8 +3576,7 @@ class DispatcherEngine:
             )
         self.scroller.add_packet(parsed_data)
         self.train_scroller.check_packet(parsed_data)
-        for el in self.elements.values():
-            el.process_packet(parsed_data, self)
+        self._dispatch_packet_to_elements(parsed_data)
 
         self._evaluate_system_logic(parsed_data["timestamp"], force=False)
         sig = self._compute_logical_signature()
@@ -3999,6 +4027,38 @@ class DispatcherEngine:
             self._engine_log("WARN", f"Failed to load temporary packet cache from {temp_path}: {exc}")
             return 0
 
+    def _dispatch_packet_to_elements(self, pkt: dict, catch_exceptions: bool = False):
+        """Fast pre-filtered packet dispatch across layout elements."""
+        node_id = pkt.get("_node_id_")
+        has_pkt_ctc = bool(pkt.get("_ctc_id_") or pkt.get("ctc_id"))
+        has_src_id = any(
+            isinstance(k, str) and k.strip().lower() in ("_src_id_", "_src_id", "src_id", "_srcid_") and v not in (None, "")
+            for k, v in pkt.items()
+        )
+        for el in self.elements.values():
+            if not has_pkt_ctc and not getattr(el, "ctc_rules", ""):
+                et = getattr(el, "elem_type", "")
+                if et not in ("base", "ptc_datetime", "date_time", "datetime"):
+                    wid = getattr(el, "wiu_id", None)
+                    rid = getattr(el, "radio_id", None)
+                    rid2 = getattr(el, "radioid", None)
+                    if wid is None and rid is None and rid2 is None:
+                        continue
+                    if not has_src_id:
+                        if not (
+                            (wid is not None and BaseElement._wiu_matches(wid, node_id))
+                            or (rid is not None and BaseElement._wiu_matches(rid, node_id))
+                            or (rid2 is not None and BaseElement._wiu_matches(rid2, node_id))
+                        ):
+                            continue
+            if catch_exceptions:
+                try:
+                    el.process_packet(pkt, self)
+                except Exception:
+                    pass
+            else:
+                el.process_packet(pkt, self)
+
     def apply_cached_packets(self):
         """Replay cached packets to populate last WIU packets, address table, scroller, elements, and system logic."""
         for pkt in self.packet_cache:
@@ -4022,11 +4082,7 @@ class DispatcherEngine:
             self.address_table.check_and_update_sequence(pkt, self.rrdata)
             self.scroller.add_packet(pkt)
             self.train_scroller.check_packet(pkt)
-            for el in self.elements.values():
-                try:
-                    el.process_packet(pkt, self)
-                except Exception:
-                    pass
+            self._dispatch_packet_to_elements(pkt, catch_exceptions=True)
 
         if self.packet_cache:
             last_pkt = self.packet_cache[-1]
