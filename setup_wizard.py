@@ -471,32 +471,11 @@ def collect_local_identities(target_host: str, extra_identities: Optional[List[s
     try:
         import mosfet_client
         clean_host = mosfet_client.normalize_host_arg(target_host)
-        hosts_to_check = [clean_host]
-        try:
-            for info in socket.getaddrinfo(clean_host, None):
-                ip = info[4][0].split("%", 1)[0]
-                if ip not in hosts_to_check:
-                    hosts_to_check.append(ip)
-        except Exception:
-            pass
-
-        async def _gather():
-            out = []
-            for h in hosts_to_check[:3]:
-                try:
-                    out.append(await mosfet_client.generate_identity(h))
-                except Exception:
-                    pass
-            return out
-
-        for ident in asyncio.run(_gather()):
-            _add(ident)
+        ident = asyncio.run(mosfet_client.generate_identity(clean_host))
+        _add(ident)
     except Exception:
         pass
 
-    # Include standard traceroute-blocked fallback identities so clients connect even behind strict ICMP/UDP firewalls
-    _add(hashlib.sha256(b"127.0.0.1").hexdigest()[:12])
-    _add(hashlib.sha256(b"::1").hexdigest()[:12])
     return identities
 
 

@@ -38,6 +38,7 @@ The software generates and maintains local configuration files strictly on your 
 When networking features are enabled:
 - **Local Network / Multicast:** Modules such as Grabber, Flux, Engine, and Viewer communicate over local network loopback (`127.0.0.1`), local area network (LAN) interfaces, or user-specified UDP multicast groups (e.g., `224.1.1.1` or `239.1.1.1`).
 - **Cloud Banc Relays:** If you deploy or connect to a remote Banc server, telemetry bursts are transmitted over an encrypted TCP connection using your configured Fernet key and TOTP credentials. This connection is strictly direct between your client node and the Banc server endpoint you configure; no data is routed through or visible to the developer or any third party.
+- **Network Identity Hashing:** To keep whitelisted home-network identities stable across computers on the same LAN, clients locally compute a one-way 12-character SHA-256 hash of the local default gateway's MAC address (with local-only fallbacks). The raw router MAC address is never transmitted in plaintext, and no external IP/identity lookup service is contacted.
 
 ---
 

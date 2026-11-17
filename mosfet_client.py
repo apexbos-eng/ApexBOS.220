@@ -30,6 +30,7 @@ import sys
 import json
 import socket
 import struct
+import subprocess
 import ipaddress
 import asyncio
 import argparse
@@ -128,8 +129,602 @@ def format_host_port(host: str, port: int) -> str:
     return f"{clean}:{int(port)}"
 
 
+IDENTITY_HASH_PREFIX = "apexbos-lan-v1:"
+_VIRTUAL_IFACE_PREFIXES = (
+    "tun", "tap", "wg", "ppp", "utun", "ipsec",
+    "tailscale", "zt", "docker", "veth", "virbr", "br-", "lo",
+)
+_SHARED_VIRTUAL_ROUTER_MAC_PREFIXES = (
+    "00:00:5e:00:01:",  # VRRP IPv4 / CARP
+    "00:00:5e:00:02:",  # VRRP IPv6
+    "00:00:0c:07:ac:",  # Cisco HSRP v1
+    "00:00:0c:9f:f",    # Cisco HSRP v2
+    "00:07:b4:00:",     # Cisco GLBP
+)
+_MAC_TOKEN_RE = re.compile(r"^(?:[0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}$")
+
+
+def normalize_mac_address(mac_str: Optional[str]) -> Optional[str]:
+    """Normalizes a MAC address to lowercase colon-separated zero-padded format (aa:bb:cc:dd:ee:ff).
+
+    Rejects blank, malformed, all-zero, broadcast, and multicast MAC addresses.
+    """
+    if not mac_str:
+        return None
+    raw = str(mac_str).strip().lower()
+    if not _MAC_TOKEN_RE.match(raw):
+        return None
+    sep = ":" if ":" in raw else "-"
+    parts = raw.split(sep)
+    if len(parts) != 6:
+        return None
+    try:
+        octets = [int(p, 16) for p in parts]
+    except ValueError:
+        return None
+    if any(b < 0 or b > 255 for b in octets):
+        return None
+    # Reject all-zero, broadcast, and multicast (LSB of first octet == 1)
+    if all(b == 0 for b in octets) or all(b == 255 for b in octets):
+        return None
+    if (octets[0] & 1) != 0:
+        return None
+    return ":".join(f"{b:02x}" for b in octets)
+
+
+def is_shared_virtual_router_mac(norm_mac: str) -> bool:
+    """Returns True if a normalized MAC belongs to a shared virtual router protocol (VRRP/HSRP/GLBP)."""
+    if not norm_mac:
+        return False
+    low = norm_mac.lower()
+    return any(low.startswith(pref) for pref in _SHARED_VIRTUAL_ROUTER_MAC_PREFIXES)
+
+
+def hash_network_identity(material: str) -> str:
+    """Hashes canonical network identity material into a 12-character hex Banc identity."""
+    payload = f"{IDENTITY_HASH_PREFIX}{material}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+
+def _is_virtual_iface_name(iface: str) -> bool:
+    low = str(iface or "").strip().lower()
+    return any(low.startswith(pref) for pref in _VIRTUAL_IFACE_PREFIXES)
+
+
+def _parse_windows_ipv4_default_gateways(route_output: str) -> List[Tuple[int, str, str]]:
+    """Parses `route print 0.0.0.0` Active Routes into sorted (metric, gateway_ip, iface_ip) tuples."""
+    results: List[Tuple[int, str, str]] = []
+    in_active = False
+    for line in (route_output or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("Active Routes:"):
+            in_active = True
+            continue
+        if in_active and (stripped.startswith("Persistent Routes:") or stripped.startswith("IPv6 Route Table")):
+            break
+        if not in_active:
+            continue
+        parts = stripped.split()
+        if len(parts) >= 5 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
+            gw_ip, iface_ip, metric_s = parts[2], parts[3], parts[4]
+            try:
+                addr = ipaddress.ip_address(gw_ip)
+                if addr.version != 4 or addr.is_unspecified or addr.is_loopback:
+                    continue
+                metric = int(metric_s)
+            except ValueError:
+                continue
+            results.append((metric, str(addr), iface_ip))
+    results.sort(key=lambda item: (item[0], item[1]))
+    return results
+
+
+def _parse_windows_arp_mac(arp_output: str, target_ip: str) -> Optional[str]:
+    """Extracts the normalized MAC address for target_ip from Windows `arp -a` output."""
+    for line in (arp_output or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2 and parts[0] == target_ip:
+            mac = normalize_mac_address(parts[1])
+            if mac:
+                return mac
+    return None
+
+
+def _parse_windows_ipv6_default_gateways(route_output: str) -> List[Tuple[int, str, str]]:
+    """Parses `netsh interface ipv6 show route` for ::/0 default routes into (metric, gw_ip, iface_idx)."""
+    results: List[Tuple[int, str, str]] = []
+    for line in (route_output or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 6 and parts[3] == "::/0":
+            try:
+                metric = int(parts[2])
+            except ValueError:
+                metric = 9999
+            iface_idx = parts[4]
+            gw_cand = parts[5].split("%", 1)[0]
+            try:
+                addr = ipaddress.ip_address(gw_cand)
+                if addr.version == 6 and not addr.is_unspecified and not addr.is_loopback:
+                    results.append((metric, str(addr), iface_idx))
+            except ValueError:
+                continue
+    results.sort(key=lambda item: (item[0], item[1]))
+    return results
+
+
+def _parse_windows_ipv6_neighbor_mac(
+    neigh_output: str, target_ip: str, iface_idx: Optional[str] = None
+) -> Optional[str]:
+    """Extracts the normalized MAC for an IPv6 neighbor from `netsh interface ipv6 show neighbors`."""
+    try:
+        canonical_target = str(ipaddress.ip_address(target_ip.split("%", 1)[0]))
+    except ValueError:
+        return None
+    cur_idx: Optional[str] = None
+    fallback_mac: Optional[str] = None
+    for line in (neigh_output or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m_if = re.match(r"^Interface\s+(\d+)\s*:", stripped, re.IGNORECASE)
+        if m_if:
+            cur_idx = m_if.group(1)
+            continue
+        parts = stripped.split()
+        if len(parts) >= 2:
+            ip_tok = parts[0].split("%", 1)[0]
+            try:
+                cand_ip = str(ipaddress.ip_address(ip_tok))
+            except ValueError:
+                continue
+            if cand_ip == canonical_target:
+                mac = normalize_mac_address(parts[1])
+                if mac:
+                    if iface_idx is None or cur_idx == str(iface_idx):
+                        return mac
+                    if fallback_mac is None:
+                        fallback_mac = mac
+    return fallback_mac
+
+
+def _parse_linux_proc_net_route(route_text: str) -> List[Tuple[int, int, str, str]]:
+    """Parses Linux `/proc/net/route` into sorted (is_virtual, metric, gateway_ip, iface) tuples."""
+    results: List[Tuple[int, int, str, str]] = []
+    for idx, line in enumerate((route_text or "").splitlines()):
+        if idx == 0:
+            continue
+        parts = line.strip().split()
+        if len(parts) < 8:
+            continue
+        iface, dest_hex, gw_hex, flags_hex = parts[0], parts[1], parts[2], parts[3]
+        metric_s, mask_hex = parts[6], parts[7]
+        if dest_hex != "00000000" or mask_hex != "00000000" or gw_hex == "00000000":
+            continue
+        try:
+            flags = int(flags_hex, 16)
+            if (flags & 0x3) != 0x3:  # RTF_UP | RTF_GATEWAY
+                continue
+            metric = int(metric_s)
+            gw_ip = socket.inet_ntoa(struct.pack("=I", int(gw_hex, 16)))
+        except (ValueError, struct.error, OSError):
+            continue
+        is_virt = 1 if _is_virtual_iface_name(iface) else 0
+        results.append((is_virt, metric, gw_ip, iface))
+    results.sort(key=lambda item: (item[0], item[1], item[3]))
+    return results
+
+
+def _parse_linux_proc_net_arp(
+    arp_text: str, target_ip: str, iface: Optional[str] = None
+) -> Optional[str]:
+    """Extracts the normalized MAC for target_ip from Linux `/proc/net/arp`."""
+    fallback_mac: Optional[str] = None
+    for idx, line in enumerate((arp_text or "").splitlines()):
+        if idx == 0:
+            continue
+        parts = line.strip().split()
+        if len(parts) < 6:
+            continue
+        ip_col, _hw_type, flags_col, mac_col, _mask, dev_col = parts[:6]
+        if ip_col != target_ip or flags_col == "0x0":
+            continue
+        mac = normalize_mac_address(mac_col)
+        if mac:
+            if not iface or dev_col == iface:
+                return mac
+            if fallback_mac is None:
+                fallback_mac = mac
+    return fallback_mac
+
+
+def _parse_linux_ip_route_default(route_output: str, ipv6: bool = False) -> List[Tuple[int, int, str, str]]:
+    """Parses `ip [-6] route show default` into sorted (is_virtual, metric, gateway_ip, iface) tuples."""
+    results: List[Tuple[int, int, str, str]] = []
+    for line in (route_output or "").splitlines():
+        parts = line.strip().split()
+        if not parts or parts[0] != "default":
+            continue
+        gw_ip = ""
+        iface = ""
+        metric = 1024
+        for i, tok in enumerate(parts):
+            if tok == "via" and i + 1 < len(parts):
+                gw_ip = parts[i + 1].split("%", 1)[0]
+            elif tok == "dev" and i + 1 < len(parts):
+                iface = parts[i + 1]
+            elif tok == "metric" and i + 1 < len(parts):
+                try:
+                    metric = int(parts[i + 1])
+                except ValueError:
+                    pass
+        if not gw_ip:
+            continue
+        try:
+            addr = ipaddress.ip_address(gw_ip)
+            expected_ver = 6 if ipv6 else 4
+            if addr.version != expected_ver or addr.is_unspecified or addr.is_loopback:
+                continue
+            gw_ip = str(addr)
+        except ValueError:
+            continue
+        is_virt = 1 if _is_virtual_iface_name(iface) else 0
+        results.append((is_virt, metric, gw_ip, iface))
+    results.sort(key=lambda item: (item[0], item[1], item[3]))
+    return results
+
+
+def _parse_linux_ip_neigh_mac(neigh_output: str, target_ip: str) -> Optional[str]:
+    """Extracts normalized MAC from `ip [-6] neigh show` output."""
+    try:
+        canonical_target = str(ipaddress.ip_address(target_ip.split("%", 1)[0]))
+    except ValueError:
+        return None
+    for line in (neigh_output or "").splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if "FAILED" in parts or "INCOMPLETE" in parts:
+            continue
+        try:
+            cand_ip = str(ipaddress.ip_address(parts[0].split("%", 1)[0]))
+        except ValueError:
+            continue
+        if cand_ip != canonical_target:
+            continue
+        for i, tok in enumerate(parts):
+            if tok == "lladdr" and i + 1 < len(parts):
+                mac = normalize_mac_address(parts[i + 1])
+                if mac:
+                    return mac
+    return None
+
+
+def _parse_macos_default_gateways(
+    route_output: str, netstat_output: str = "", ipv6: bool = False
+) -> List[Tuple[int, str, str]]:
+    """Parses macOS `route -n get default` and `netstat -rn` into (is_virtual, gateway_ip, iface) tuples."""
+    candidates: List[Tuple[int, str, str]] = []
+    seen = set()
+    expected_ver = 6 if ipv6 else 4
+
+    def _add(gw_raw: str, iface: str):
+        gw_clean = (gw_raw or "").split("%", 1)[0]
+        try:
+            addr = ipaddress.ip_address(gw_clean)
+            if addr.version != expected_ver or addr.is_unspecified or addr.is_loopback:
+                return
+            gw_s = str(addr)
+        except ValueError:
+            return
+        key = (gw_s, iface)
+        if key not in seen:
+            seen.add(key)
+            candidates.append((1 if _is_virtual_iface_name(iface) else 0, gw_s, iface))
+
+    # Parse `route -n get [-inet6] default`
+    gw_val = ""
+    if_val = ""
+    for line in (route_output or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("gateway:"):
+            gw_val = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("interface:"):
+            if_val = stripped.split(":", 1)[1].strip()
+    if gw_val:
+        _add(gw_val, if_val)
+
+    # Parse `netstat -rn -f inet[6]` to catch physical gateways behind a VPN utun default route
+    for line in (netstat_output or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 4 and parts[0] == "default":
+            _add(parts[1], parts[3])
+
+    candidates.sort(key=lambda item: (item[0], item[2]))
+    return candidates
+
+
+def _parse_macos_arp_mac(arp_output: str, target_ip: str) -> Optional[str]:
+    """Extracts normalized MAC from macOS `arp -n <ip>` output (handles unpadded hex octets)."""
+    for line in (arp_output or "").splitlines():
+        if f"({target_ip})" not in line:
+            continue
+        m = re.search(r"\bat\s+([0-9a-fA-F:.-]+)\b", line)
+        if m:
+            mac = normalize_mac_address(m.group(1))
+            if mac:
+                return mac
+    return None
+
+
+def _parse_macos_ndp_mac(ndp_output: str, target_ip: str) -> Optional[str]:
+    """Extracts normalized MAC from macOS `ndp -an` output."""
+    try:
+        canonical_target = str(ipaddress.ip_address(target_ip.split("%", 1)[0]))
+    except ValueError:
+        return None
+    for line in (ndp_output or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        try:
+            cand_ip = str(ipaddress.ip_address(parts[0].split("%", 1)[0]))
+        except ValueError:
+            continue
+        if cand_ip == canonical_target:
+            mac = normalize_mac_address(parts[1])
+            if mac:
+                return mac
+    return None
+
+
+async def _run_cmd_text(cmd: List[str], timeout: float = 3.0) -> str:
+    """Runs an OS networking query command safely with a short timeout and returns decoded stdout."""
+    kwargs: Dict[str, Any] = {
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.communicate()
+            except Exception:
+                pass
+            return ""
+        return stdout.decode(errors="ignore")
+    except Exception:
+        return ""
+
+
+def _nudge_arp_cache(gateway_ip: str) -> None:
+    """Sends a harmless 1-byte UDP datagram to the gateway discard port (9) to populate ARP/NDP cache."""
+    sock = None
+    try:
+        addr = ipaddress.ip_address(gateway_ip.split("%", 1)[0])
+        fam = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+        sock = socket.socket(fam, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        sock.sendto(b"\x00", (str(addr), 9))
+    except Exception:
+        pass
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def _get_outbound_local_network_material(target_host: str = "") -> Optional[str]:
+    """Determines a privacy-safe local network identifier without contacting any third-party server.
+
+    Uses only UDP socket connect() (OS routing table query; transmits no packets on the wire) to
+    inspect the local outbound address:
+      - Global IPv6 address -> shared LAN /64 prefix (consistent across all hosts on the same LAN)
+      - Public IPv4 address -> direct WAN IPv4 (for hosts directly attached to PPPoE/VPS without NAT)
+    """
+    clean_host = normalize_host_arg(target_host)
+    probes: List[Tuple[int, str]] = []
+    if clean_host:
+        ver = detect_ip_version(clean_host)
+        if ver == 6:
+            probes.append((socket.AF_INET6, clean_host))
+        elif ver == 4:
+            probes.append((socket.AF_INET, clean_host))
+        else:
+            try:
+                for info in socket.getaddrinfo(clean_host, 80, socket.AF_UNSPEC, socket.SOCK_DGRAM):
+                    probes.append((info[0], info[4][0].split("%", 1)[0]))
+            except OSError:
+                pass
+    probes.extend([(socket.AF_INET6, "2606:4700:4700::1111"), (socket.AF_INET, "1.1.1.1")])
+
+    for fam, probe_ip in probes:
+        sock = None
+        try:
+            sock = socket.socket(fam, socket.SOCK_DGRAM)
+            sock.connect((probe_ip, 80))
+            local_ip = sock.getsockname()[0].split("%", 1)[0]
+            addr = ipaddress.ip_address(local_ip)
+            if addr.version == 6 and addr.is_global:
+                net64 = ipaddress.IPv6Network(f"{addr}/64", strict=False)
+                return f"ipv6-prefix:{net64}"
+            if addr.version == 4 and addr.is_global:
+                return f"pub4:{addr}"
+        except Exception:
+            continue
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+    return None
+
+
+async def _resolve_default_gateway_mac_windows() -> Tuple[Optional[str], Optional[str], str]:
+    """Resolves (normalized_mac, gateway_ip, proto) on Windows. Prefers physical IPv4 gateway first."""
+    route4 = await _run_cmd_text(["route", "print", "0.0.0.0"])
+    gw4_list = _parse_windows_ipv4_default_gateways(route4)
+    for _metric, gw_ip, _iface_ip in gw4_list:
+        arp_out = await _run_cmd_text(["arp", "-a", gw_ip])
+        mac = _parse_windows_arp_mac(arp_out, gw_ip)
+        if not mac:
+            _nudge_arp_cache(gw_ip)
+            await asyncio.sleep(0.06)
+            arp_out = await _run_cmd_text(["arp", "-a", gw_ip])
+            mac = _parse_windows_arp_mac(arp_out, gw_ip)
+        if mac:
+            return mac, gw_ip, "ipv4"
+
+    # IPv6-only fallback
+    route6 = await _run_cmd_text(["netsh", "interface", "ipv6", "show", "route"])
+    gw6_list = _parse_windows_ipv6_default_gateways(route6)
+    if gw6_list:
+        neigh6 = await _run_cmd_text(["netsh", "interface", "ipv6", "show", "neighbors"])
+        for _metric, gw6_ip, iface_idx in gw6_list:
+            mac = _parse_windows_ipv6_neighbor_mac(neigh6, gw6_ip, iface_idx)
+            if mac:
+                return mac, gw6_ip, "ipv6"
+
+    return None, (gw4_list[0][1] if gw4_list else None), "none"
+
+
+async def _resolve_default_gateway_mac_linux() -> Tuple[Optional[str], Optional[str], str]:
+    """Resolves (normalized_mac, gateway_ip, proto) on Linux/Raspberry Pi. Prefers physical IPv4 gateway."""
+    gw4_list: List[Tuple[int, int, str, str]] = []
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as fh:
+            gw4_list = _parse_linux_proc_net_route(fh.read())
+    except OSError:
+        pass
+    if not gw4_list:
+        ip_route4 = await _run_cmd_text(["ip", "-4", "route", "show", "default"])
+        gw4_list = _parse_linux_ip_route_default(ip_route4, ipv6=False)
+
+    for _is_virt, _metric, gw_ip, iface in gw4_list:
+        mac: Optional[str] = None
+        try:
+            with open("/proc/net/arp", "r", encoding="utf-8") as fh:
+                mac = _parse_linux_proc_net_arp(fh.read(), gw_ip, iface)
+        except OSError:
+            pass
+        if not mac:
+            neigh_out = await _run_cmd_text(["ip", "-4", "neigh", "show", gw_ip])
+            mac = _parse_linux_ip_neigh_mac(neigh_out, gw_ip)
+        if not mac:
+            _nudge_arp_cache(gw_ip)
+            await asyncio.sleep(0.06)
+            try:
+                with open("/proc/net/arp", "r", encoding="utf-8") as fh:
+                    mac = _parse_linux_proc_net_arp(fh.read(), gw_ip, iface)
+            except OSError:
+                pass
+            if not mac:
+                neigh_out = await _run_cmd_text(["ip", "-4", "neigh", "show", gw_ip])
+                mac = _parse_linux_ip_neigh_mac(neigh_out, gw_ip)
+        if mac:
+            return mac, gw_ip, "ipv4"
+
+    # IPv6-only fallback
+    ip_route6 = await _run_cmd_text(["ip", "-6", "route", "show", "default"])
+    gw6_list = _parse_linux_ip_route_default(ip_route6, ipv6=True)
+    for _is_virt, _metric, gw6_ip, iface in gw6_list:
+        cmd = ["ip", "-6", "neigh", "show", gw6_ip]
+        if iface:
+            cmd.extend(["dev", iface])
+        neigh6 = await _run_cmd_text(cmd)
+        mac = _parse_linux_ip_neigh_mac(neigh6, gw6_ip)
+        if mac:
+            return mac, gw6_ip, "ipv6"
+
+    return None, (gw4_list[0][2] if gw4_list else None), "none"
+
+
+async def _resolve_default_gateway_mac_macos() -> Tuple[Optional[str], Optional[str], str]:
+    """Resolves (normalized_mac, gateway_ip, proto) on macOS. Prefers physical IPv4 gateway first."""
+    route4 = await _run_cmd_text(["route", "-n", "get", "default"])
+    netstat4 = await _run_cmd_text(["netstat", "-rn", "-f", "inet"])
+    gw4_list = _parse_macos_default_gateways(route4, netstat4, ipv6=False)
+    for _is_virt, gw_ip, _iface in gw4_list:
+        arp_out = await _run_cmd_text(["arp", "-n", gw_ip])
+        mac = _parse_macos_arp_mac(arp_out, gw_ip)
+        if not mac:
+            _nudge_arp_cache(gw_ip)
+            await asyncio.sleep(0.06)
+            arp_out = await _run_cmd_text(["arp", "-n", gw_ip])
+            mac = _parse_macos_arp_mac(arp_out, gw_ip)
+        if mac:
+            return mac, gw_ip, "ipv4"
+
+    # IPv6-only fallback
+    route6 = await _run_cmd_text(["route", "-n", "get", "-inet6", "default"])
+    netstat6 = await _run_cmd_text(["netstat", "-rn", "-f", "inet6"])
+    gw6_list = _parse_macos_default_gateways(route6, netstat6, ipv6=True)
+    if gw6_list:
+        ndp_out = await _run_cmd_text(["ndp", "-an"])
+        for _is_virt, gw6_ip, _iface in gw6_list:
+            mac = _parse_macos_ndp_mac(ndp_out, gw6_ip)
+            if mac:
+                return mac, gw6_ip, "ipv6"
+
+    return None, (gw4_list[0][1] if gw4_list else None), "none"
+
+
+async def resolve_network_identity_details(target_host: str = "") -> Tuple[str, str]:
+    """Computes a stable, home-network-wide 12-char identity hash and a privacy-safe source label.
+
+    Resolution order:
+      1. Physical IPv4 default gateway MAC address (skips VPN/TUN routes without ARP MACs).
+      2. IPv6 default gateway neighbor MAC address (for IPv6-only networks).
+      3. Outbound global IPv6 /64 prefix or public IPv4 (no third-party lookup; for PPPoE/VPS).
+      4. Deterministic local fallback hash.
+    """
+    try:
+        if sys.platform == "win32":
+            gw_mac, gw_ip, proto = await _resolve_default_gateway_mac_windows()
+        elif sys.platform == "darwin":
+            gw_mac, gw_ip, proto = await _resolve_default_gateway_mac_macos()
+        else:
+            gw_mac, gw_ip, proto = await _resolve_default_gateway_mac_linux()
+
+        if gw_mac:
+            if is_shared_virtual_router_mac(gw_mac):
+                extra = _get_outbound_local_network_material(target_host) or (gw_ip or "lan")
+                return hash_network_identity(f"virt:{gw_mac}:{extra}"), f"virtual-gw-mac-{proto}"
+            return hash_network_identity(f"gw:{gw_mac}"), f"gateway-mac-{proto}"
+
+        outbound_mat = _get_outbound_local_network_material(target_host)
+        if outbound_mat:
+            src = "ipv6-prefix" if outbound_mat.startswith("ipv6-prefix:") else "public-ipv4"
+            return hash_network_identity(outbound_mat), src
+
+        if gw_ip:
+            return hash_network_identity(f"gw-ip:{gw_ip}"), "gateway-ip-fallback"
+        return hash_network_identity("local"), "local-fallback"
+    except Exception:
+        return hash_network_identity("local"), "local-fallback"
+
+
+async def generate_identity(target_host: str = "") -> str:
+    """Computes a deterministic 12-char SHA-256 network identity anchored to the LAN default gateway MAC.
+
+    All computers on the same home LAN produce the identical identity hash while remaining globally
+    unique across different users' networks and completely immune to ISP routing/IP churn.
+    """
+    ident, _source = await resolve_network_identity_details(target_host)
+    return ident
+
+
 def extract_ips_from_traceroute(output_text: str) -> List[str]:
-    """Extracts canonical IPv4 and IPv6 addresses from tracert/traceroute output."""
+    """Legacy helper retained for backward compatibility: extracts canonical IPv4/IPv6 addresses."""
     ips: List[str] = []
     for raw_tok in re.findall(r"[0-9A-Fa-f:.%]+", output_text or ""):
         cand = raw_tok.strip(".:[]()")
@@ -137,7 +732,6 @@ def extract_ips_from_traceroute(output_text: str) -> List[str]:
             cand = cand.split("%", 1)[0]
         if not cand or ("." not in cand and ":" not in cand):
             continue
-        # Ignore bare integers / time-like numbers such as 12:34 unless valid IPv6
         try:
             addr = ipaddress.ip_address(cand)
             if getattr(addr, "ipv4_mapped", None) is not None:
@@ -146,58 +740,6 @@ def extract_ips_from_traceroute(output_text: str) -> List[str]:
         except ValueError:
             continue
     return ips
-
-
-async def generate_identity(target_host: str) -> str:
-    """Runs a traceroute (IPv4 or IPv6 auto-detected) to target_host and hashes hops 2, 3, and 4."""
-    clean_host = normalize_host_arg(target_host)
-    try:
-        ip_ver = resolve_target_ip_version(clean_host)
-        if sys.platform == 'win32':
-            cmd = ['tracert', '-d', '-h', '5', clean_host]
-        elif ip_ver == 6:
-            cmd = ['traceroute', '-6', '-n', '-m', '5', clean_host]
-        else:
-            cmd = ['traceroute', '-n', '-m', '5', clean_host]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-
-        # On POSIX, if 'traceroute -6' wasn't supported, retry 'traceroute6'
-        if sys.platform != 'win32' and ip_ver == 6 and proc.returncode != 0:
-            try:
-                proc6 = await asyncio.create_subprocess_exec(
-                    'traceroute6', '-n', '-m', '5', clean_host,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                stdout6, _ = await proc6.communicate()
-                if stdout6:
-                    stdout = stdout6
-            except FileNotFoundError:
-                pass
-
-        # Extract both IPv4 and IPv6 addresses from output
-        ips = extract_ips_from_traceroute(stdout.decode(errors="ignore"))
-        target_cmp = clean_host
-        try:
-            target_cmp = str(ipaddress.ip_address(clean_host.split("%", 1)[0]))
-        except ValueError:
-            pass
-
-        # Exclude the target host itself if resolved, take up to the next 3 hops
-        hops = [ip for ip in ips if ip != clean_host and ip != target_cmp]
-        target_hops = hops[1:4] if len(hops) > 1 else hops
-
-        if not target_hops:
-            target_hops = ['::1'] if ip_ver == 6 else ['127.0.0.1']  # Fallback if traceroute fails/blocks
-
-        hop_string = ",".join(target_hops)
-        identity = hashlib.sha256(hop_string.encode()).hexdigest()[:12]
-        return identity
-    except Exception:
-        return hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
 
 # ---------------------------------------------------------------------------
 # Banc Cloud Client (TCP / Encrypted)

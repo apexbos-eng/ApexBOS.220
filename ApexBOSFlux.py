@@ -81,6 +81,7 @@ from zmq.utils.monitor import parse_monitor_message
 from cryptography.fernet import Fernet
 
 import mosfet_auth
+import mosfet_client
 from version import VERSION, __version__
 
 # ---------------------------------------------------------------------------
@@ -154,75 +155,25 @@ def format_host_port(host: str, port: int) -> str:
 
 
 def extract_ips_from_traceroute(output_text: str) -> List[str]:
-    """Extracts canonical IPv4 and IPv6 addresses from tracert/traceroute output."""
-    ips: List[str] = []
-    for raw_tok in re.findall(r"[0-9A-Fa-f:.%]+", output_text or ""):
-        cand = raw_tok.strip(".:[]()")
-        if "%" in cand:
-            cand = cand.split("%", 1)[0]
-        if not cand or ("." not in cand and ":" not in cand):
-            continue
-        try:
-            addr = ipaddress.ip_address(cand)
-            if getattr(addr, "ipv4_mapped", None) is not None:
-                addr = addr.ipv4_mapped
-            ips.append(str(addr))
-        except ValueError:
-            continue
-    return ips
+    """Legacy helper retained for compatibility: delegates to mosfet_client."""
+    return mosfet_client.extract_ips_from_traceroute(output_text)
 
 
-async def generate_identity(target_host):
-    """Runs a traceroute (IPv4 or IPv6 auto-detected) to the target host and hashes hops 2, 3, and 4."""
+async def generate_identity(target_host: str = "") -> str:
+    """Computes a stable 12-char SHA-256 network identity anchored to the LAN default gateway MAC.
+
+    Delegates to mosfet_client.resolve_network_identity_details() so Flux, Dispatcher Engine,
+    and Setup Wizard always compute the exact same network identity across all machines on a LAN.
+    """
     clean_host = normalize_host_arg(target_host)
-    print(f"[*] Generating identity via traceroute to {clean_host}...")
+    print("[*] Generating stable network identity (LAN default gateway MAC)...")
     try:
-        ip_ver = resolve_target_ip_version(clean_host)
-        if sys.platform == 'win32':
-            cmd = ['tracert', '-d', '-h', '5', clean_host]
-        elif ip_ver == 6:
-            cmd = ['traceroute', '-6', '-n', '-m', '5', clean_host]
-        else:
-            cmd = ['traceroute', '-n', '-m', '5', clean_host]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-
-        if sys.platform != 'win32' and ip_ver == 6 and proc.returncode != 0:
-            try:
-                proc6 = await asyncio.create_subprocess_exec(
-                    'traceroute6', '-n', '-m', '5', clean_host,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                stdout6, _ = await proc6.communicate()
-                if stdout6:
-                    stdout = stdout6
-            except FileNotFoundError:
-                pass
-
-        # Extract IPv4 and IPv6 hop addresses from output
-        ips = extract_ips_from_traceroute(stdout.decode(errors="ignore"))
-        target_cmp = clean_host
-        try:
-            target_cmp = str(ipaddress.ip_address(clean_host.split("%", 1)[0]))
-        except ValueError:
-            pass
-
-        # Exclude the target host itself if resolved, take up to the next 3 hops
-        hops = [ip for ip in ips if ip != clean_host and ip != target_cmp]
-        target_hops = hops[1:4] if len(hops) > 1 else hops
-
-        if not target_hops:
-            target_hops = ['::1'] if ip_ver == 6 else ['127.0.0.1']  # Fallback if traceroute fails/blocks
-
-        hop_string = ",".join(target_hops)
-        identity = hashlib.sha256(hop_string.encode()).hexdigest()[:12]
+        identity, source = await mosfet_client.resolve_network_identity_details(clean_host)
+        print(f"[+] Network identity resolved via {source}: {identity}")
         return identity
     except Exception as e:
-        print(f"[-] Traceroute failed: {e}. Using fallback identity.")
-        return hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
+        print(f"[-] Network identity resolution failed: {e}. Using local fallback identity.")
+        return mosfet_client.hash_network_identity("local")
 
 # ---------------------------------------------------------------------------
 # Statistics and Data Management
@@ -1171,7 +1122,10 @@ async def main():
         cloud_port=cloud_port
     )
     
-    if cloud_ip != "None":
+    cfg_identity = config.get("identity")
+    if cfg_identity and str(cfg_identity).strip().lower() != "auto":
+        stats.identity = str(cfg_identity).strip()
+    elif cloud_ip != "None":
         stats.identity = await generate_identity(cloud_ip)
     else:
         stats.identity = "LOCAL"

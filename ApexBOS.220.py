@@ -1548,15 +1548,15 @@ async def banc_listener(monitor: DispatcherHostMonitor, config: dict):
         monitor.log_message("INFO", f"Using configured Banc identity '{ident}' for {host}:{port}")
     else:
         monitor.identity = "GENERATING ID..."
-        monitor.log_message("INFO", f"Generating Banc identity via traceroute to {host}...")
+        monitor.log_message("INFO", "Generating Banc network identity (LAN default gateway MAC)...")
         try:
-            ident = await mosfet_client.generate_identity(host)
+            ident, id_src = await mosfet_client.resolve_network_identity_details(host)
             monitor.identity = ident
-            monitor.log_message("INFO", f"Generated Banc identity '{ident}'")
+            monitor.log_message("INFO", f"Generated Banc identity '{ident}' (via {id_src})")
         except Exception as exc:
             ident = "FALLBACK"
             monitor.identity = ident
-            monitor.log_message("WARN", f"Traceroute identity generation failed ({exc}); using FALLBACK")
+            monitor.log_message("WARN", f"Network identity generation failed ({exc}); using FALLBACK")
 
     # If both multicast and banc are configured, default to receiving packets from multicast only,
     # unless Banc (or Both) is selected as packet source.
@@ -1730,7 +1730,7 @@ async def banc_wiu_sync_loop(monitor: DispatcherHostMonitor, config: dict):
     connections = monitor._get_connections()
     cfg_ident = connections.get("identity") or config.get("identity")
     if not cfg_ident or str(cfg_ident).lower() == "auto":
-        # Wait briefly for banc_listener to resolve dynamic traceroute identity
+        # Wait briefly for banc_listener to resolve dynamic network identity
         for _ in range(25):
             if monitor.identity not in ("INITIALIZING...", "GENERATING ID..."):
                 break

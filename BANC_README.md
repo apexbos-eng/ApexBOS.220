@@ -289,7 +289,7 @@ Follow the step-by-step graphical or CLI wizard:
 ```
 
 #### What the Setup Script Performs Under the Hood:
-1. **Node Identity Collection**: Computes the SHA-256 network trace hashes for all local nodes (Flux, Engine, Viewer, Creator) and writes them into `whitelist.txt`.
+1. **Node Identity Collection**: Computes the SHA-256 LAN default-gateway MAC identity hash for the local network (shared identically by Flux, Engine, Viewer, and Creator on the same home LAN) and writes it into `whitelist.txt`.
 2. **Package Construction (`banc_deploy.zip`)**: Packages:
    - `ApexBOSBanc.py`
    - `version.py`
@@ -365,7 +365,8 @@ ApexBOSBanc enforces defense-in-depth security suitable for public cloud hosting
 - Replay attacks outside the token window are automatically dropped.
 
 ### 3. Node Identity Whitelisting
-- Every client calculates a unique identity string based on traceroute network hops and hardware UUIDs.
+- Every client calculates a stable 12-character SHA-256 identity hash anchored to its local network's physical default gateway MAC address (preferring the physical IPv4 gateway and skipping VPN tunnels, with IPv6-only and local outbound prefix fallbacks—and zero third-party lookup servers).
+- All computers on the same home LAN generate the exact same identity hash regardless of ISP routing or dynamic public IP changes, while remaining unique across different users' private networks. Users on isolated VLANs or double-NAT setups can also manually pin an `"identity"` override in their configuration file.
 - Only identities listed in `whitelist.txt` (or approved dynamically via `[0-9]` in the console) are permitted to submit or fetch data.
 
 ### 4. Automated Anti-DoS Cooldown Defense

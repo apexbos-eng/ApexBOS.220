@@ -21,7 +21,7 @@ Operating at the critical junction between RF physical receivers and dispatcher 
 4. [Cloud Bursting Protocol & Security](#cloud-bursting-protocol--security)
    - [Dual-Frame Wire Protocol](#dual-frame-wire-protocol)
    - [Dynamic Rolling TOTP Authentication](#dynamic-rolling-totp-authentication)
-   - [Spoof-Resistant Multi-Hop Node Identity](#spoof-resistant-multi-hop-node-identity)
+   - [Stable Home-Network Node Identity (Gateway MAC)](#stable-home-network-node-identity-gateway-mac)
    - [CSV Burst Record Specification](#csv-burst-record-specification)
 5. [Interactive Console Commands & Keybindings](#interactive-console-commands--keybindings)
 6. [Setup Wizard & Deployment Guide](#setup-wizard--deployment-guide)
@@ -46,7 +46,7 @@ flowchart TD
         SUB["Supervised ZMQ Subscriber Pool\n- Auto-Reconnect & Keepalive\n- Multipart & RSSI Extraction\n- 60-Sec Sliding Window Counters"]
         MCAST_TX["Local UDP Multicast Transmitter\n- Channel Tagging (CH###:)\n- RSSI Injection (RSSI=##.#:)\n- Low-Latency Loopback"]
         QUEUE["In-Memory Burst Buffer Queue\n- Max 100 Packets or 120 Seconds\n- Pause/Resume Memory Cap"]
-        ENC["Cryptographic Burst Engine\n- Rolling TOTP (mosfet_auth)\n- AES-128 Fernet Encryption\n- Multi-Hop Traceroute Identity"]
+        ENC["Cryptographic Burst Engine\n- Rolling TOTP (mosfet_auth)\n- AES-128 Fernet Encryption\n- LAN Gateway MAC Identity"]
         UI_SRV["Telnet / TUI Server (Port 8080 / 56781)"]
     end
 
@@ -87,7 +87,7 @@ ApexBOSFlux features a high-density, real-time ANSI terminal dashboard that prov
 ### Dashboard Functional Zones:
 
 1. **Header & Node Identity Zone**:
-   - **Identity ID**: Cryptographically derived local node identifier (e.g. `d71477755787...`), uniquely computed via multi-hop network traceroute hashing.
+   - **Identity ID**: Cryptographically derived network identifier (e.g. `d71477755787`), deterministically computed by hashing the local LAN default gateway's MAC address so every computer on the same home network shares one stable identity.
    - **Auth Token**: Active **Rolling TOTP Token** with a live countdown timer showing the remaining window (e.g. `56C361 (changes in 08:32)`).
    - **Total Pkts/Min**: Aggregated rolling packet rate across all connected RF channels over a 60-second sliding window.
    - **Connections**: Summary counters showing `Active` vs `Pending / Restoring` ZeroMQ subscriber sockets.
@@ -181,15 +181,20 @@ $$\text{Token} = \text{HMAC-SHA256}(\text{Secret}, \lfloor t_{\text{UTC}} / 600 
 - Tokens are valid for 10 minutes (600 seconds), with a $\pm 60$-second clock skew tolerance.
 - Compromised or intercepted network traffic cannot be replayed outside the active 10-minute window.
 
-### Spoof-Resistant Multi-Hop Node Identity
+### Stable Home-Network Node Identity (Gateway MAC)
 
-Flux automatically establishes a stable, hardware- and network-anchored node identity:
-1. Executes an automated traceroute (`tracert -d -h 5` on Windows; `traceroute -n -m 5` or `traceroute6` on Linux) towards the target Banc cloud server.
-2. Extracts IP addresses of intermediate network hops (specifically hops 2, 3, and 4).
-3. Hashes the hop IPs combined with the machine's MAC/UUID using SHA-256:
-   $$\text{Identity} = \text{SHA256}(\text{Hop}_2 + \text{Hop}_3 + \text{Hop}_4 + \text{UUID})[:16]$$
-4. If Banc is local or offline, falls back to `"LOCAL"` or a machine UUID hash.
-5. This prevents rogue stations from spoofing telemetry from authorized physical sensor locations.
+Flux, Dispatcher Engine, and the Setup Wizard all share a single network identity generator (`mosfet_client.generate_identity`) anchored to the local router rather than volatile ISP hops:
+1. Queries the OS routing table and ARP/neighbor cache to locate the **physical IPv4 default gateway MAC address** (automatically skipping virtual VPN/TUN routes that lack an Ethernet ARP entry).
+2. Normalizes the MAC address to canonical lowercase, zero-padded `aa:bb:cc:dd:ee:ff` form so Windows, Linux/Raspberry Pi, and macOS machines on the same home LAN produce the **exact same identity**.
+3. Computes a one-way 12-character SHA-256 hash (the raw router MAC is never transmitted):
+   $$\text{Identity} = \text{SHA256}(\text{"apexbos-lan-v1:gw:"} + \text{GatewayMAC})[:12]$$
+4. **Fallbacks & Edge Cases** (zero third-party servers contacted):
+   - On IPv6-only networks, falls back to the IPv6 default gateway neighbor MAC.
+   - If a shared enterprise virtual-router MAC (VRRP/HSRP/GLBP) is detected, mixes in a local network differentiator.
+   - On direct PPPoE/cellular/VPS hosts without a Layer-2 gateway MAC, falls back to the local outbound IPv6 `/64` prefix or public IPv4, and finally to a deterministic local fallback.
+   - If Banc is disabled (`cloud_server: "None"`), uses `"LOCAL"`.
+   - For isolated VLANs or double-NAT setups, you can explicitly pin `"identity": "<custom_id>"` in `config.json` / `MosFET.json`.
+5. Because the identity is tied to the home router's globally unique MAC address, it remains **100% immune to ISP routing changes and dynamic WAN IP renewals**, never collides across different users' private `192.168.x.x` LANs, and allows Banc owners to authorize a user's home network once across all their computers.
 
 ### CSV Burst Record Specification
 
@@ -203,7 +208,7 @@ Each line within the decrypted payload represents a single decoded telemetry mes
 | :---: | :--- | :--- | :--- |
 | **0** | `date_str` | `YYYY-MM-DD HH:MM:SS` | Human-readable local/UTC timestamp. |
 | **1** | `unix_ts` | Float (`1763266530.42`) | Microsecond-accurate epoch timestamp. |
-| **2** | `identity` | String (`16 hex chars`) | Cryptographic Node Identity of the sending Flux station. |
+| **2** | `identity` | String (`12 hex chars`) | Cryptographic Network Identity of the sending Flux station. |
 | **3** | `hex_data` | Uppercase Hex String | Complete raw hex representation of the telemetry frame. |
 | **4** | `channel` | Integer (`101`) | 220 MHz RF channel number (e.g. 101, 102, 113...). |
 | **5** | `rssi` | Float / `"NA"` (`-68.4`) | True received signal strength in dBm or dBFS. |
@@ -312,6 +317,7 @@ ApexBOSFlux supports both modern unified `config.json` files and standalone lega
 | `cloud_port` | Integer | `23009` | Inbound TCP data port on the Banc cloud server. |
 | `auth_secret` | String | `"DEFAULT_SECRET"` | Shared secret phrase used for rolling TOTP token generation. |
 | `encryption_key` | String | `null` | 44-character Base64 Fernet key used for symmetric payload encryption. |
+| `identity` | String | `"auto"` | Optional override for the node identity string. Leave unset or `"auto"` to derive automatically from the LAN default gateway MAC hash. |
 
 ---
 
