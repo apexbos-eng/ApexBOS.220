@@ -518,6 +518,9 @@ python ApexBOSCreator.py --lat 34.1234 --lon -118.6543 --radius 25.0 layouts/my_
 | `0` | Canvas | **Track Jump Tool**: Activates broken-line track connector placement. |
 | `A` | Selected Elem | **Topology Assistant**: Auto-wires neighbors and route links. |
 | `X` | Selected Track | **Split Track**: Divides selected track segment into two halves. |
+| `R` / `Shift+R` | Selection | **Rotate 45° CW / CCW**: Rotates a single selected track in place, or rotates **multiple selected layout elements** together around their common center of mass (updating positions, track orientations/neighbor directions, turnout legs, signals, and track jumps). |
+| `Arrow Keys` | Canvas | **Pan Camera**: Scrolls the schematic viewport smoothly. |
+| `Shift+Arrow Keys` | Selection | **Move Selected Element(s)**: Nudges one or more selected elements by 1 logical grid unit per tap (hold to repeat smoothly) without panning the camera. |
 | `K` | Canvas | **Crank Engine**: Runs in-memory DispatcherEngine simulation pass. |
 | `S` | Sim/Crank Mode | **All Stop**: Instantly turns all signals across layout to Red/Stop aspect. |
 | `V` | Canvas | **Verify Layout**: Runs automated topological and syntax audit. |
@@ -540,7 +543,8 @@ python ApexBOSCreator.py --lat 34.1234 --lon -118.6543 --radius 25.0 layouts/my_
 
 - **Left Click & Drag (Canvas)**: Pans schematic canvas across the screen.
 - **Scroll Wheel (Canvas)**: Zooms in and out centered on the mouse cursor.
-- **Left Click on Element**: Selects element for dragging or editing.
+- **Shift + Scroll Wheel (Selection)**: Rotates a single selected (or hovered) track in place in 45° increments, or—when **multiple layout elements are selected** (via box-select or `Shift + Click`)—rotates the entire group together in 45° increments around their common center of mass (automatically rotating element coordinates, track orientations & neighbor compass keys, turnout orientations/legs, signal directions, and track-jump directions with lossless full-circle stepping).
+- **Left Click on Element**: Selects element for dragging, `Shift + Arrow` nudging, or editing (`Shift + Click` toggles multi-selection; dragging on empty canvas box-selects multiple elements).
 - **Double Click on Element**: Opens the In-Place Property Editor.
 - **Right Click & Drag (Track End)**: Stretches or curves track segment using endpoint handles.
 - **Hover on Element**: Displays contextual element identification tooltip (ID, Display Label, WIU, RSSI).

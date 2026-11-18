@@ -1,16 +1,16 @@
 {
-  "version": "v26.1117.05",
-  "generated_at": "2026-11-17T21:33:24.028618Z",
+  "version": "v26.1117.06",
+  "generated_at": "2026-11-18T01:14:55.467479Z",
   "files": {
     "ApexBOS.220.py": "faae9c3f7e5fdcd996f28730db36715efdcd60cdeb6f47fb7e370e28f7f3b00c",
     "ApexBOSBanc.py": "0cf3265d47588f64ccaa0e5b0c0b6bfd32f5cda90e08417a333854d5e6bc2968",
-    "ApexBOSCreator.py": "179c6f747c565a364669cd4356877a7f398db90678aa3d84a2d44c78c0555d2d",
+    "ApexBOSCreator.py": "a9177658ce0ca2fd53cad37c786395e63046b5c1b210be224e82c7cf9bbea685",
     "ApexBOSFlux.py": "81ea9b129fa8c7072bc79fe3f78f0eeb23ef1ea736575bde372b19d0d627dc7b",
     "ApexBOSGrabber.py": "93a31e674127f165206a3a49d4379d1d3cb750e45939b3a919051902df389609",
     "ApexBOSLauncher.py": "fb0234ddc3a7695f79f01d080d8e96fb6a3f51a0b5402e5ef74213b6f2b9f147",
     "ApexBOSSpy.py": "d342991db4d139b6a18ebc4c51402a2636a80fc4587ed09d28edad37c98c4651",
     "BANC_README.md": "fd5d13a6799841cc5510bed1530faea8a589c89c7a102a518e219b822109fcb8",
-    "CREATOR_README.md": "107972159cf75b976d22473667a30a4a82f5e7e7b180b0d96032553af3880ddf",
+    "CREATOR_README.md": "1984b56c4b411de3f7ed27af3555f9865e0d7012ede9482b97395454d304c478",
     "ENGINE_README.md": "5a81e36361f9baf92d65c66f055b669087bcc1f1af8fec6784c3c336099fe025",
     "FLUX_README.md": "42c8d0057f17f003da5c37821031c244a6facf16c7534308c70c0cb0110ad1d1",
     "GRABBER_README.md": "b26a51e7ac3a0d330f85a57a23209783e8589b3bcccb632c34def1db686f7181",
@@ -39,7 +39,7 @@
     "install_utils.py": "5d91aff77c10b511216bd284f6f9c6f7d2db676fdfb0b1d5a0841986a09e14e1",
     "itcvl_converter.py": "22f82b4d6ce2fd7570c6c9ab332056ec5a9ad6d1a89d96c6f95b04101ff68769",
     "layouts/all_classes_example.json": "80b0dd4ec627a9a13ddabd92741e576c4ad6b72a960f53da7a39fe8f081ff06c",
-    "layouts/arrow_layout.json": "33125011465c6cadbb26653ebd9b8f8d096471481e100535ea6e06d59c396d4e",
+    "layouts/arrow_layout.json": "f3ebd1385007dd9acaa3d9a31ff1f3e39201d9367e0ad0939726ca727638654a",
     "layouts/up_yuma_subdivision.json": "dc39b10d7e68cd4c8d21d701b10c52706c4ec497cb593553d4fa9c0b2bb1bbbe",
     "mosfet_auth.py": "69f558139cb374a0e0b584dedd3ec3b7576cb784fbda79abaa92077a9e4a4adf",
     "mosfet_client.py": "275440255b74787f015bb681155b78c5051dfd5ac67ac4a65ebf5ba3d2c11b67",
@@ -61,7 +61,7 @@
     "update.bat": "b58fbd50eafac3a81913e0b1a0f115bee2cda168461be5c7e1b145a22a03cf84",
     "update.py": "9540e67e165ec79136f718d5d1a2edd5deefa4d958f0ac2e53042d1ab29fd9c0",
     "update.sh": "e1ff22c79daed48d5204487012a19f7b1b34506bb2c7aa9312b39bcad014a76f",
-    "version.py": "4a2326fb2d3fad6608708e7547ed89ba45a4f522473915d481684a51a972b1d3",
-    "config.defaults.json": "2bb286fdf7101a455c1aa6b06dc97c10868071e35b091fa418c0e33c6b2ceb87"
+    "version.py": "f953d57b983c1ed07522afd32d95b2c40927d9425eff9b6f41f8fff8aa4304a9",
+    "config.defaults.json": "f7e76c75a2aa7536d4bfa83ea5b15bdda0ac3dcebe4993754466de88574f48c0"
   }
 }

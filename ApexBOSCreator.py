@@ -3787,6 +3787,9 @@ class ApexBOSCreatorApp:
         self.drag_moved: bool = False
         self.drag_anchor_logical: Tuple[float, float] = (0.0, 0.0)
         self.drag_initial_positions: Dict[str, Tuple[int, int]] = {}
+        self._group_rot_session: Optional[Dict[str, Any]] = None
+        self._shift_arrow_repeat_ts: float = 0.0
+        self._shift_arrow_moved_during_hold: bool = False
 
         self.dragging_track_end: Optional[Tuple[str, int, Tuple[float, float]]] = None
         self.track_end_drag_curr_logical: Tuple[float, float] = (0.0, 0.0)
@@ -3991,6 +3994,7 @@ class ApexBOSCreatorApp:
 
     def undo(self):
         if not self.undo_stack: return
+        self._group_rot_session = None
         self.redo_stack.append(self._capture_snapshot())
         prev_snap = self.undo_stack.pop()
         self._restore_snapshot(prev_snap)
@@ -3999,6 +4003,7 @@ class ApexBOSCreatorApp:
 
     def redo(self):
         if not self.redo_stack: return
+        self._group_rot_session = None
         self.undo_stack.append(self._capture_snapshot())
         next_snap = self.redo_stack.pop()
         self._restore_snapshot(next_snap)
@@ -5391,7 +5396,7 @@ class ApexBOSCreatorApp:
                 if (mods & pygame.KMOD_SHIFT) or (mods & pygame.KMOD_LSHIFT) or (mods & pygame.KMOD_RSHIFT):
                     direction = 1 if event.y > 0 else -1
                     if not self.rotate_selected_track(direction, mx, my):
-                        self.status_toast = "Select a track to rotate in 45° increments (Shift + Scroll)."
+                        self.status_toast = "Select a track or multiple elements to rotate in 45° increments (Shift + Scroll)."
                     continue
 
                 if self.inplace_editor:
@@ -5522,18 +5527,41 @@ class ApexBOSCreatorApp:
                                 self.pending_load_target = None
                     continue
                 self._handle_mouse_down(event)
+            elif event.type == pygame.KEYUP:
+                if event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN, pygame.K_LSHIFT, pygame.K_RSHIFT):
+                    self._shift_arrow_repeat_ts = 0.0
+                    if self._shift_arrow_moved_during_hold:
+                        self._shift_arrow_moved_during_hold = False
+                        for sid in self.selected_ids:
+                            el = self.engine.elements.get(sid)
+                            if el and el.elem_type not in SYSTEM_LIST_TYPES:
+                                LayoutTopologyAssistant.auto_suggest_connections(el, self.engine.elements)
+                        self.crank_engine()
             elif event.type == pygame.MOUSEBUTTONUP:
                 self._handle_mouse_up(event)
             elif event.type == pygame.MOUSEMOTION:
                 self._handle_mouse_motion(event)
 
-        if not self.inplace_editor and not self.file_prompt_mode and not self.confirm_exit_modal and not self.confirm_new_modal and not self.confirm_load_modal and not self.frag_picker_modal and not self.banc_coverage_modal:
+        if (not self.inplace_editor and not self.file_prompt_mode and not self.confirm_exit_modal
+                and not self.confirm_new_modal and not self.confirm_load_modal
+                and not self.frag_picker_modal and not self.banc_coverage_modal
+                and not self.gps_picker_modal and not self.train_assign_active):
             keys = pygame.key.get_pressed()
-            pan_speed = 10.0
-            if keys[pygame.K_LEFT]: self.cam_x += pan_speed
-            if keys[pygame.K_RIGHT]: self.cam_x -= pan_speed
-            if keys[pygame.K_UP]: self.cam_y += pan_speed
-            if keys[pygame.K_DOWN]: self.cam_y -= pan_speed
+            shift_held = bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
+            if shift_held:
+                if self.selected_ids and self._shift_arrow_repeat_ts > 0.0 and time.time() >= self._shift_arrow_repeat_ts:
+                    dx = (-1 if keys[pygame.K_LEFT] else 0) + (1 if keys[pygame.K_RIGHT] else 0)
+                    dy = (-1 if keys[pygame.K_UP] else 0) + (1 if keys[pygame.K_DOWN] else 0)
+                    if dx != 0 or dy != 0:
+                        self.move_selected_elements(dx, dy, push_undo=False, auto_connect=False)
+                        self._shift_arrow_repeat_ts = time.time() + 0.07
+                        self._shift_arrow_moved_during_hold = True
+            else:
+                pan_speed = 10.0
+                if keys[pygame.K_LEFT]: self.cam_x += pan_speed
+                if keys[pygame.K_RIGHT]: self.cam_x -= pan_speed
+                if keys[pygame.K_UP]: self.cam_y += pan_speed
+                if keys[pygame.K_DOWN]: self.cam_y -= pan_speed
         return True
 
     def open_file_prompt(self, mode: str, default_buffer: str = ""):
@@ -5990,10 +6018,179 @@ class ApexBOSCreatorApp:
         self.crank_engine()
         self.status_toast = f"Split '{el.id}' into '{el.id}' & '{new_id}' (gap at ({orig_x},{orig_y}) for turnout)."
 
+    @staticmethod
+    def _rotate_compass_dir(direction_str: str, step: int) -> str:
+        """Rotates an 8-point compass direction clockwise by `step` * 45 degrees."""
+        compass_cw = ("E", "SE", "S", "SW", "W", "NW", "N", "NE")
+        d = str(direction_str or "").strip().upper()
+        if d not in compass_cw:
+            return direction_str
+        return compass_cw[(compass_cw.index(d) + step) % 8]
+
+    @staticmethod
+    def _rotate_track_orientation(orient_str: str, step: int) -> str:
+        """Rotates a TrackSegment orientation clockwise by `step` * 45 degrees."""
+        rot_cycle = ("E-W", "NW-SE", "N-S", "NE-SW")
+        cur = str(orient_str or "E-W").strip().upper()
+        if cur not in rot_cycle:
+            cur = "E-W"
+        return rot_cycle[(rot_cycle.index(cur) + step) % 4]
+
+    def move_selected_elements(self, dx: int, dy: int, push_undo: bool = True, auto_connect: bool = True) -> bool:
+        """Moves all currently selected layout elements by (dx, dy) logical grid units."""
+        targets = [
+            self.engine.elements[sid]
+            for sid in sorted(self.selected_ids)
+            if sid in self.engine.elements
+        ]
+        if not targets or (dx == 0 and dy == 0):
+            return False
+
+        self._group_rot_session = None
+        if push_undo:
+            self.push_undo_state()
+
+        for el in targets:
+            el.x = int(el.x) + int(dx)
+            el.y = int(el.y) + int(dy)
+
+        if auto_connect:
+            for el in targets:
+                if el.elem_type not in SYSTEM_LIST_TYPES:
+                    LayoutTopologyAssistant.auto_suggest_connections(el, self.engine.elements)
+
+        self.dirty = True
+        self._cached_render_state = None
+        self.crank_engine()
+        if len(targets) == 1:
+            t0 = targets[0]
+            self.status_toast = f"Moved '{t0.id}' to ({t0.x}, {t0.y})."
+        else:
+            self.status_toast = f"Moved {len(targets)} selected elements by ({dx:+d}, {dy:+d})."
+        return True
+
     def rotate_selected_track(self, direction: int = 1, mx: Optional[int] = None, my: Optional[int] = None) -> bool:
-        """Rotates the selected track segment in 45-degree increments.
+        """Rotates either:
+          - Multiple selected layout elements together around their common center of mass in 45° increments, OR
+          - A single selected (or hovered) TrackSegment in place in 45° increments.
         direction: +1 for clockwise / wheel up, -1 for counter-clockwise / wheel down.
         """
+        step_dir = 1 if direction >= 0 else -1
+        selected_layout = [
+            self.engine.elements[sid]
+            for sid in sorted(self.selected_ids)
+            if sid in self.engine.elements and self.engine.elements[sid].elem_type not in SYSTEM_LIST_TYPES
+        ]
+
+        # Multi-element rotation around common center of mass (when >1 layout elements are selected)
+        if len(selected_layout) > 1:
+            target_ids = frozenset(el.id for el in selected_layout)
+            sess = self._group_rot_session
+            reuse_session = (
+                isinstance(sess, dict)
+                and sess.get("ids") == target_ids
+                and all(
+                    (int(el.x), int(el.y)) == sess.get("last_pos", {}).get(el.id)
+                    for el in selected_layout
+                )
+            )
+            if not reuse_session:
+                cx = sum(float(el.x) for el in selected_layout) / float(len(selected_layout))
+                cy = sum(float(el.y) for el in selected_layout) / float(len(selected_layout))
+                orig_map: Dict[str, Dict[str, Any]] = {}
+                for el in selected_layout:
+                    rec: Dict[str, Any] = {"x": float(el.x), "y": float(el.y)}
+                    if isinstance(el, TrackSegment):
+                        rec["orientation"] = el.orientation or "E-W"
+                        rec["neighbors"] = copy.deepcopy(el.neighbors) if isinstance(el.neighbors, dict) else {}
+                    elif isinstance(el, Turnout):
+                        rec["orientation"] = el.orientation or "E"
+                        rec["normal_dir"] = el.normal_dir or "E"
+                        rec["reverse_dir"] = el.reverse_dir or "NE"
+                    elif isinstance(el, (Signal, TrackJump)):
+                        rec["direction"] = el.direction or "E"
+                    orig_map[el.id] = rec
+                sess = {
+                    "ids": target_ids,
+                    "cx": cx,
+                    "cy": cy,
+                    "step": 0,
+                    "orig": orig_map,
+                    "last_pos": {},
+                }
+                self._group_rot_session = sess
+
+            self.push_undo_state()
+            sess["step"] += step_dir
+            step_total = sess["step"]
+            cx = sess["cx"]
+            cy = sess["cy"]
+
+            # Exact 8-step clockwise trig table for screen coordinates (+x East, +y South)
+            s45 = math.sqrt(0.5)
+            trig_table = (
+                (1.0, 0.0),    # 0°
+                (s45, s45),    # 45° CW
+                (0.0, 1.0),    # 90° CW
+                (-s45, s45),   # 135° CW
+                (-1.0, 0.0),   # 180°
+                (-s45, -s45),  # 225° CW
+                (0.0, -1.0),   # 270° CW
+                (s45, -s45),   # 315° CW
+            )
+            cos_t, sin_t = trig_table[step_total % 8]
+            last_pos: Dict[str, Tuple[int, int]] = {}
+
+            for el in selected_layout:
+                orig = sess["orig"][el.id]
+                dx = orig["x"] - cx
+                dy = orig["y"] - cy
+                el.x = int(round(cx + dx * cos_t - dy * sin_t))
+                el.y = int(round(cy + dx * sin_t + dy * cos_t))
+                last_pos[el.id] = (el.x, el.y)
+
+                if isinstance(el, TrackSegment):
+                    el.orientation = self._rotate_track_orientation(orig["orientation"], step_total)
+                    new_nbrs: Dict[str, List[str]] = {}
+                    for d_key, id_list in orig["neighbors"].items():
+                        rot_key = self._rotate_compass_dir(d_key, step_total)
+                        bucket = new_nbrs.setdefault(rot_key, [])
+                        for nid in id_list:
+                            if nid not in bucket:
+                                bucket.append(nid)
+                    el.neighbors = new_nbrs
+                elif isinstance(el, Turnout):
+                    el.orientation = self._rotate_compass_dir(orig["orientation"], step_total)
+                    el.normal_dir = self._rotate_compass_dir(orig["normal_dir"], step_total)
+                    el.reverse_dir = self._rotate_compass_dir(orig["reverse_dir"], step_total)
+                elif isinstance(el, (Signal, TrackJump)):
+                    el.direction = self._rotate_compass_dir(orig["direction"], step_total)
+
+                if self.inplace_editor and self.inplace_editor.element.id == el.id:
+                    for f in self.inplace_editor.fields:
+                        if f["key"] == "orientation" and hasattr(el, "orientation"):
+                            f["val"] = el.orientation
+                        elif f["key"] == "direction" and hasattr(el, "direction"):
+                            f["val"] = el.direction
+                        elif f["key"] == "normal_dir" and hasattr(el, "normal_dir"):
+                            f["val"] = el.normal_dir
+                        elif f["key"] == "reverse_dir" and hasattr(el, "reverse_dir"):
+                            f["val"] = el.reverse_dir
+
+            sess["last_pos"] = last_pos
+            self.dirty = True
+            self._cached_render_state = None
+            self.crank_engine()
+            delta_deg = step_dir * 45
+            total_deg = (step_total * 45) % 360
+            self.status_toast = (
+                f"Rotated {len(selected_layout)} elements by {delta_deg:+d}° around center "
+                f"({cx:.1f}, {cy:.1f}) [total {total_deg}°]."
+            )
+            return True
+
+        # Single-track rotation in place
+        self._group_rot_session = None
         target_tracks: List[TrackSegment] = []
         if self.selected_ids:
             for sid in self.selected_ids:
@@ -6014,14 +6211,8 @@ class ApexBOSCreatorApp:
             return False
 
         self.push_undo_state()
-        rot_cycle = ["E-W", "NW-SE", "N-S", "NE-SW"]
         for trk in target_tracks:
-            cur = trk.orientation or "E-W"
-            if cur not in rot_cycle:
-                cur = "E-W"
-            idx = rot_cycle.index(cur)
-            new_idx = (idx + direction) % len(rot_cycle)
-            new_orient = rot_cycle[new_idx]
+            new_orient = self._rotate_track_orientation(trk.orientation or "E-W", step_dir)
             trk.orientation = new_orient
 
             # Sync editor if open for this track
@@ -6031,6 +6222,7 @@ class ApexBOSCreatorApp:
                         f["val"] = new_orient
 
         self.dirty = True
+        self._cached_render_state = None
         self.crank_engine()
         names = ", ".join(t.id for t in target_tracks)
         last_orient = target_tracks[0].orientation
@@ -6336,10 +6528,18 @@ class ApexBOSCreatorApp:
             self.show_verification_panel = False
             self.status_toast = "Deselected all elements."
         elif event.key in (pygame.K_DELETE, pygame.K_BACKSPACE): self.delete_selected()
+        elif shift and not ctrl and event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
+            dx = -1 if event.key == pygame.K_LEFT else (1 if event.key == pygame.K_RIGHT else 0)
+            dy = -1 if event.key == pygame.K_UP else (1 if event.key == pygame.K_DOWN else 0)
+            if self.move_selected_elements(dx, dy, push_undo=True, auto_connect=True):
+                self._shift_arrow_repeat_ts = time.time() + 0.35
+                self._shift_arrow_moved_during_hold = False
+            else:
+                self.status_toast = "Select element(s) to move with Shift + Arrow keys."
         elif event.key == pygame.K_r and not ctrl:
             direction = -1 if shift else 1
             if not self.rotate_selected_track(direction):
-                self.status_toast = "Select a track to rotate in 45° increments (R or Shift-Scroll)."
+                self.status_toast = "Select a track or multiple elements to rotate in 45° increments (R or Shift-Scroll)."
         elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.selected_ids:
             sel_id = next(iter(sorted(self.selected_ids)))
             if sel_id in self.engine.elements:
