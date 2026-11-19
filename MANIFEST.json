@@ -1,6 +1,6 @@
 {
-  "version": "v26.1117.06",
-  "generated_at": "2026-11-18T01:14:55.467479Z",
+  "version": "v26.1119.01",
+  "generated_at": "2026-11-19T18:27:46.466887Z",
   "files": {
     "ApexBOS.220.py": "faae9c3f7e5fdcd996f28730db36715efdcd60cdeb6f47fb7e370e28f7f3b00c",
     "ApexBOSBanc.py": "0cf3265d47588f64ccaa0e5b0c0b6bfd32f5cda90e08417a333854d5e6bc2968",
@@ -33,7 +33,7 @@
     "config/x33_rule.json": "b58bb3e0fbd7396a8649b6cbf0509c10a725a533d14aa9864a13cb518a273d03",
     "config/x70_rules.json": "97705c04152c8bb656ca83c53ee03f3ba0bf0e1155745e180d34e9a665b62f2b",
     "config_loader.py": "f6e373d0b3794bf8c913ff1daf46db71787d95b6a1088d5bfc1defcab08f6404",
-    "dispatcher_engine.py": "038558955bae3a331f4f0a1902b5c46affc02f465dc94f1aa2a2e176f097938f",
+    "dispatcher_engine.py": "771e3631011d268648216aa0c981611e13d2442f173d55132a26472ddeb85604",
     "enable_firewall.bat": "37c124b4a8d65d6464ee4602b15e9fff36a28b51f2a5c814dc63a84801cf6f5f",
     "enable_firewall.ps1": "3977f738237be448b78444b79d554fcaa5700020140e67298109ba806c4788bd",
     "install_utils.py": "5d91aff77c10b511216bd284f6f9c6f7d2db676fdfb0b1d5a0841986a09e14e1",
@@ -54,14 +54,14 @@
     "signals_default.json": "0ede41f219c0cae833d55c2357ef9ab73425b9cd20a00a913912a3ff54a33db1",
     "start_banc.sh": "5d79fa3bd96a4e1b625506fc24d7e3f103fd2418e08ce3b381ddcded6792d806",
     "thanks.txt": "444bf8f98625b41b648db33030a3b28dc6ed4a0d22dd9b46e54126db85f00b01",
-    "train_logic.py": "f2266608407fa1fcebd34da8f44cd26906a8025771941744e85ff79139bd5fce",
+    "train_logic.py": "4982789f0690decb744697a4bf85eb918c0e8c5c7c44ac9567bde45c7999dc14",
     "uninstall.bat": "b0b9adbadeb09bd241ef26719eb72b750373da22d15ecb44970b89311e37c864",
     "uninstall.py": "197bec90d5357c10f43bd7e51d9562b4ef28929082308dccccf4c6975659a508",
     "uninstall.sh": "b5f01392a333c6197079fe37c3cf37e05a4d064667f3896dc6425cdcf3476f7e",
     "update.bat": "b58fbd50eafac3a81913e0b1a0f115bee2cda168461be5c7e1b145a22a03cf84",
     "update.py": "9540e67e165ec79136f718d5d1a2edd5deefa4d958f0ac2e53042d1ab29fd9c0",
     "update.sh": "e1ff22c79daed48d5204487012a19f7b1b34506bb2c7aa9312b39bcad014a76f",
-    "version.py": "f953d57b983c1ed07522afd32d95b2c40927d9425eff9b6f41f8fff8aa4304a9",
-    "config.defaults.json": "f7e76c75a2aa7536d4bfa83ea5b15bdda0ac3dcebe4993754466de88574f48c0"
+    "version.py": "45824b2efeacba69d7abb74fbbf011989b8a5557cce965d67b2d9c9ff920bb64",
+    "config.defaults.json": "108ed37150d8b812459d6c39eccb46384cb0cd3b8f357fc1eb530de76918e9f9"
   }
 }

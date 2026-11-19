@@ -638,6 +638,12 @@ class TrainInferenceManager:
             for compat in COMPATIBLE_DIRS.get(travel_dir, (travel_dir,)):
                 if el2_id in neighbors.get(compat, []):
                     return True
+            opp = OPPOSITE_DIR.get(travel_dir)
+            for ndir, nval in neighbors.items():
+                if ndir != opp:
+                    cands = [nval] if isinstance(nval, str) else list(nval)
+                    if el2_id in cands:
+                        return True
 
         if getattr(el1, "elem_type", "") == "turnout":
             act = el1.active_branch_neighbor() if hasattr(el1, "active_branch_neighbor") else None
@@ -729,7 +735,7 @@ class TrainInferenceManager:
         """
         d1 = trn1.get("direction")
         d2 = trn2.get("direction")
-        if not d1 or not d2 or d1 != d2:
+        if not d1 or not d2:
             return False, True
 
         p1 = trn1.get("path_element_ids") or []
@@ -738,32 +744,43 @@ class TrainInferenceManager:
         sig2 = trn2.get("initial_signal_id")
         ds1 = trn1.get("downstream_signals") or []
         ds2 = trn2.get("downstream_signals") or []
+        exp1 = trn1.get("expected_signal_id")
+        exp2 = trn2.get("expected_signal_id")
 
         # 1. Downstream signal explicitly in path
-        if sig2 and sig2 in ds1:
+        if sig2 and (sig2 in ds1 or sig2 == exp1):
             return True, True
-        if sig1 and sig1 in ds2:
+        if sig1 and (sig1 in ds2 or sig1 == exp2):
             return True, False
 
         # 2. Overlapping track elements
         overlap = set(p1) & set(p2)
         if overlap:
-            first_overlap = None
-            for eid in p1:
-                if eid in overlap:
-                    first_overlap = eid
-                    break
-            idx1 = p1.index(first_overlap) if first_overlap else 0
-            idx2 = p2.index(first_overlap) if first_overlap in p2 else 0
-            return True, (idx1 >= idx2)
+            overlap_p1 = [eid for eid in p1 if eid in overlap]
+            overlap_p2 = [eid for eid in p2 if eid in overlap]
+            if overlap_p1 == overlap_p2:
+                idx1 = p1.index(overlap_p1[0])
+                idx2 = p2.index(overlap_p1[0])
+                return True, (idx1 >= idx2)
+            else:
+                # Opposite traversal order along shared elements -> opposing trains
+                return False, True
+
+        # Strictly opposite directions with no downstream signal or forward overlap -> opposing trains
+        if OPPOSITE_DIR.get(d1) == d2:
+            return False, True
 
         # 3. End-to-start element continuity
         if p1 and p2:
-            if cls.are_elements_continuous(p1[-1], p2[0], d1, elements, resolve_jump_fn) or \
-               cls.is_path_reachable(p1[-1], p2[0], d1, elements, resolve_jump_fn):
+            if (cls.are_elements_continuous(p1[-1], p2[0], d1, elements, resolve_jump_fn) or
+                cls.are_elements_continuous(p1[-1], p2[0], d2, elements, resolve_jump_fn) or
+                cls.is_path_reachable(p1[-1], p2[0], d1, elements, resolve_jump_fn) or
+                cls.is_path_reachable(p1[-1], p2[0], d2, elements, resolve_jump_fn)):
                 return True, True
-            if cls.are_elements_continuous(p2[-1], p1[0], d1, elements, resolve_jump_fn) or \
-               cls.is_path_reachable(p2[-1], p1[0], d1, elements, resolve_jump_fn):
+            if (cls.are_elements_continuous(p2[-1], p1[0], d1, elements, resolve_jump_fn) or
+                cls.are_elements_continuous(p2[-1], p1[0], d2, elements, resolve_jump_fn) or
+                cls.is_path_reachable(p2[-1], p1[0], d1, elements, resolve_jump_fn) or
+                cls.is_path_reachable(p2[-1], p1[0], d2, elements, resolve_jump_fn)):
                 return True, False
 
         # 4. Entry signal connection
@@ -797,6 +814,9 @@ class TrainInferenceManager:
         up_trn["ahead_elements"] = up_ahead
 
         up_sigs = list(up_trn.get("downstream_signals", []))
+        down_init = down_trn.get("initial_signal_id")
+        if down_init and down_init not in up_sigs and down_init != up_trn.get("initial_signal_id") and down_init not in up_trn.get("passed_signals", []):
+            up_sigs.append(down_init)
         for sid in down_trn.get("downstream_signals", []):
             if sid not in up_sigs and sid != up_trn.get("initial_signal_id") and sid not in up_trn.get("passed_signals", []):
                 up_sigs.append(sid)
@@ -904,33 +924,42 @@ class TrainInferenceManager:
         ahead_el = elements.get(getattr(sig, "protects_element", None))
         gps_resolver = get_signal_gps_fn or (lambda s: get_signal_gps(s, elements))
 
-        # 1. Rule 3: Check if this signal drop matches a Potential train (first signal in lined path)
-        matched_potential = None
-        for tkey, trn in train_tracker.trains.items():
-            if trn.get("status") == "Potential" and trn.get("initial_signal_id") == sig_id:
-                matched_potential = trn
-                break
-
-        # 2. Rule 4: Check if this signal drop matches an Inferred or Confirmed train expecting this signal
+        # 1. Rule 4: Check if this signal drop matches an Inferred or Confirmed train expecting this signal
         matched_expected = None
-        if not matched_potential:
-            for tkey, trn in train_tracker.trains.items():
-                if trn.get("status") in ("Inferred", "Confirmed"):
-                    # Rule 6: Ignore opposite direction signal drops
-                    if trn.get("direction") != sig_dir:
+        for tkey, trn in train_tracker.trains.items():
+            if trn.get("status") in ("Inferred", "Confirmed"):
+                exp_sig = trn.get("expected_signal_id")
+                is_expected = (exp_sig == sig_id)
+                is_downstream = (sig_id in trn.get("downstream_signals", []))
+                # Rule 6: Ignore opposite direction signal drops if not on this train's forward path
+                if not is_expected and not is_downstream:
+                    if OPPOSITE_DIR.get(trn.get("direction")) == sig_dir:
                         continue
-                    exp_sig = trn.get("expected_signal_id")
-                    if exp_sig == sig_id or (exp_sig is None and (sig_id in trn.get("downstream_signals", []) or trn.get("timeout_start_ts") is not None or trn.get("is_dimmed"))):
-                        matched_expected = trn
-                        break
+                if is_expected or (exp_sig is None and (is_downstream or trn.get("timeout_start_ts") is not None or trn.get("is_dimmed"))):
+                    matched_expected = trn
+                    break
 
-        # 3. Rule 5: Non-next signal on the same path going the same direction drops
+        # 2. Rule 3: Check if this signal drop matches a Potential train (first signal in lined path)
+        matched_potential = None
+        if not matched_expected:
+            for tkey, trn in train_tracker.trains.items():
+                if trn.get("status") == "Potential" and trn.get("initial_signal_id") == sig_id:
+                    matched_potential = trn
+                    break
+
+        # If matched_expected was found, clean up any duplicate Potential train keyed to this signal
+        if matched_expected:
+            pot_keys = [
+                k for k, t in train_tracker.trains.items()
+                if t.get("status") == "Potential" and (t.get("initial_signal_id") == sig_id or sig_id in t.get("path_element_ids", []))
+            ]
+            for k in pot_keys:
+                train_tracker.trains.pop(k, None)
+
+        # 3. Rule 5: Non-next signal on the same path drops
         if not matched_potential and not matched_expected:
             for tkey, trn in train_tracker.trains.items():
                 if trn.get("status") in ("Inferred", "Confirmed"):
-                    if trn.get("direction") != sig_dir:
-                        continue
-                    # Check if sig_id is a downstream signal or along this train's path, but NOT the expected next one
                     ds_list = trn.get("downstream_signals", [])
                     if sig_id in ds_list and sig_id != trn.get("expected_signal_id"):
                         # Rule 5: Keep existing train, do not create new train, continue watching expected signal
@@ -938,18 +967,28 @@ class TrainInferenceManager:
 
         # 4. Fallback: If no potential train was lined up, check if a potential train can be formed or inferred
         if not matched_potential and not matched_expected:
-            # Check if any train in the same direction on this continuous path already exists
             path = cls.trace_signal_green_path(sig, elements, resolve_jump_fn)
             if not path:
                 path = [(getattr(sig, "protects_element", ""), sig_dir)]
             downstream_sigs = cls.extract_downstream_signals(sig, path, elements)
 
-            # Check if this signal is on any existing train's path going the same direction
+            # Check if this signal is on any existing train's path
             has_existing = False
+            path_set = set(p[0] for p in path)
             for trn in train_tracker.trains.values():
-                if trn.get("direction") == sig_dir:
-                    overlap = set(p[0] for p in path) & set(trn.get("path_element_ids", []))
-                    if overlap or sig_id in trn.get("downstream_signals", []):
+                if sig_id in trn.get("downstream_signals", []) or sig_id == trn.get("expected_signal_id"):
+                    has_existing = True
+                    break
+                trn_ahead = trn.get("ahead_elements", [])
+                if set(trn_ahead) & path_set:
+                    has_existing = True
+                    break
+                trn_path = trn.get("path_element_ids", [])
+                overlap = set(trn_path) & path_set
+                if overlap:
+                    overlap_path = [e for e in [p[0] for p in path] if e in overlap]
+                    overlap_trn = [e for e in trn_path if e in overlap]
+                    if overlap_path == overlap_trn:
                         has_existing = True
                         break
             if not has_existing:
@@ -962,6 +1001,7 @@ class TrainInferenceManager:
         if matched_potential:
             trn = matched_potential
             trn["status"] = "Inferred"
+            trn["direction"] = sig_dir
             trn["current_signal_id"] = sig_id
             if sig_id not in trn.get("passed_signals", []):
                 trn.setdefault("passed_signals", []).append(sig_id)
@@ -978,9 +1018,17 @@ class TrainInferenceManager:
             if fwd_path:
                 fwd_eids = [p[0] for p in fwd_path if p[0] != prot_el]
                 fwd_sigs = cls.extract_downstream_signals(sig, fwd_path, elements)
-                trn["ahead_elements"] = fwd_eids
-                trn["downstream_signals"] = fwd_sigs
-                trn["expected_signal_id"] = fwd_sigs[0] if fwd_sigs else None
+                combined_sigs = list(fwd_sigs)
+                for sid in trn.get("downstream_signals", []):
+                    if sid not in combined_sigs and sid != sig_id and sid not in trn.get("passed_signals", []):
+                        combined_sigs.append(sid)
+                trn["downstream_signals"] = combined_sigs
+                trn["expected_signal_id"] = combined_sigs[0] if combined_sigs else None
+                combined_ahead = list(fwd_eids)
+                for eid in trn.get("ahead_elements", []):
+                    if eid not in combined_ahead and eid != prot_el:
+                        combined_ahead.append(eid)
+                trn["ahead_elements"] = combined_ahead
             else:
                 ds_list = [s for s in trn.get("downstream_signals", []) if s != sig_id]
                 trn["downstream_signals"] = ds_list
@@ -1018,6 +1066,7 @@ class TrainInferenceManager:
         if matched_expected:
             trn = matched_expected
             trn["status"] = "Confirmed"
+            trn["direction"] = sig_dir
             # Rule 11: Reactivate train if it resumed motion during timeout countdown
             trn["is_dimmed"] = False
             trn["timeout_start_ts"] = None
@@ -1116,9 +1165,17 @@ class TrainInferenceManager:
             if fwd_path:
                 fwd_eids = [p[0] for p in fwd_path if p[0] != new_el_id and p[0] not in passed_elems]
                 fwd_sigs = cls.extract_downstream_signals(sig, fwd_path, elements)
-                trn["ahead_elements"] = fwd_eids
-                trn["downstream_signals"] = fwd_sigs
-                trn["expected_signal_id"] = fwd_sigs[0] if fwd_sigs else None
+                combined_sigs = list(fwd_sigs)
+                for sid in trn.get("downstream_signals", []):
+                    if sid not in combined_sigs and sid != sig_id and sid not in trn.get("passed_signals", []):
+                        combined_sigs.append(sid)
+                trn["downstream_signals"] = combined_sigs
+                trn["expected_signal_id"] = combined_sigs[0] if combined_sigs else None
+                combined_ahead = list(fwd_eids)
+                for eid in remaining_ahead:
+                    if eid not in combined_ahead and eid != new_el_id and eid not in passed_elems:
+                        combined_ahead.append(eid)
+                trn["ahead_elements"] = combined_ahead
             else:
                 ds_list = trn.get("downstream_signals", [])
                 if sig_id in ds_list:
@@ -1220,12 +1277,10 @@ class TrainInferenceManager:
                 prot_el = getattr(sig, "protects_element", None)
                 path_eids = [p[0] for p in path]
 
-                # Associate with existing train going in same direction if downstream/ahead
+                # Associate with existing train if downstream/ahead along continuous path
                 is_duplicate = False
                 matched_existing = None
                 for tkey, trn in train_tracker.trains.items():
-                    if trn.get("direction") != sig_dir:
-                        continue
                     # 1. Same entry signal
                     if trn.get("initial_signal_id") == sig_id:
                         is_duplicate = True
@@ -1242,23 +1297,34 @@ class TrainInferenceManager:
                         matched_existing = trn
                         break
                     # 4. Overlap with ahead elements
-                    if set(path_eids) & set(trn.get("ahead_elements", [])):
-                        is_duplicate = True
-                        matched_existing = trn
-                        break
+                    ahead_elems = trn.get("ahead_elements", [])
+                    overlap_ahead = set(path_eids) & set(ahead_elems)
+                    if overlap_ahead:
+                        op = [e for e in path_eids if e in overlap_ahead]
+                        oa = [e for e in ahead_elems if e in overlap_ahead]
+                        if op == oa:
+                            is_duplicate = True
+                            matched_existing = trn
+                            break
                     # 5. Continuous connection from train's current element to prot_el
                     curr_el = trn.get("current_element_id")
+                    trn_dir = trn.get("direction", sig_dir)
                     if curr_el and (cls.are_elements_continuous(curr_el, prot_el, sig_dir, elements, resolve_jump_fn) or
-                                   cls.is_path_reachable(curr_el, prot_el, sig_dir, elements, resolve_jump_fn, max_depth=6)):
+                                   cls.are_elements_continuous(curr_el, prot_el, trn_dir, elements, resolve_jump_fn) or
+                                   cls.is_path_reachable(curr_el, prot_el, sig_dir, elements, resolve_jump_fn, max_depth=6) or
+                                   cls.is_path_reachable(curr_el, prot_el, trn_dir, elements, resolve_jump_fn, max_depth=6)):
                         is_duplicate = True
                         matched_existing = trn
                         break
                     # 6. Fallback overlap with path_element_ids
                     overlap = set(path_eids) & set(trn.get("path_element_ids", []))
                     if overlap:
-                        is_duplicate = True
-                        matched_existing = trn
-                        break
+                        op = [e for e in path_eids if e in overlap]
+                        ot = [e for e in trn.get("path_element_ids", []) if e in overlap]
+                        if op == ot:
+                            is_duplicate = True
+                            matched_existing = trn
+                            break
 
                 if is_duplicate and matched_existing:
                     active_lined_entry_signals.add(sig_id)
@@ -1277,6 +1343,8 @@ class TrainInferenceManager:
                     ds = matched_existing.setdefault("downstream_signals", [])
                     pass_sigs = matched_existing.get("passed_signals", [])
                     curr_sig = matched_existing.get("current_signal_id")
+                    if sig_id and sig_id not in ds and sig_id != init_sig and sig_id != curr_sig and sig_id not in pass_sigs:
+                        ds.append(sig_id)
                     for sid in new_ds:
                         if sid not in ds and sid not in pass_sigs and sid != curr_sig:
                             ds.append(sid)

@@ -595,6 +595,16 @@ class TrackSegment(BaseElement):
             for cand in cands:
                 if cand != prev_id:
                     return cand, compat_dir
+        # Fallback for curved tracks (e.g. turning 90 degrees from West to North):
+        # find any non-opposite neighbor that is not prev_id
+        opp = OPPOSITE_DIR.get(travel_dir)
+        for ndir, raw in self.neighbors.items():
+            if ndir == opp:
+                continue
+            cands = [raw] if isinstance(raw, str) else list(raw)
+            for cand in cands:
+                if cand and cand != prev_id:
+                    return cand, ndir
         return None, travel_dir
 
     @property
