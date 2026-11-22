@@ -238,14 +238,16 @@ Reference guide matching the fields shown in [`GrabberMainScreen.png`](images/Gr
 
 ### 1. Header Bar
 ```
-ApexBOSGrabber (v26.119.13) | SDR: PIPE | Rate: 960000 S/s [AUTO] | Gain: AGC | Bias: ON | PPM: 6 | Center: 220.4875 MHz
+ApexBOSGrabber (2.2.0) | Elapsed: 00:04:12 | SDR: PIPE | Rate: 960000 S/s [AUTO] | Gain: AGC | Bias: ON | PPM: 6 | Err: 8 | Center: 220.4875 MHz
 ```
-- **`v26.119.13`**: Active Grabber engine release version.
+- **`2.2.0`**: Active Grabber engine release version.
+- **`Elapsed: 00:04:12`**: Elapsed execution time since Grabber launched (`HH:MM:SS`).
 - **`SDR: PIPE`**: Active ingestion mode (`PIPE`, `TCP`, `RTLSDR`, or `STDIN`).
 - **`Rate: 960000 S/s [AUTO]`**: Hardware sampling rate. `[AUTO]` denotes that Grabber automatically expanded the sample rate from 192 kS/s to 960 kS/s to span all requested channels.
 - **`Gain: AGC`**: Tuner gain setting. Displays `AGC` when auto-gain is active, or fixed gain in dB (e.g. `42.0 dB`). When incoming bursts clip the ADC (`Peak RSSI >= 0.0 dBFS`), an alert tag `[CLIP: GAIN HIGH]` warns in bold red that the gain is set too high.
 - **`Bias: ON`**: Status of internal 4.5V LNA bias-tee power (`ON` or `OFF`).
 - **`PPM: 6`**: Master oscillator frequency correction offset applied to the tuner.
+- **`Err: 8`**: Active maximum unique word Hamming bit error tolerance (`-E`, modifiable on-the-fly via `e <err>`).
 - **`Center: 220.4875 MHz`**: Tuner RF local oscillator center frequency.
 
 ### 2. I/Q Flow & Global Metrics
@@ -253,7 +255,8 @@ ApexBOSGrabber (v26.119.13) | SDR: PIPE | Rate: 960000 S/s [AUTO] | Gain: AGC | 
 I/Q Flow: Reader 1,165,352,000 S (2222.73 MB, 7874 chunks) | Workers Demod: 3,611,200,000 S (24400 banks)
 Bursts: 938895  Pending Banks: 6  Peak RSSI: 1.5 dBFS  Packets: 15518  PPM: 693 (Raw: 13,753)  Dropped: 0
 Channels (8 active, 7 base*): 101*, 102*, 113*, 114*, 125*, 126*, 127*, 131
-Channel AFC Offsets (Δf) : 101: +56Hz, 102: +500Hz, 113: +500Hz, 114: -500Hz, 1...
+Channel AFC Offsets (Δf) : [DISABLED - Offsets 0Hz] (use 'afc on' to enable)
+Avg Packet Freq Offset (Δf) : +24.5 Hz [OPTIMAL: |Δf| < 100 Hz] | Auto-PPM: ON (7s check)
 ```
 - **`I/Q Flow: Reader`**: Samples received, total megabytes read, and chunk blocks dispatched by the ingestion reader process.
 - **`Workers Demod`**: Cumulative samples and sample banks processed across all worker child processes.
@@ -266,7 +269,9 @@ Channel AFC Offsets (Δf) : 101: +56Hz, 102: +500Hz, 113: +500Hz, 114: -500Hz, 1
 - **`Channels`**: List of monitored channels:
   - `*` (e.g. `101*`): Base station channel dynamically discovered and protected from idle timeouts.
   - `.` (e.g. `102.`): Locked channel pinned by user command or CLI configuration.
-- **`Channel AFC Offsets (Δf)`**: Real-time frequency correction applied to individual channels by the Automatic Frequency Control loop to compensate for transmitter crystal drift (capped at $\pm 500\text{ Hz}$).
+- **`Channel AFC Offsets (Δf)`**: Real-time frequency correction applied to individual channels by the Automatic Frequency Control loop to compensate for transmitter crystal drift (capped at $\pm 500\text{ Hz}$). Disabled by default; enable via `--afc` flag or `afc on` terminal command.
+- **`Avg Packet Freq Offset (Δf)`**: The rolling sliding-window average measured frequency error across all channels for decoded packets. Displays `[OPTIMAL: |Δf| < 100 Hz]`, `[HIGH: Δf > +100 Hz -> PPM -1]`, or `[LOW: Δf < -100 Hz -> PPM +1]`.
+- **`Auto-PPM`**: Real-time operational state of the automatic PPM tracker (`ON (7s check)` or `OFF`). Automatically evaluates every 7 seconds and nudges PPM $\pm 1$ until $|\Delta f| \le 100\text{ Hz}$.
 
 ### 3. Pipeline Detection & Decoding Integrity (60s Window)
 ```
@@ -284,7 +289,8 @@ Channel AFC Offsets (Δf) : 101: +56Hz, 102: +500Hz, 113: +500Hz, 114: -500Hz, 1
   - Yellow (`35 - 65%`): `MODERATE`
   - Orange (`66 - 98%`): `HIGH`
   - Red (`> 98%`): `CRITICAL`
-- **`Auto-Tune PID`**: Status of automated gain/PPM tuning algorithm and active proportional, integral, and derivative terms.
+  - Gray (`--`): `NO SYNC` — When 0 sync signatures are detected within the observation window (e.g. quiet band, disconnected antenna, or tuner off-frequency), the matrix displays `--` and `0/0 CRC/Sync (--.-% match)` rather than a deceptive `0.0% [OPTIMAL]`.
+- **`Auto-Tune PID`**: Status of automated gain/PPM tuning algorithm and active proportional, integral, and derivative terms. When 0 sync signatures are detected, the PID loop automatically stops (`[STOPPED: NO SYNC]`), resets P/I/D terms to 0.0, and holds tuner gain and PPM constant to prevent integral windup.
 - **`Packet Sync Signatures`**: Number of valid 64-bit unique word correlations detected in the 60s window and lifetime.
 - **`Viterbi Headers Decoded`**: Good vs corrupted packet headers passing Viterbi error correction.
 - **`RS Payloads Processed`**: Good vs uncorrectable payload blocks evaluated by Reed-Solomon $RS(16, 12)$.
@@ -352,6 +358,7 @@ python ApexBOSGrabber.py [OPTIONS]
 | `--gain <dB>` | Tuner gain in dB or tenths (or `0` for AGC) | `0` (AGC) |
 | `-b`, `--bias-tee <0\|1>`| Power inline antenna LNA via bias-tee | `1` (ON) |
 | `--ppm <int>` | Master tuner frequency correction in PPM | `0` |
+| `--auto-ppm` / `--no-auto-ppm` | Automatically adjust master PPM based on packet frequency offsets ($\Delta f$) | `True` |
 | `--auto-tune` | Enable automated PID tuning of gain and PPM | `False` |
 
 ### Channels & Demodulation
@@ -360,10 +367,10 @@ python ApexBOSGrabber.py [OPTIONS]
 | `--chans <list>` | Comma-separated channels (e.g. `101,102.,107`); suffix `.` or `l` locks channel | `channels.json` |
 | `--chans-file <path>` | Path to JSON channels file | `channels.json` |
 | `--channel-timeout <s>`| Inactivity seconds before dropping non-base channels | `300.0` (5 min) |
-| `--afc` / `--no-afc` | Enable/disable dynamic per-channel AFC frequency tracking | `True` |
+| `--afc` / `--no-afc` | Enable/disable dynamic per-channel AFC frequency tracking | `False` |
 | `--afc-limit <Hz>` | Maximum AFC offset allowed per channel | `500.0` Hz |
 | `--dedup-ttl <sec>` | Packet deduplication window in seconds | `1.0` s |
-| `-E`, `--max-errors <n>`| Maximum unique word Hamming bit errors | `8` |
+| `-E`, `--max-errors <n>`| Maximum unique word Hamming bit errors (modifiable at runtime via `e <err>`) | `8` |
 
 ### Networking & IPC
 | Flag | Description | Default |
@@ -384,14 +391,80 @@ While ApexBOSGrabber is running, you can adjust parameters in real time directly
 | `p <ppm>` | Set master frequency correction in PPM | `p 5` |
 | `g <gain>` | Set tuner gain (`0` or `auto` for AGC, or dB value) | `g 42.0` |
 | `b <0\|1>` | Toggle LNA antenna bias-tee power | `b 1` |
+| `e <err>` | Set maximum unique word Hamming bit errors (`-E`) at runtime | `e 8` |
+| `autopm <on\|off>` | Toggle or configure automatic PPM adjustment based on packet $\Delta f$ | `autopm on` |
 | `+ <chan>` | Add channel (suffix `.` or `l` to lock) | `+ 102.` |
 | `- <chan>` | Remove channel | `- 102` |
-| `chans` | List all active, locked, and base channels | `chans` |
+| `c`, `chans` | List all active, locked, and base channels, with the elapsed time since the last packet was received (e.g. `101 (locked.) (15s ago)`, `102 (base*) (2s ago)`) | `c` |
 | `tune <on\|off>`| Enable or disable automated PID tuner | `tune on` |
 | `afc <on\|off>` | Enable or disable per-channel AFC frequency correction | `afc off` |
 | `dedup <sec>` | Adjust deduplication window in seconds | `dedup 2.0` |
 | `t <sec>` | Set channel inactivity timeout | `t 600` |
 | `q` | Cleanly terminate all worker processes and exit | `q` |
+
+---
+
+## Channel Search & Calibration (`ApexBOSScanner.py`)
+
+ApexBOS includes a dedicated automated channel search and frequency calibration utility: **`ApexBOSScanner.py`**.
+
+It automatically discovers active Positive Train Control (PTC) and ACSES channels across the 220 MHz band, measures channel health metrics, optimizes master receiver crystal PPM offsets, and generates startup scripts to launch ApexBOSGrabber with optimized parameters.
+
+### Operational Workflow
+1. **Phase 1: Rapid Channel Probe (Channels 97 to 176)**
+   - Tunes the SDR sequentially across ITC channels 97 to 176 (220.0125 MHz to 221.9875 MHz).
+   - Offsets the local oscillator (LO) by 50 kHz below each target channel to isolate the signal from tuner zero-IF DC center spikes.
+   - Observes baseband I/Q for the specified dwell duration (default: `2.0` seconds; configurable with `--dwell <sec>`) to catch periodic beacons and status reports, probing for the 64-bit $\pi/4$-DQPSK PTC sync word signature (`PTC_SYNC_BIT_STRING`).
+2. **Phase 2: PPM Sweep & Optimization ($\pm 4$ PPM)**
+   - For every active channel detected in Phase 1, sweeps the master frequency correction from $\text{base\_ppm} - 4$ to $\text{base\_ppm} + 4$ in 9 discrete steps.
+   - Observes each candidate PPM for 5.0 seconds (or custom `--opt-dwell <sec>`), recording sync signature hits, CRC-good packets, average burst RSSI (dBFS), and signal-to-noise ratio (SNR).
+   - Identifies the per-channel optimal PPM that maximizes sync signatures and CRC integrity.
+3. **Phase 3: Consensus Master PPM Determination**
+   - Evaluates active channels to calculate the optimal consensus master tuner PPM covering all active transmitters.
+4. **Phase 4: Calibration & Performance Report**
+   - Generates an on-screen tabular report and saves `apexbos_channel_scan_report.txt` in the system temporary directory (`tempfile.gettempdir()`).
+5. **Phase 5: Automated Startup Script Generation**
+   - Creates ready-to-run startup scripts configured with the discovered active channels and consensus PPM, using absolute paths for both the Python interpreter and `ApexBOSGrabber.py`:
+     - Windows Batch: `%TEMP%\start_apexbos_grabber.bat`
+     - PowerShell: `$env:TEMP\start_apexbos_grabber.ps1`
+     - Plain text command line: `%TEMP%\start_apexbos_grabber_cmd.txt`
+
+### Interactive Controls During Scanning
+While `ApexBOSScanner.py` is actively running, you can interact with the scan in real time:
+
+| Key | Phase | Action |
+| :--- | :--- | :--- |
+| `n` or `Space` / `Enter` | Phase 1 (Probe) | Move immediately to the next channel without waiting for the dwell timer to finish |
+| `s` or `2` / `p` | Phase 1 (Probe) | Safely stop Phase 1 probe and proceed immediately to Phase 2 (PPM optimization) with discovered channels |
+| `q` or `Esc` | Phase 1 (Probe) | Cancel and abort scan |
+| `n` or `Space` / `Enter` | Phase 2 (PPM Sweep) | Skip to the next candidate PPM offset |
+| `q` or `s` / `Esc` | Phase 2 (PPM Sweep) | Safely stop Phase 2 and quit (finalizes report and writes ready-to-run Grabber startup scripts to `%TEMP%`) |
+
+### Terminal Display & Selective Scrolling
+- **Real-Time Live Countdown & Telemetry**: As each channel is being probed, an in-place status line dynamically reports:
+  ```text
+  [ 15.0%] Ch 101 (220.1125 MHz) [T- 2.8s] | Sync:  2 | CRC:  0 | RSSI: -14.5 dBFS | SNR: 30.5 dB
+  ```
+- **Selective Scrolling**: If no sync signatures are detected during a channel's dwell, the line is overwritten in-place without scrolling down. The screen scrolls down (`\n`) **only when a channel with sync signatures is detected**, keeping the terminal clean so only active, relevant channels remain on the screen.
+
+### Running the Scanner
+```bash
+# Scan default channel range 97 to 176 with 2.0s dwell per channel:
+python ApexBOSScanner.py
+
+# Increase dwell time to 3.0 or 5.0 seconds per channel to catch intermittent/slow transmitters:
+python ApexBOSScanner.py --dwell 3.5
+python ApexBOSScanner.py -d 5.0
+
+# Scan with custom dwell, base PPM, fixed gain, and bias-tee:
+python ApexBOSScanner.py --dwell 3.0 --ppm 6 --gain 33.8 --bias-tee
+
+# Scan custom channel range (e.g. channels 101 to 135) with 4.0s dwell:
+python ApexBOSScanner.py --start-ch 101 --end-ch 135 -d 4.0
+
+# Fast offline mock verification mode:
+python ApexBOSScanner.py --mock --start-ch 100 --end-ch 115
+```
 
 ---
 

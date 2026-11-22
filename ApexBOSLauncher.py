@@ -41,6 +41,7 @@ import time
 import shlex
 import signal
 import shutil
+import tempfile
 import threading
 import subprocess
 
@@ -171,29 +172,41 @@ def spawn_in_new_terminal(
 
     else:
         quoted_cmd = " ".join(shlex.quote(c) for c in cmd)
+        shell_bin = "bash" if shutil.which("bash") else "sh"
+        title_esc = f'printf "\\033]2;%s\\007" {shlex.quote(title)}; ' if title else ""
         if keep_open:
-            shell_bin = "bash" if shutil.which("bash") else "sh"
             inner = (
-                f"{quoted_cmd}; rc=$?; echo ''; "
+                f"{title_esc}{quoted_cmd}; rc=$?; echo ''; "
                 'echo "[Process exited with code $rc. Close this terminal when done.]"; '
                 f"exec {shell_bin}"
             )
             launch_cmd = [shell_bin, "-c", inner]
         else:
-            launch_cmd = cmd
+            inner = f"{title_esc}exec {quoted_cmd}"
+            launch_cmd = [shell_bin, "-c", inner]
 
         terminals = [
-            ("gnome-terminal", ["gnome-terminal", "--title", title, "--"]),
-            ("x-terminal-emulator", ["x-terminal-emulator", "-T", title, "-e"]),
-            ("konsole", ["konsole", "-p", f"tabtitle={title}", "-e"]),
-            ("xfce4-terminal", ["xfce4-terminal", "-T", title, "-x"]),
-            ("xterm", ["xterm", "-T", title, "-e"]),
+            ("gnome-terminal", ["gnome-terminal", "--"]),
+            ("x-terminal-emulator", ["x-terminal-emulator", "-e"]),
+            ("mate-terminal", ["mate-terminal", "--"]),
+            ("xfce4-terminal", ["xfce4-terminal", "-x"]),
+            ("konsole", ["konsole", "-e"]),
+            ("alacritty", ["alacritty", "-e"]),
+            ("kitty", ["kitty", "--"]),
+            ("tilix", ["tilix", "-e"]),
+            ("xterm", ["xterm", "-e"]),
         ]
         for term_bin, term_prefix in terminals:
             if shutil.which(term_bin):
-                return subprocess.Popen(term_prefix + launch_cmd, cwd=work_dir, env=child_env)
+                try:
+                    return subprocess.Popen(term_prefix + launch_cmd, cwd=work_dir, env=child_env)
+                except Exception:
+                    continue
         # Fallback to background process if no graphical terminal found
-        return subprocess.Popen(cmd, cwd=work_dir, env=child_env)
+        try:
+            return subprocess.Popen(cmd, cwd=work_dir, env=child_env)
+        except Exception:
+            return None
 
 
 SUBSYSTEM_SCRIPTS = {
@@ -205,6 +218,7 @@ SUBSYSTEM_SCRIPTS = {
     "creator": "ApexBOSCreator.py",
     "spy": "ApexBOSSpy.py",
     "packfig": "PackFIG.py",
+    "scanner": "ApexBOSScanner.py",
 }
 
 
@@ -237,6 +251,10 @@ class ProcessManager:
         self._scanner_thread.start()
         self.status_toast: str = f"ApexBOS Control Center ready (v{VERSION}){migrated_msg}."
         self.toast_time: float = time.time()
+        self._scanner_launched: bool = False
+        self._scanner_seen: bool = False
+        self._scanner_start_time: float = 0.0
+        self._scanner_results_applied: bool = False
 
     def _scan_loop(self):
         while not self._stop_scanner.is_set():
@@ -257,7 +275,7 @@ class ProcessManager:
                 continue
 
             # Check single subsystems
-            for skey in ("grabber", "flux", "banc", "creator", "spy", "packfig"):
+            for skey in ("grabber", "flux", "banc", "creator", "spy", "packfig", "scanner"):
                 script = SUBSYSTEM_SCRIPTS.get(skey)
                 if script and script.lower() in cmd_low and skey not in live:
                     live[skey] = int(p["pid"])
@@ -494,6 +512,125 @@ class ProcessManager:
             with self._lock:
                 self._starting_until["grabber"] = time.time() + 2.5
             self.set_toast(f"Started ApexBOSGrabber (SDR #{device_idx}, {num_procs} procs, {ch_count} chans).")
+
+    def start_scanner(self, dwell: float = 3.5, update_config: bool = False) -> Optional[subprocess.Popen]:
+        """
+        Launches ApexBOSScanner in its own terminal window.
+        Inherits gain, bias-tee, ppm, and device index from active Grabber config.
+        """
+        if self.is_running("scanner"):
+            self.set_toast("ApexBOSScanner is already running.")
+            return None
+
+        grabber_cfg = self.config.get("grabber", {})
+        ppm_val = grabber_cfg.get("ppm") if grabber_cfg.get("ppm") is not None else grabber_cfg.get("frequency_correction")
+        gain_val = grabber_cfg.get("gain")
+        bias_tee = bool(grabber_cfg.get("bias_tee", 1))
+        device_idx = int(grabber_cfg.get("device", 0) or 0)
+
+        args = ["--dwell", f"{float(dwell):.1f}"]
+        if ppm_val is not None and str(ppm_val).strip() != "":
+            args.extend(["--ppm", str(ppm_val).strip()])
+        if gain_val is not None and str(gain_val).strip() != "" and str(gain_val).strip().lower() != "auto":
+            args.extend(["--gain", str(gain_val).strip()])
+        if device_idx:
+            args.extend(["--device", str(device_idx)])
+        if bias_tee:
+            args.append("--bias-tee")
+        if update_config:
+            args.append("--update-config")
+
+        title = f"ApexBOS 220 MHz Scanner (Dwell {dwell}s | PPM {ppm_val or 0} | Bias-T {'ON' if bias_tee else 'OFF'})"
+        p = spawn_in_new_terminal(title, "ApexBOSScanner.py", args, cwd=self.work_dir)
+        if p:
+            self.procs["scanner"] = p
+            with self._lock:
+                self._starting_until["scanner"] = time.time() + 10.0
+            self._scanner_launched = True
+            self._scanner_seen = False
+            self._scanner_start_time = time.time()
+            self._scanner_results_applied = False
+            self.set_toast(f"Started 220 MHz Channel Scanner (dwell={dwell}s, base PPM={ppm_val or 0}).")
+            return p
+        return None
+
+    def get_latest_scan_results(self) -> Optional[Dict[str, Any]]:
+        """
+        Reads apexbos_scan_results.json from temp directory or work_dir.
+        Returns data dict if file exists and was modified since scanner was started.
+        """
+        try:
+            cand_paths = [
+                os.path.join(tempfile.gettempdir(), "apexbos_scan_results.json"),
+                os.path.join(self.work_dir, "apexbos_scan_results.json"),
+            ]
+            for p in cand_paths:
+                if os.path.exists(p):
+                    try:
+                        mtime = os.path.getmtime(p)
+                        min_time = (self._scanner_start_time - 5.0) if self._scanner_start_time > 0 else 0.0
+                        if mtime >= min_time:
+                            with open(p, "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                            if isinstance(data, dict) and "active_channels" in data:
+                                return data
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return None
+
+    def apply_scan_results(self, results_data: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Updates Grabber channels (--chans), procs (--procs), ports, and PPM in
+        config.json and grabber_config.json from scanner results.
+        """
+        active_chans = results_data.get("active_channels", [])
+        if not active_chans:
+            return False, "No active channels found in scan results."
+
+        rec_ppm = int(results_data.get("recommended_ppm", 0))
+        rec_gain = results_data.get("recommended_gain")
+
+        grabber_cfg = self.config.setdefault("grabber", {})
+        sorted_chans = sorted(set(int(c) for c in active_chans))
+        locked_chans_raw = results_data.get("locked_channels")
+        if locked_chans_raw is None:
+            locked_set = set(sorted_chans)
+        else:
+            locked_set = set(int(c) for c in locked_chans_raw) & set(sorted_chans)
+        chans_tokens = [f"{c}." if c in locked_set else str(c) for c in sorted_chans]
+        chans_str = ", ".join(chans_tokens)
+        grabber_cfg["channels"] = sorted_chans
+        grabber_cfg["chans"] = chans_str
+        grabber_cfg["locked_channels"] = sorted(locked_set)
+        grabber_cfg["ppm"] = rec_ppm
+        grabber_cfg["frequency_correction"] = rec_ppm
+        if rec_gain is not None:
+            grabber_cfg["gain"] = float(rec_gain)
+
+        # Calculate new worker processes & ports matching channel count
+        existing_procs = int(grabber_cfg.get("process_count", 2) or 2)
+        worker_count = min(existing_procs, max(1, len(sorted_chans)))
+        ports, _ = config_loader.calculate_grabber_procs(sorted_chans, worker_count)
+        grabber_cfg["ports"] = ports
+        procs_str = ",".join(str(p) for p in ports)
+        grabber_cfg["procs"] = procs_str
+        grabber_cfg["process_count"] = len(ports)
+
+        # Synchronize Flux relay sources if configured
+        flux_cfg = self.config.get("flux")
+        if isinstance(flux_cfg, dict):
+            flux_cfg["sources"] = [f"tcp://127.0.0.1:{p}" for p in ports]
+            flux_cfg["ports"] = list(ports)
+
+        config_loader.save_unified_config(self.config, self.config_path)
+        config_loader.sync_legacy_configs(self.config, self.work_dir)
+        self.reload_config()
+        self._scanner_results_applied = True
+        msg = f"Updated Grabber config: {len(sorted_chans)} chans ({chans_str}), {len(ports)} procs ({procs_str}), PPM {rec_ppm:+d}."
+        self.set_toast(msg)
+        return True, msg
 
     def start_grabber_proc(self, proc_idx: int = 0):
         """Backwards compatibility shim for starting Grabber."""
@@ -872,6 +1009,23 @@ class ProcessManager:
                 tcp = self.get_tcp_port(i)
                 return subprocess.list2cmdline([py_exe, "View_ApexBOS.220.py", "--config", "config.json", "--banc-config", "config.json", "--mcast-port", str(mcast), "--engine-port", str(tcp)])
 
+        if key_low in ("scanner", "scan"):
+            grabber_cfg = self.config.get("grabber", {})
+            ppm_val = grabber_cfg.get("ppm") if grabber_cfg.get("ppm") is not None else grabber_cfg.get("frequency_correction")
+            gain_val = grabber_cfg.get("gain")
+            bias_tee = bool(grabber_cfg.get("bias_tee", 1))
+            device_idx = int(grabber_cfg.get("device", 0) or 0)
+            args = [py_exe, "ApexBOSScanner.py", "--dwell", "3.5"]
+            if ppm_val is not None and str(ppm_val).strip() != "":
+                args.extend(["--ppm", str(ppm_val).strip()])
+            if gain_val is not None and str(gain_val).strip() != "" and str(gain_val).strip().lower() != "auto":
+                args.extend(["--gain", str(gain_val).strip()])
+            if device_idx:
+                args.extend(["--device", str(device_idx)])
+            if bias_tee:
+                args.append("--bias-tee")
+            return subprocess.list2cmdline(args)
+
         if key_low == "spy":
             grabber_cfg = self.config.get("grabber", {})
             ports = grabber_cfg.get("ports")
@@ -937,6 +1091,10 @@ class ApexBOSLauncherApp:
 
         self.mgr = ProcessManager(config_path)
         self.buttons: Dict[str, ButtonEntry] = {}
+        self.modal_buttons: Dict[str, ButtonEntry] = {}
+        self._modal_mode: Optional[str] = None  # None, "dwell_prompt", or "scan_complete"
+        self._dwell_input_text: str = "3.5"
+        self._scan_results_pending: Optional[Dict[str, Any]] = None
         self._running = True
 
     def run(self):
@@ -948,34 +1106,125 @@ class ApexBOSLauncherApp:
             for event in events:
                 if event.type == pygame.QUIT:
                     self._running = False
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1:
-                        self._handle_click(event.pos)
-                    elif event.button == 3:
-                        self._handle_right_click(event.pos)
+                elif self._modal_mode == "dwell_prompt":
+                    if event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_ESCAPE:
+                            self._modal_mode = None
+                        elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                            self._start_scanner_from_modal()
+                        elif event.key == pygame.K_BACKSPACE:
+                            self._dwell_input_text = self._dwell_input_text[:-1]
+                        elif event.unicode and event.unicode in "0123456789." and len(self._dwell_input_text) < 5:
+                            self._dwell_input_text += event.unicode
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        self._handle_modal_click(event.pos)
+                elif self._modal_mode == "scan_complete":
+                    if event.type == pygame.KEYDOWN:
+                        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                            self._apply_scanner_results_from_modal()
+                        elif event.key == pygame.K_ESCAPE:
+                            self._dismiss_scanner_results_modal()
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        self._handle_modal_click(event.pos)
+                else:
+                    if event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 1:
+                            self._handle_click(event.pos)
+                        elif event.button == 3:
+                            self._handle_right_click(event.pos)
+
+            # Check if background scanner has completed and reload config
+            if getattr(self.mgr, "_scanner_launched", False):
+                scanner_active = self.mgr.is_running("scanner")
+                if scanner_active:
+                    self.mgr._scanner_seen = True
+                elif getattr(self.mgr, "_scanner_seen", False) or (time.time() - getattr(self.mgr, "_scanner_start_time", 0.0) > 15.0):
+                    self.mgr._scanner_launched = False
+                    self.mgr._scanner_seen = False
+                    try:
+                        self.mgr.reload_config()
+                    except Exception:
+                        pass
+                    try:
+                        res = self.mgr.get_latest_scan_results()
+                    except Exception:
+                        res = None
+                    ch_count = len(res.get("active_channels", [])) if res else 0
+                    if ch_count > 0:
+                        self.mgr.set_toast(f"Scanner finished ({ch_count} active chans). Reloaded config.json.")
+                    else:
+                        self.mgr.set_toast("Scanner finished. Reloaded config.json.")
 
             self._draw()
             pygame.display.flip()
 
         pygame.quit()
 
+    def _open_scanner_prompt(self):
+        """Opens modal dialog prompting user for Phase 1 observation dwell time."""
+        self._dwell_input_text = "3.5"
+        self._modal_mode = "dwell_prompt"
+
+    def _start_scanner_from_modal(self):
+        """Starts the scanner using the entered dwell time."""
+        try:
+            d = float(self._dwell_input_text.strip() or "3.5")
+        except ValueError:
+            d = 3.5
+        self._modal_mode = None
+        self.mgr.start_scanner(dwell=d)
+
+    def _apply_scanner_results_from_modal(self):
+        """Applies discovered channels and consensus PPM to Grabber configuration."""
+        if self._scan_results_pending:
+            self.mgr.apply_scan_results(self._scan_results_pending)
+            self._scan_results_pending = None
+        self._modal_mode = None
+
+    def _dismiss_scanner_results_modal(self):
+        """Dismisses the scan completion dialog without updating configuration."""
+        self.mgr._scanner_results_applied = True
+        self._scan_results_pending = None
+        self._modal_mode = None
+
     def _handle_click(self, pos):
-        for btn_key, entry in list(self.buttons.items()):
-            rect = entry[0]
-            action_fn = entry[1]
-            if rect.collidepoint(pos):
-                if action_fn:
-                    action_fn()
-                break
+        try:
+            if self._modal_mode:
+                self._handle_modal_click(pos)
+                return
+            for btn_key, entry in list(self.buttons.items()):
+                rect = entry[0]
+                action_fn = entry[1]
+                if rect.collidepoint(pos):
+                    if action_fn:
+                        action_fn()
+                    break
+        except Exception as e:
+            self.mgr.set_toast(f"Action error: {e}")
+
+    def _handle_modal_click(self, pos):
+        try:
+            for btn_key, entry in list(self.modal_buttons.items()):
+                rect = entry[0]
+                action_fn = entry[1]
+                if rect.collidepoint(pos):
+                    if action_fn:
+                        action_fn()
+                    break
+        except Exception as e:
+            self.mgr.set_toast(f"Modal action error: {e}")
 
     def _handle_right_click(self, pos):
-        for btn_key, entry in list(self.buttons.items()):
-            rect = entry[0]
-            if rect.collidepoint(pos):
-                cmd_key = getattr(entry, "cmd_key", btn_key)
-                label = getattr(entry, "label", btn_key)
-                self.copy_command_to_clipboard(cmd_key, label)
-                break
+        try:
+            for btn_key, entry in list(self.buttons.items()):
+                rect = entry[0]
+                if rect.collidepoint(pos):
+                    cmd_key = getattr(entry, "cmd_key", btn_key)
+                    label = getattr(entry, "label", btn_key)
+                    self.copy_command_to_clipboard(cmd_key, label)
+                    break
+        except Exception as e:
+            self.mgr.set_toast(f"Clipboard action error: {e}")
 
     def copy_command_to_clipboard(self, cmd_key: str, label: str):
         cmd = self.mgr.get_command_line(cmd_key)
@@ -1019,10 +1268,6 @@ class ApexBOSLauncherApp:
         pygame.draw.rect(self.screen, (22, 28, 40), (0, 61, self.width, 24))
         lbl_info = self.font_sm.render(st_bar, True, COLOR_TEXT_DIM)
         self.screen.blit(lbl_info, (25, 65))
-
-        hint_txt = "[Tip: Right-click any button or click [CMD] to copy manual CLI command]"
-        lbl_hint = self.font_tiny.render(hint_txt, True, (110, 175, 235))
-        self.screen.blit(lbl_hint, (self.width - lbl_hint.get_width() - 25, 66))
 
         # Top Macro Workflows Section
         y = 96
@@ -1129,6 +1374,14 @@ class ApexBOSLauncherApp:
                 lbl_btn = self.font_sm.render("START", True, (10, 10, 10))
                 self.screen.blit(lbl_btn, lbl_btn.get_rect(center=btn_act.center))
                 self.buttons[f"{skey}_action"] = ButtonEntry(btn_act, start_fn, cmd_key=skey, label=sname)
+
+            if skey == "grabber":
+                btn_scan = pygame.Rect(row_r.right - 264 if running else row_r.right - 196, row_r.y + 3, 58, 26)
+                pygame.draw.rect(self.screen, COLOR_BTN_BG, btn_scan, border_radius=3)
+                pygame.draw.rect(self.screen, COLOR_ACCENT, btn_scan, 1, border_radius=3)
+                lbl_scan = self.font_tiny.render("SCAN", True, COLOR_ACCENT)
+                self.screen.blit(lbl_scan, lbl_scan.get_rect(center=btn_scan.center))
+                self.buttons["grabber_scan"] = ButtonEntry(btn_scan, self._open_scanner_prompt, cmd_key="scanner", label="Scan 220 MHz Channels")
 
             y += 36
 
@@ -1268,21 +1521,24 @@ class ApexBOSLauncherApp:
         y += 22
 
         ut_btns = [
-            ("spy", "ApexBOSSpy Packet Inspector", self.mgr.start_spy),
+            ("scanner", "Scan 220 MHz Channels", self._open_scanner_prompt),
+            ("spy", "ApexBOSSpy Inspector", self.mgr.start_spy),
             ("packfig", "PackFIG Binary Decoder", self.mgr.start_packfig),
             ("wizard", "Re-Run Setup Wizard", self._run_wizard_external),
             ("reload", "Reload config.json", self.mgr.reload_config),
         ]
         ux = 25
-        ubtn_w = (self.width - 50 - 3 * 12) // 4
+        ubtn_w = (self.width - 50 - 4 * 10) // 5
         for ukey, utext, ufn in ut_btns:
             urect = pygame.Rect(ux, y, ubtn_w, 32)
             pygame.draw.rect(self.screen, COLOR_BTN_BG, urect, border_radius=4)
             pygame.draw.rect(self.screen, COLOR_BORDER, urect, 1, border_radius=4)
             ulbl = self.font_sm.render(utext, True, COLOR_TEXT)
+            if ulbl.get_width() > urect.width - 6:
+                ulbl = self.font_tiny.render(utext, True, COLOR_TEXT)
             self.screen.blit(ulbl, ulbl.get_rect(center=urect.center))
             self.buttons[ukey] = ButtonEntry(urect, ufn, cmd_key=ukey, label=utext)
-            ux += ubtn_w + 12
+            ux += ubtn_w + 10
 
         y += 38
         maint_btns = [
@@ -1299,13 +1555,179 @@ class ApexBOSLauncherApp:
             mlbl = self.font_sm.render(mtext, True, COLOR_TEXT)
             self.screen.blit(mlbl, mlbl.get_rect(center=mrect.center))
             self.buttons[mkey] = ButtonEntry(mrect, mfn, cmd_key=mkey, label=mtext)
-            mx += ubtn_w + 12
+            mx += ubtn_w + 10
 
-        # Bottom Toast / Notification Bar
+        # Bottom Hint & Toast / Notification Bar
+        hint_txt = "[Tip: Right-click any button or click [CMD] to copy manual CLI command]"
+        lbl_hint = self.font_tiny.render(hint_txt, True, (110, 175, 235))
+        self.screen.blit(lbl_hint, (25, self.height - 54))
+
         pygame.draw.rect(self.screen, (10, 14, 20), (0, self.height - 35, self.width, 35))
         pygame.draw.line(self.screen, COLOR_BORDER, (0, self.height - 35), (self.width, self.height - 35), 1)
         toast_lbl = self.font_sm.render(self.mgr.status_toast, True, COLOR_ACCENT)
         self.screen.blit(toast_lbl, (20, self.height - 25))
+
+        # Modals (Dwell prompt & Scan completion)
+        self.modal_buttons.clear()
+        if self._modal_mode == "dwell_prompt":
+            self._draw_dwell_modal()
+        elif self._modal_mode == "scan_complete":
+            self._draw_scan_complete_modal()
+
+    def _draw_dwell_modal(self):
+        import pygame
+        # Dark dimming overlay
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        overlay.fill((10, 14, 22, 215))
+        self.screen.blit(overlay, (0, 0))
+
+        # Centered card
+        cw, ch = 640, 320
+        cx = (self.width - cw) // 2
+        cy = (self.height - ch) // 2
+        card_r = pygame.Rect(cx, cy, cw, ch)
+        pygame.draw.rect(self.screen, COLOR_CARD, card_r, border_radius=8)
+        pygame.draw.rect(self.screen, COLOR_ACCENT, card_r, 2, border_radius=8)
+
+        # Title
+        title_lbl = self.font_title.render("ApexBOS 220 MHz Channel Scanner", True, COLOR_ACCENT)
+        self.screen.blit(title_lbl, (cx + 25, cy + 20))
+
+        # Sub-header: Inherited Grabber configuration
+        grabber_cfg = self.mgr.config.get("grabber", {})
+        g_val = grabber_cfg.get("gain")
+        g_txt = f"{g_val} dB" if (g_val is not None and str(g_val).strip() and str(g_val).lower() != "auto") else "AGC (Auto)"
+        bt_txt = "ON (4.5V)" if grabber_cfg.get("bias_tee", 1) else "OFF"
+        ppm_val = grabber_cfg.get("ppm") if grabber_cfg.get("ppm") is not None else grabber_cfg.get("frequency_correction", 0)
+        dev_val = grabber_cfg.get("device", 0)
+        sub_txt = f"Using Grabber Config: Gain: {g_txt} | Bias-T: {bt_txt} | PPM: {ppm_val or 0:+d} | SDR: #{dev_val}"
+        sub_lbl = self.font_sm.render(sub_txt, True, COLOR_TEXT_DIM)
+        self.screen.blit(sub_lbl, (cx + 25, cy + 54))
+
+        pygame.draw.line(self.screen, COLOR_BORDER, (cx + 20, cy + 80), (cx + cw - 20, cy + 80), 1)
+
+        # Prompt text
+        prompt_txt = "Observation Dwell Duration per Channel (Phase 1):"
+        p_lbl = self.font_h2.render(prompt_txt, True, COLOR_TEXT)
+        self.screen.blit(p_lbl, (cx + 25, cy + 96))
+
+        # Input box with text & cursor
+        in_r = pygame.Rect(cx + (cw - 160) // 2, cy + 130, 160, 38)
+        pygame.draw.rect(self.screen, (10, 14, 20), in_r, border_radius=4)
+        pygame.draw.rect(self.screen, (80, 170, 255), in_r, 2, border_radius=4)
+        disp_txt = f"{self._dwell_input_text}s"
+        in_lbl = self.font_title.render(disp_txt, True, COLOR_TEXT)
+        self.screen.blit(in_lbl, in_lbl.get_rect(center=in_r.center))
+
+        # Preset buttons: [2.0s Quick] [3.5s Default] [5.0s Deep] [10.0s Long] [20.0s Max]
+        presets = [
+            ("2.0s Quick", "2.0"),
+            ("3.5s Default", "3.5"),
+            ("5.0s Deep", "5.0"),
+            ("10.0s Long", "10.0"),
+            ("20.0s Max", "20.0"),
+        ]
+        pre_w = 110
+        gap = 10
+        pre_start_x = cx + (cw - (len(presets) * pre_w + (len(presets) - 1) * gap)) // 2
+        for idx, (plabel, pval) in enumerate(presets):
+            pr = pygame.Rect(pre_start_x + idx * (pre_w + gap), cy + 184, pre_w, 28)
+            is_active = (self._dwell_input_text == pval)
+            pygame.draw.rect(self.screen, (25, 50, 75) if is_active else COLOR_BTN_BG, pr, border_radius=4)
+            pygame.draw.rect(self.screen, (80, 170, 255) if is_active else COLOR_BORDER, pr, 1, border_radius=4)
+            pl = self.font_sm.render(plabel, True, COLOR_TEXT if is_active else COLOR_TEXT_DIM)
+            self.screen.blit(pl, pl.get_rect(center=pr.center))
+            def _set_dwell(v=pval):
+                self._dwell_input_text = v
+            self.modal_buttons[f"preset_{pval}"] = ButtonEntry(pr, _set_dwell)
+
+        # Bottom buttons: [Start Scanner] [Cancel]
+        act_y = cy + ch - 54
+        btn_start = pygame.Rect(cx + cw - 260, act_y, 140, 34)
+        pygame.draw.rect(self.screen, COLOR_GREEN, btn_start, border_radius=4)
+        lbl_s = self.font_h2.render("START SCANNER", True, (10, 10, 10))
+        self.screen.blit(lbl_s, lbl_s.get_rect(center=btn_start.center))
+        self.modal_buttons["start_scan"] = ButtonEntry(btn_start, self._start_scanner_from_modal)
+
+        btn_cancel = pygame.Rect(cx + cw - 105, act_y, 85, 34)
+        pygame.draw.rect(self.screen, COLOR_BTN_BG, btn_cancel, border_radius=4)
+        pygame.draw.rect(self.screen, COLOR_BORDER, btn_cancel, 1, border_radius=4)
+        lbl_c = self.font_sm.render("Cancel", True, COLOR_TEXT)
+        self.screen.blit(lbl_c, lbl_c.get_rect(center=btn_cancel.center))
+        self.modal_buttons["cancel_scan"] = ButtonEntry(btn_cancel, lambda: setattr(self, "_modal_mode", None))
+
+        hint_lbl = self.font_tiny.render("[Enter: Start | Esc: Cancel | Type numbers or select preset]", True, COLOR_TEXT_DIM)
+        self.screen.blit(hint_lbl, (cx + 25, act_y + 10))
+
+    def _draw_scan_complete_modal(self):
+        import pygame
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        overlay.fill((10, 14, 22, 220))
+        self.screen.blit(overlay, (0, 0))
+
+        cw, ch = 660, 360
+        cx = (self.width - cw) // 2
+        cy = (self.height - ch) // 2
+        card_r = pygame.Rect(cx, cy, cw, ch)
+        pygame.draw.rect(self.screen, COLOR_CARD, card_r, border_radius=8)
+        pygame.draw.rect(self.screen, COLOR_GREEN, card_r, 2, border_radius=8)
+
+        # Title
+        title_lbl = self.font_title.render("Channel Scan Complete!", True, COLOR_GREEN)
+        self.screen.blit(title_lbl, (cx + 25, cy + 20))
+
+        sub_lbl = self.font_sm.render("Scanner discovered active 220 MHz telemetry channels & calibrated tuner PPM.", True, COLOR_TEXT_DIM)
+        self.screen.blit(sub_lbl, (cx + 25, cy + 50))
+        pygame.draw.line(self.screen, COLOR_BORDER, (cx + 20, cy + 74), (cx + cw - 20, cy + 74), 1)
+
+        res = self._scan_results_pending or {}
+        chans = res.get("active_channels", [])
+        ppm = int(res.get("recommended_ppm", 0))
+        gain = float(res.get("recommended_gain", 20.7))
+        chans_str = ", ".join(str(c) for c in sorted(chans))
+
+        # Calculate worker processes & ports
+        existing_procs = int((self.mgr.config.get("grabber") or {}).get("process_count", 2) or 2)
+        worker_count = min(existing_procs, max(1, len(chans)))
+        ports, _ = config_loader.calculate_grabber_procs(chans, worker_count)
+        procs_str = ",".join(str(p) for p in ports)
+
+        lines = [
+            (f"Active Channels ({len(chans)}):", f"[{chans_str}]", COLOR_ACCENT),
+            ("Consensus Tuner PPM:", f"{ppm:+d} PPM", COLOR_GREEN),
+            ("Recommended RF Gain:", f"{gain:.1f} dB (Headroom >= 12 dB)", COLOR_TEXT),
+            ("Calculated Workers:", f"{len(ports)} processes (ZMQ Ports: {procs_str})", (80, 190, 255)),
+        ]
+        ly = cy + 90
+        for label, val, val_col in lines:
+            lbl_l = self.font_body.render(f"{label:<25}", True, COLOR_TEXT_DIM)
+            lbl_v = self.font_body.render(val, True, val_col)
+            self.screen.blit(lbl_l, (cx + 30, ly))
+            self.screen.blit(lbl_v, (cx + 240, ly))
+            ly += 26
+
+        pygame.draw.line(self.screen, COLOR_BORDER, (cx + 20, ly + 6), (cx + cw - 20, ly + 6), 1)
+
+        prompt_txt = "Update Grabber configuration (--chans & --procs) in config.json?"
+        p_lbl = self.font_h2.render(prompt_txt, True, COLOR_TEXT)
+        self.screen.blit(p_lbl, (cx + 30, ly + 18))
+
+        act_y = cy + ch - 54
+        btn_update = pygame.Rect(cx + cw - 380, act_y, 240, 34)
+        pygame.draw.rect(self.screen, COLOR_GREEN, btn_update, border_radius=4)
+        lbl_u = self.font_h2.render("UPDATE GRABBER CONFIG", True, (10, 10, 10))
+        self.screen.blit(lbl_u, lbl_u.get_rect(center=btn_update.center))
+        self.modal_buttons["update_config"] = ButtonEntry(btn_update, self._apply_scanner_results_from_modal)
+
+        btn_dismiss = pygame.Rect(cx + cw - 125, act_y, 105, 34)
+        pygame.draw.rect(self.screen, COLOR_BTN_BG, btn_dismiss, border_radius=4)
+        pygame.draw.rect(self.screen, COLOR_BORDER, btn_dismiss, 1, border_radius=4)
+        lbl_d = self.font_sm.render("Dismiss", True, COLOR_TEXT)
+        self.screen.blit(lbl_d, lbl_d.get_rect(center=btn_dismiss.center))
+        self.modal_buttons["dismiss_scan"] = ButtonEntry(btn_dismiss, self._dismiss_scanner_results_modal)
+
+        hint_lbl = self.font_tiny.render("[Press Enter to Update | Esc to Dismiss]", True, COLOR_TEXT_DIM)
+        self.screen.blit(hint_lbl, (cx + 30, act_y + 10))
 
     def _run_wizard_external(self):
         """Invokes setup_wizard.py in an external window."""
@@ -1341,6 +1763,22 @@ class ApexBOSLauncherApp:
 
 
 def main():
+    if "--scan" in sys.argv or "-d" in sys.argv or "--dwell" in sys.argv:
+        dwell = 3.5
+        for flag in ("--scan", "-d", "--dwell"):
+            if flag in sys.argv:
+                idx = sys.argv.index(flag) + 1
+                if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                    try:
+                        dwell = float(sys.argv[idx])
+                        break
+                    except ValueError:
+                        pass
+        app = ApexBOSLauncherApp()
+        app.mgr.start_scanner(dwell=dwell)
+        app.run()
+        return
+
     if "--mode" in sys.argv:
         # Direct CLI macro execution (e.g. from desktop shortcuts: --mode local or --mode remote)
         mgr = ProcessManager()

@@ -167,10 +167,12 @@ BG_FAIL_AMBER = "\033[48;5;214m"        # Amber for failure rate 15.1% - 45.0%
 BG_FAIL_ORANGE = "\033[48;5;208m"       # Orange for failure rate 45.1% - 66.0%
 BG_FAIL_DARK_ORANGE = "\033[48;5;166m"   # Dark orange for failure rate 66.1% - 98.0%
 BG_FAIL_RED = "\033[48;5;196m"           # Red for high failure rate > 98.1%
+BG_FAIL_GRAY = "\033[48;5;238m"          # Dark neutral gray when no sync signatures are detected
 
 # Text contrast styles
-FG_CONTRAST_BLACK = "\033[30m\033[1m"   # High contrast dark text on bright amber
-FG_CONTRAST_WHITE = "\033[97m\033[1m"   # High contrast white text on colored backgrounds
+FG_CONTRAST_BLACK = "\033[30m\033[1m"       # High contrast dark text on bright amber
+FG_CONTRAST_DARK_GREEN = "\033[32m\033[1m"  # Dark green text for moderate failure rate band
+FG_CONTRAST_WHITE = "\033[97m\033[1m"       # High contrast white text on colored backgrounds
 
 class FailureRateStyle(tuple):
     """Encapsulates background color, status label, status color, and high-contrast foreground text style."""
@@ -199,6 +201,7 @@ LARGE_BLOCK_FONT_UNICODE = {
     "8": ["█▀█", "█▀█", "▀▀▀"],
     "9": ["█▀█", " ▀█", "▀▀▀"],
     ".": [" ", " ", "█"],
+    "-": ["   ", "▀▀▀", "   "],
     "%": ["▀ █", " █ ", "█ ▀"],
     " ": ["   ", "   ", "   "],
 }
@@ -215,6 +218,7 @@ LARGE_BLOCK_FONT_ASCII = {
     "8": ["[#]", "[#]", "[#]"],
     "9": ["[#]", "##]", "  #"],
     ".": [" ", " ", "."],
+    "-": ["   ", "---", "   "],
     "%": ["o/ ", " / ", "/o "],
     " ": ["   ", "   ", "   "],
 }
@@ -230,19 +234,22 @@ def get_large_block_font():
         return LARGE_BLOCK_FONT_ASCII
 
 
-def get_failure_rate_bg_and_tag(rate: float):
+def get_failure_rate_bg_and_tag(rate):
     """
     Returns FailureRateStyle (bg_ansi, label_str, status_color, fg_contrast) depending on failure rate:
+    - rate is None: Dark neutral gray background, bold white text (-- [NO SYNC])
     - rate < 15.0%: Green background, bold white text (<15%)
-    - 15.0% < rate <= 45.0%: Amber background, high-contrast dark text (15.1% - 45%)
+    - 15.0% < rate <= 45.0%: Amber background, dark green text (15.1% - 45%)
     - 45.0% < rate <= 66.0%: Orange background, bold white text (45.1% - 66%)
     - 66.0% < rate <= 98.0%: Dark orange background, bold white text (66.1% - 98%)
     - rate > 98.0%: Red background, bold white text (>98.1%)
     """
-    if rate <= 15.0:
+    if rate is None:
+        return FailureRateStyle(BG_FAIL_GRAY, "NO SYNC", COLOR_DIM, FG_CONTRAST_WHITE)
+    elif rate <= 15.0:
         return FailureRateStyle(BG_FAIL_GREEN, "OPTIMAL (<15%)", COLOR_GREEN, FG_CONTRAST_WHITE)
     elif rate <= 45.0:
-        return FailureRateStyle(BG_FAIL_AMBER, "MODERATE (15-45%)", COLOR_YELLOW, FG_CONTRAST_BLACK)
+        return FailureRateStyle(BG_FAIL_AMBER, "MODERATE (15-45%)", "\033[32m", FG_CONTRAST_DARK_GREEN)
     elif rate <= 66.0:
         return FailureRateStyle(BG_FAIL_ORANGE, "ELEVATED (45-66%)", COLOR_YELLOW, FG_CONTRAST_WHITE)
     elif rate <= 98.0:
@@ -1895,7 +1902,7 @@ def native_demod_worker(
     metrics_queue: multiprocessing.Queue,
     shutdown_flag: multiprocessing.Event,
     no_rssi: bool = False,
-    afc_enabled: bool = True,
+    afc_enabled: bool = False,
     afc_limit_hz: float = 500.0,
     dedup_ttl_sec: float = 1.0,
 ):
@@ -2011,6 +2018,9 @@ def native_demod_worker(
                     elif req.get("cmd") == "set_dedup":
                         if "ttl_sec" in req:
                             dedup_ttl_sec = max(0.0, float(req["ttl_sec"]))
+                    elif req.get("cmd") == "set_max_errors":
+                        if "max_errors" in req:
+                            max_sync_errors = max(0, int(req["max_errors"]))
                     elif req.get("cmd") == "reset_peak_rssi":
                         peak_burst_rssi = -100.0
                         interval_peak_burst_rssi = -100.0
@@ -2769,11 +2779,12 @@ class LazyPidAutoTuner:
         self.last_adjusted_param = None
         self.last_action_desc = "Offsets reset to base"
 
-    def compute_short_window_demod_fail_rate(self, rolling_deltas, current_time: float) -> Tuple[float, int, int]:
+    def compute_short_window_demod_fail_rate(self, rolling_deltas, current_time: float) -> Tuple[Optional[float], int, int]:
         """
         Calculates total demod failure rate as percentage of CRC matched packets to total Packet Sync Signatures seen
         over the short sliding window (SHORT_SLIDING_WINDOW_SECONDS).
         Returns (failure_rate_fraction, total_sync_seen, total_crc_matched).
+        Returns (None, 0, 0) when 0 sync signatures are seen to prevent false 0.0% failure rate indication.
         """
         short_window = max(self.eval_interval, SHORT_SLIDING_WINDOW_SECONDS)
         settling_window = min(self.settling_time, self.eval_interval * 0.2)
@@ -2786,13 +2797,13 @@ class LazyPidAutoTuner:
             recent_records = list(rolling_deltas)
 
         if not recent_records:
-            return 0.0, 0, 0
+            return None, 0, 0
 
         sync_seen = sum(d[1] for d in recent_records)
         crc_matched = sum(d[6] for d in recent_records)
 
         if sync_seen == 0:
-            return 0.0, 0, 0
+            return None, 0, 0
 
         fail_count = max(0, sync_seen - crc_matched)
         fail_rate = fail_count / sync_seen
@@ -2817,6 +2828,14 @@ class LazyPidAutoTuner:
             return None
 
         err_rate, sync_seen, crc_matched = self.compute_short_window_demod_fail_rate(rolling_deltas, current_time)
+        if sync_seen == 0 or err_rate is None:
+            self.last_p = 0.0
+            self.last_i = 0.0
+            self.last_d = 0.0
+            self.prev_error_rate = None
+            self.last_action_desc = "PID stopped (0 sync signatures detected)"
+            return None
+
         if sync_seen < self.min_samples:
             return None
 
@@ -3069,13 +3088,26 @@ class ApexBOSGrabberApplication:
         }
         self.recent_events = collections.deque(maxlen=15)
         self.channel_freq_offsets: Dict[int, float] = {}
-        raw_afc = getattr(cli_args, "channel_afc", True)
+        # Frequency correction (Channel AFC) is disabled by default
+        raw_afc = getattr(cli_args, "channel_afc", False)
         if isinstance(raw_afc, str):
             self.afc_enabled = raw_afc.strip().lower() in ("1", "on", "true", "yes", "enable", "start")
         else:
             self.afc_enabled = bool(raw_afc)
         self.afc_limit_hz = abs(float(getattr(cli_args, "afc_limit", 500.0)))
         self.dedup_ttl = float(getattr(cli_args, "dedup_ttl", 1.0))
+
+        # Automatic PPM adjustment based on sliding window average frequency offset (Δf)
+        # Enabled by default: evaluates every 7s, adjusting PPM ±1 until |avg Δf| < 100 Hz
+        raw_auto_ppm = getattr(cli_args, "auto_ppm", True)
+        if isinstance(raw_auto_ppm, str):
+            self.auto_ppm_enabled = raw_auto_ppm.strip().lower() in ("1", "on", "true", "yes", "enable", "start")
+        else:
+            self.auto_ppm_enabled = bool(raw_auto_ppm)
+        self.auto_ppm_interval = 7.0
+        self.last_auto_ppm_time = self.start_time
+        self.packet_df_history = collections.deque(maxlen=2000)
+
         self.status_banner = f"Initialized ({self.stream_kind.upper()})"
         self.cmd_thread: Optional[TerminalCommandListener] = None
 
@@ -3093,6 +3125,64 @@ class ApexBOSGrabberApplication:
             max_offset_ppm=4,
             max_offset_gain_tenths=20,
         )
+
+    def get_sliding_window_average_df(self, current_time: float, window_sec: float = 60.0) -> Optional[float]:
+        """
+        Computes the average measured frequency offset (Δf) across all channels
+        for all packets received within the sliding window (default: 60s).
+        Returns None if no packets are in the sliding window.
+        """
+        if not hasattr(self, "packet_df_history"):
+            self.packet_df_history = collections.deque(maxlen=2000)
+            return None
+
+        cutoff = current_time - window_sec
+        while self.packet_df_history and self.packet_df_history[0][0] < cutoff:
+            self.packet_df_history.popleft()
+
+        if not self.packet_df_history:
+            return None
+
+        return float(np.mean([df for _, df in self.packet_df_history]))
+
+    def step_auto_ppm(self, current_time: float) -> Optional[int]:
+        """
+        Automatic PPM adjustment based on the sliding window average measured
+        frequency offsets for all channels for received packets (Δf).
+        Evaluates every 7 seconds:
+          - If avg Δf > +100 Hz : reduce PPM by 1
+          - If avg Δf < -100 Hz : increase PPM by 1
+          - If |avg Δf| <= 100 Hz : keep current PPM (within target deadband)
+        """
+        if not getattr(self, "auto_ppm_enabled", True):
+            return None
+
+        if current_time - self.last_auto_ppm_time < self.auto_ppm_interval:
+            return None
+
+        self.last_auto_ppm_time = current_time
+        avg_df = self.get_sliding_window_average_df(current_time)
+        if avg_df is None:
+            return None
+
+        adj = 0
+        if avg_df > 100.0:
+            adj = -1
+        elif avg_df < -100.0:
+            adj = +1
+
+        if adj != 0:
+            old_ppm = self.ppm
+            self.ppm += adj
+            self.base_ppm = self.ppm
+            if hasattr(self, "auto_tuner") and self.auto_tuner:
+                self.auto_tuner.set_base_ppm(self.ppm)
+            self.reader_ctrl_queue.put({"cmd": "set_ppm", "ppm": self.ppm})
+            self.packet_df_history.clear()
+            action = "Reduced" if adj < 0 else "Increased"
+            self.status_banner = f"Auto-PPM: avg Δf={avg_df:+.1f} Hz -> {action} PPM by 1 from {old_ppm:+d} to {self.ppm:+d}"
+            return adj
+        return 0
 
     def step_auto_tuner(self, current_time: float):
         if not hasattr(self, "auto_tuner") or not self.auto_tuner or not self.auto_tuner.enabled:
@@ -3134,6 +3224,8 @@ class ApexBOSGrabberApplication:
         if hasattr(self, "worker_raw_deltas"):
             for q in self.worker_raw_deltas:
                 q.clear()
+        if hasattr(self, "packet_df_history"):
+            self.packet_df_history.clear()
         self.reset_peak_rssi()
 
     def handle_terminal_input(self, command_line: str):
@@ -3164,6 +3256,9 @@ class ApexBOSGrabberApplication:
         elif (cmd.startswith("b") and len(cmd) > 1 and cmd[1:].lower() in ("0", "1", "on", "off", "true", "false")):
             tokens = ["b", cmd[1:]] + tokens[1:]
             cmd = "b"
+        elif (cmd.startswith("e") and len(cmd) > 1 and cmd[1:].isdigit()):
+            tokens = ["e", cmd[1:]] + tokens[1:]
+            cmd = "e"
         elif cmd.startswith("dedup") and len(cmd) > 5 and cmd[5:].replace(".", "").isdigit():
             tokens = ["dedup", cmd[5:]] + tokens[1:]
             cmd = "dedup"
@@ -3311,14 +3406,15 @@ class ApexBOSGrabberApplication:
             now = time.time()
             ch_info = []
             for c in self.channels:
-                age = int(now - self.channel_last_seen.get(c, self.start_time))
+                last_t = self.channel_last_activity.get(c) or self.channel_last_seen.get(c, self.start_time)
+                age = max(0, int(now - last_t))
                 flags = []
                 if c in getattr(self, "locked_channels", set()):
                     flags.append("locked.")
                 if c in self.base_channels:
                     flags.append("base*")
-                flag_str = f" ({', '.join(flags)})" if flags else f" ({age}s ago)"
-                ch_info.append(f"{c}{flag_str}")
+                flag_str = f" ({', '.join(flags)})" if flags else ""
+                ch_info.append(f"{c}{flag_str} ({age}s ago)")
             self.status_banner = f"Channels ({len(self.channels)}): {', '.join(ch_info)}"
 
         elif cmd in ("tune", "pid", "autotune", "auto-tune"):
@@ -3462,11 +3558,53 @@ class ApexBOSGrabberApplication:
             else:
                 self.status_banner = f"Dedup Window: {self.dedup_ttl:.2f}s (use 'dedup <sec>' to change)"
 
+        elif cmd in ("e", "-e", "err", "errors", "max-errors", "max_errors"):
+            if len(tokens) > 1:
+                try:
+                    new_err = max(0, int(tokens[1]))
+                    self.max_errors = new_err
+                    for q in self.worker_ctrl_queues:
+                        q.put({"cmd": "set_max_errors", "max_errors": new_err})
+                    self.status_banner = f"Maximum unique word bit errors (-E) set to {new_err}"
+                except ValueError:
+                    self.status_banner = f"Invalid error threshold: '{tokens[1]}'"
+            else:
+                self.status_banner = f"Current max unique word bit errors (-E): {self.max_errors} (use 'e <0-16>' to change)"
+
+        elif cmd in ("autopm", "auto-ppm", "appm", "ppm-afc"):
+            if len(tokens) > 1:
+                sub = tokens[1].lower()
+                if sub in ("1", "on", "true", "yes", "enable", "start"):
+                    self.auto_ppm_enabled = True
+                    self.last_auto_ppm_time = time.time()
+                    self.status_banner = "Auto-PPM enabled (target: |Δf| < 100 Hz, 7s interval)"
+                elif sub in ("0", "off", "false", "no", "disable", "stop"):
+                    self.auto_ppm_enabled = False
+                    self.status_banner = "Auto-PPM disabled"
+                elif sub in ("status", "info"):
+                    st = "ON" if self.auto_ppm_enabled else "OFF"
+                    avg_df = self.get_sliding_window_average_df(time.time())
+                    avg_str = f"avg Δf: {avg_df:+.1f} Hz" if avg_df is not None else "waiting for packets"
+                    self.status_banner = f"Auto-PPM: {st} ({avg_str}, 7s interval, ±100 Hz threshold)"
+                else:
+                    self.status_banner = f"Invalid option '{tokens[1]}'. Use 'autopm on' or 'autopm off'"
+            else:
+                if self.auto_ppm_enabled:
+                    self.auto_ppm_enabled = False
+                    self.status_banner = "Auto-PPM disabled"
+                else:
+                    self.auto_ppm_enabled = True
+                    self.last_auto_ppm_time = time.time()
+                    self.status_banner = "Auto-PPM enabled (target: |Δf| < 100 Hz, 7s interval)"
+
+        elif cmd in ("scan", "search"):
+            self.status_banner = "Channel search: run 'python ApexBOSScanner.py' or 'python ApexBOSGrabber.py --scan'"
+
         elif cmd in ("q", "quit", "exit"):
             self.shutdown_flag.set()
 
         elif cmd in ("?", "h", "help"):
-            self.status_banner = "Commands: p <ppm> | g <gain|auto> | b <0|1> | tune <on|off> | afc <on|off> | dedup <sec> | + <ch> | - <ch> | chans | q"
+            self.status_banner = "Commands: p <ppm> | g <gain|auto> | b <0|1> | e <err> | autopm <on|off> | tune <on|off> | afc <on|off> | dedup <sec> | + <ch> | - <ch> | chans | scan | q"
 
     def _pick_channel_to_keep(self, pool: Optional[List[int]] = None) -> int:
         """
@@ -3665,11 +3803,14 @@ class ApexBOSGrabberApplication:
                         else:
                             if float(p_rssi) > self.peak_rssi:
                                 self.peak_rssi = float(p_rssi)
+                    if "freq_offset_hz" in m:
+                        self.packet_df_history.append((now_t, float(m["freq_offset_hz"])))
                     if "freq_offset_hz" in m and "channel" in m:
                         if self.afc_enabled:
                             self.channel_freq_offsets[m["channel"]] = m["freq_offset_hz"]
                     if "channel" in m and isinstance(m["channel"], int):
                         self.channel_last_activity[m["channel"]] = now_t
+                        self.channel_last_seen[m["channel"]] = now_t
 
                     # Inspect base packet channels & dynamically add missing ones (re-arranges workers)
                     self.process_packet_channels(
@@ -3747,6 +3888,20 @@ class ApexBOSGrabberApplication:
 
     def run(self):
         self._rtl_tcp_proc = None
+        if getattr(self.args, "scan_mode", False):
+            from ApexBOSScanner import ApexBOSChannelScanner
+            scanner = ApexBOSChannelScanner(
+                start_ch=getattr(self.args, "start_ch", 97),
+                end_ch=getattr(self.args, "end_ch", 176),
+                base_ppm=self.ppm,
+                gain=self.gain_db,
+                device_idx=self.device,
+                bias_tee=self.bias_tee,
+                probe_duration_sec=getattr(self.args, "dwell", 2.0),
+            )
+            scanner.run()
+            return
+
         # 0. Check SDR availability before spawning worker processes
         if self.stream_kind == "tcp":
             self._maybe_start_rtl_tcp_server()
@@ -3862,6 +4017,9 @@ class ApexBOSGrabberApplication:
                 # Automated lazy PID tuning step
                 self.step_auto_tuner(now)
 
+                # Automated PPM adjustment based on sliding window average Δf (7s interval)
+                self.step_auto_ppm(now)
+
                 if now - last_render >= 0.5:
                     self.render_screen(now)
                     last_render = now
@@ -3878,6 +4036,48 @@ class ApexBOSGrabberApplication:
                 p.terminate()
             self._stop_rtl_tcp_server()
             print(self.colorize(COLOR_YELLOW, "\nApexBOSGrabber pipeline terminated."))
+
+    @staticmethod
+    def split_status_banner(banner: str, max_len: int = 65) -> Tuple[str, str]:
+        """
+        Splits long status banner into two lines for display on smaller terminal windows.
+        Returns (line1, line2). If banner is short, line2 is empty string.
+        """
+        banner = banner.strip()
+        if not banner:
+            return "", ""
+        if "\n" in banner:
+            parts = banner.split("\n", 1)
+            return parts[0].strip(), parts[1].strip()
+        if len(banner) <= max_len and " | " not in banner:
+            return banner, ""
+
+        # Delimiters to try in order of preference
+        for sep in (" | ", " -> ", " (use ", " (re-arranged", " (Gain:", " (locked:", " or 'python "):
+            if sep in banner:
+                idx = -1
+                start = 0
+                while True:
+                    found = banner.find(sep, start)
+                    if found == -1:
+                        break
+                    if 15 <= found <= max_len:
+                        idx = found
+                    elif found > max_len:
+                        if idx == -1:
+                            idx = found
+                        break
+                    start = found + len(sep)
+                if idx != -1:
+                    p1 = banner[:idx].strip()
+                    p2 = banner[idx + (len(sep) if sep == " | " else 0):].strip()
+                    return p1, p2
+
+        # Fallback to last space <= max_len
+        pos = banner.rfind(" ", 20, max_len)
+        if pos != -1:
+            return banner[:pos].strip(), banner[pos:].strip()
+        return banner[:max_len].strip(), banner[max_len:].strip()
 
     def render_screen(self, current_time: float):
         if hasattr(self, "worker_raw_deltas"):
@@ -3922,11 +4122,11 @@ class ApexBOSGrabberApplication:
         short_sync = sum(d[1] for d in short_deltas)
         short_crc_g = sum(d[6] for d in short_deltas)
         short_matched_pct = (short_crc_g / short_sync * 100.0) if short_sync > 0 else 0.0
-        short_demod_fail_pct = max(0.0, 100.0 - short_matched_pct) if short_sync > 0 else 0.0
+        short_demod_fail_pct = max(0.0, 100.0 - short_matched_pct) if short_sync > 0 else None
 
         # 60s window demod failure and match rate
         win_matched_pct = (win_crc_g / win_sync * 100.0) if win_sync > 0 else 0.0
-        win_demod_fail_pct = max(0.0, 100.0 - win_matched_pct) if win_sync > 0 else 0.0
+        win_demod_fail_pct = max(0.0, 100.0 - win_matched_pct) if win_sync > 0 else None
 
         # Percentage of bad in good: (bad / good) * 100 for sliding window
         hdr_bad_in_good = (win_hdr_b / win_hdr_g * 100.0) if win_hdr_g > 0 else (100.0 if win_hdr_b > 0 else 0.0)
@@ -3949,15 +4149,23 @@ class ApexBOSGrabberApplication:
         gain_str = f"{self.gain_db:.1f} dB" if self.gain_db > 0 else "AGC"
         gain_disp = self.colorize(COLOR_RED + COLOR_BOLD, f"{gain_str} [CLIP: GAIN HIGH]") if is_clipping else self.colorize(COLOR_WHITE, gain_str)
 
+        elapsed_sec = int(max(0.0, current_time - self.start_time))
+        el_h = elapsed_sec // 3600
+        el_m = (elapsed_sec % 3600) // 60
+        el_s = elapsed_sec % 60
+        elapsed_str = f"{el_h:02d}:{el_m:02d}:{el_s:02d}"
+
         lines = []
         lines.append(self.colorize(COLOR_CYAN + COLOR_BOLD, "=" * 80))
         lines.append(
             self.colorize(COLOR_CYAN + COLOR_BOLD, f" ApexBOSGrabber ({VERSION}) ")
-            + self.colorize(COLOR_DIM, "| SDR: ") + self.colorize(COLOR_WHITE + COLOR_BOLD, self.stream_kind.upper())
+            + self.colorize(COLOR_DIM, "| Elapsed: ") + self.colorize(COLOR_WHITE + COLOR_BOLD, elapsed_str)
+            + self.colorize(COLOR_DIM, " | SDR: ") + self.colorize(COLOR_WHITE + COLOR_BOLD, self.stream_kind.upper())
             + self.colorize(COLOR_DIM, " | Rate: ") + self.colorize(COLOR_WHITE, f"{self.sample_rate} S/s" + (" [AUTO]" if self.rate_auto_scaled else ""))
             + self.colorize(COLOR_DIM, " | Gain: ") + gain_disp
             + self.colorize(COLOR_DIM, " | Bias: ") + self.colorize(COLOR_GREEN if self.bias_tee else COLOR_DIM, "ON" if self.bias_tee else "OFF")
             + self.colorize(COLOR_DIM, " | PPM: ") + self.colorize(COLOR_WHITE, f"{self.ppm}")
+            + self.colorize(COLOR_DIM, " | Err: ") + self.colorize(COLOR_YELLOW + COLOR_BOLD, str(self.max_errors))
             + self.colorize(COLOR_DIM, " | Center: ") + self.colorize(COLOR_GREEN, f"{self.center_freq / 1e6:.4f} MHz")
         )
         lines.append(self.colorize(COLOR_CYAN + COLOR_BOLD, "=" * 80))
@@ -4006,7 +4214,7 @@ class ApexBOSGrabberApplication:
             f" Channels ({len(self.channels)} active{locked_tag}, {len(self.base_channels)} base*): "
             f"{self.colorize(COLOR_CYAN, ch_display)}"
         )
-        afc_on = getattr(self, "afc_enabled", True)
+        afc_on = getattr(self, "afc_enabled", False)
         if afc_on:
             if hasattr(self, "channel_freq_offsets") and self.channel_freq_offsets:
                 active_offsets = [
@@ -4024,9 +4232,35 @@ class ApexBOSGrabberApplication:
                     )
         else:
             lines.append(
-                f" Channel AFC Offsets (Δf) : "
-                f"{self.colorize(COLOR_DIM, '[DISABLED - Offsets 0Hz]')}"
+                " Channel AFC Offsets (Δf) : "
+                + self.colorize(COLOR_DIM, "[DISABLED - Offsets 0Hz] (use 'afc on' to enable)")
             )
+
+        # Sliding window average measured frequency offset (Δf) across all channels
+        avg_df = self.get_sliding_window_average_df(current_time)
+        auto_ppm_on = getattr(self, "auto_ppm_enabled", True)
+        if avg_df is not None:
+            if abs(avg_df) <= 100.0:
+                df_color = COLOR_GREEN + COLOR_BOLD
+                df_tag = "[OPTIMAL: |Δf| < 100 Hz]"
+            elif avg_df > 100.0:
+                df_color = COLOR_YELLOW + COLOR_BOLD
+                df_tag = "[HIGH: Δf > +100 Hz -> PPM -1]"
+            else:
+                df_color = COLOR_CYAN + COLOR_BOLD
+                df_tag = "[LOW: Δf < -100 Hz -> PPM +1]"
+            df_val_str = f"{avg_df:+.1f} Hz"
+        else:
+            df_color = COLOR_DIM
+            df_tag = "[WAITING FOR PACKETS]"
+            df_val_str = "-- Hz"
+
+        auto_ppm_badge = self.colorize(COLOR_GREEN + COLOR_BOLD, "ON (7s check)") if auto_ppm_on else self.colorize(COLOR_DIM, "OFF")
+        lines.append(
+            f" Avg Packet Freq Offset (Δf) : "
+            f"{self.colorize(df_color, df_val_str)} {self.colorize(df_color, df_tag)} | "
+            f"Auto-PPM: {auto_ppm_badge}"
+        )
         lines.append(self.colorize(COLOR_DIM, "-" * 80))
 
         # Pipeline Statistics & Failure Rates (60s Sliding Window)
@@ -4037,7 +4271,8 @@ class ApexBOSGrabberApplication:
             d_p = self.ppm - self.base_ppm
             d_g = (self.gain_tenths - self.base_gain_tenths) / 10.0
             g_str = f", ΔG: {d_g:+.1f} dB" if self.base_gain_tenths > 0 else " [Gain: AGC]"
-            tune_badge = self.colorize(COLOR_GREEN + COLOR_BOLD, f"ON (ΔPPM: {d_p:+d}{g_str})") + self.colorize(COLOR_CYAN, pid_str)
+            stop_str = " [STOPPED: NO SYNC]" if short_sync == 0 else ""
+            tune_badge = self.colorize(COLOR_GREEN + COLOR_BOLD, f"ON (ΔPPM: {d_p:+d}{g_str}){stop_str}") + self.colorize(COLOR_CYAN, pid_str)
         else:
             tune_badge = self.colorize(COLOR_DIM, "OFF") + self.colorize(COLOR_DIM, pid_str)
 
@@ -4053,7 +4288,13 @@ class ApexBOSGrabberApplication:
             status_color = style.status_color
             fg_code = getattr(style, "fg_contrast", COLOR_WHITE + COLOR_BOLD)
             font = get_large_block_font()
-            rate_str = f"{short_demod_fail_pct:5.1f}%"
+            if short_demod_fail_pct is None:
+                rate_str = " -- "
+                tag_badge = f"{bg_code}{fg_code}   --% [{status_lbl}] {COLOR_RESET}"
+            else:
+                rate_str = f"{short_demod_fail_pct:5.1f}%"
+                tag_badge = f"{bg_code}{fg_code} {short_demod_fail_pct:5.1f}% [{status_lbl}] {COLOR_RESET}"
+
             rows_num = [
                 " ".join(font.get(c, ["   ", "   ", "   "])[r] for c in rate_str)
                 for r in range(3)
@@ -4064,28 +4305,46 @@ class ApexBOSGrabberApplication:
             r1_num = f"{bg_code}{fg_code} {rows_num[1].ljust(max_w)} {COLOR_RESET}"
             r2_num = f"{bg_code}{fg_code} {rows_num[2].ljust(max_w)} {COLOR_RESET}"
 
-            tag_badge = f"{bg_code}{fg_code} {short_demod_fail_pct:5.1f}% [{status_lbl}] {COLOR_RESET}"
             r0_text = f"{self.colorize(COLOR_BOLD, 'Total Demod Failure Rate:')} {tag_badge}"
-            r1_text = (
-                f"{int(SHORT_SLIDING_WINDOW_SECONDS)}s Short Window: {self.colorize(COLOR_WHITE + COLOR_BOLD, f'{short_crc_g:,}')}/"
-                f"{self.colorize(COLOR_WHITE + COLOR_BOLD, f'{short_sync:,}')} CRC/Sync "
-                f"({self.colorize(COLOR_GREEN if short_matched_pct >= 90 else COLOR_YELLOW, f'{short_matched_pct:5.1f}% match')})"
-            )
-            r2_text = (
-                f"60s Total Window: {self.colorize(COLOR_WHITE, f'{win_demod_fail_pct:5.1f}% fail')} "
-                f"({win_crc_g:,}/{win_sync:,}) | {self.colorize(COLOR_DIM, 'PID Setpoint: 0.0%')}"
-            )
+            if short_sync > 0:
+                r1_text = (
+                    f"{int(SHORT_SLIDING_WINDOW_SECONDS)}s Short Window: {self.colorize(COLOR_WHITE + COLOR_BOLD, f'{short_crc_g:,}')}/"
+                    f"{self.colorize(COLOR_WHITE + COLOR_BOLD, f'{short_sync:,}')} CRC/Sync "
+                    f"({self.colorize(COLOR_GREEN if short_matched_pct >= 90 else COLOR_YELLOW, f'{short_matched_pct:5.1f}% match')})"
+                )
+            else:
+                r1_text = (
+                    f"{int(SHORT_SLIDING_WINDOW_SECONDS)}s Short Window: {self.colorize(COLOR_DIM, f'{short_crc_g:,}/{short_sync:,} CRC/Sync (--.-% match)')}"
+                )
+
+            if win_sync > 0:
+                r2_text = (
+                    f"60s Total Window: {self.colorize(COLOR_WHITE, f'{win_demod_fail_pct:5.1f}% fail')} "
+                    f"({win_crc_g:,}/{win_sync:,}) | {self.colorize(COLOR_DIM, 'PID Setpoint: 0.0%')}"
+                )
+            else:
+                r2_text = (
+                    f"60s Total Window: {self.colorize(COLOR_DIM, '--.-% fail (0/0)')} | {self.colorize(COLOR_DIM, 'PID: STOPPED (NO SYNC)')}"
+                )
 
             lines.append(f"  {r0_num}  {r0_text}")
             lines.append(f"  {r1_num}  {r1_text}")
             lines.append(f"  {r2_num}  {r2_text}")
         else:
-            lines.append(
-                f"  Total Demod Failure Rate : "
-                f"[{short_demod_fail_pct:5.1f}%] "
-                f"({int(SHORT_SLIDING_WINDOW_SECONDS)}s: {short_crc_g:,}/{short_sync:,} CRC/Sync, {short_matched_pct:5.1f}% match) | "
-                f"60s: {win_demod_fail_pct:5.1f}% ({win_crc_g:,}/{win_sync:,})"
-            )
+            if short_demod_fail_pct is None:
+                lines.append(
+                    f"  Total Demod Failure Rate : "
+                    f"[ -- ] "
+                    f"({int(SHORT_SLIDING_WINDOW_SECONDS)}s: {short_crc_g:,}/{short_sync:,} CRC/Sync, --.-% match) | "
+                    f"60s: --.-% ({win_crc_g:,}/{win_sync:,}) | PID: STOPPED (NO SYNC)"
+                )
+            else:
+                lines.append(
+                    f"  Total Demod Failure Rate : "
+                    f"[{short_demod_fail_pct:5.1f}%] "
+                    f"({int(SHORT_SLIDING_WINDOW_SECONDS)}s: {short_crc_g:,}/{short_sync:,} CRC/Sync, {short_matched_pct:5.1f}% match) | "
+                    f"60s: {win_demod_fail_pct:5.1f}% ({win_crc_g:,}/{win_sync:,})"
+                )
         lines.append(
             f"  Packet Sync Signatures   : {self.colorize(COLOR_WHITE + COLOR_BOLD, f'{win_sync:,}')} detected (window)  |  "
             f"Lifetime: {self.colorize(COLOR_DIM, f'{life_sync:,}')}"
@@ -4111,8 +4370,11 @@ class ApexBOSGrabberApplication:
         lines.append(
             f"  Packets per Minute Rate  : "
             f"Unique: {self.colorize(COLOR_GREEN + COLOR_BOLD, f'{overall_ppm:,}')} Pkts/m (dedup)  |  "
-            f"Raw Demod: {self.colorize(COLOR_CYAN + COLOR_BOLD, f'{win_crc_g:,}')} Pkts/m (pre-dedup)  |  "
-            f"Lifetime Unique: {self.colorize(COLOR_WHITE, f'{total_p:,}')}"
+            f"Raw Demod: {self.colorize(COLOR_CYAN + COLOR_BOLD, f'{win_crc_g:,}')} Pkts/m (pre-dedup)"
+        )
+        lines.append(
+            f"  Lifetime Unique Packets  : "
+            f"{self.colorize(COLOR_WHITE + COLOR_BOLD, f'{total_p:,}')} (deduplicated lifetime)"
         )
         lines.append(self.colorize(COLOR_DIM, "-" * 80))
 
@@ -4139,12 +4401,15 @@ class ApexBOSGrabberApplication:
             )
         lines.append(self.colorize(COLOR_DIM, "-" * len(table_hdr)))
 
-        # Recent Decoded Packets & Telemetry
+        # Recent Decoded Packets & Telemetry (6 lines pre-allocated for view consistency)
         lines.append(self.colorize(COLOR_BOLD, " Recent Decoded Packets (Viterbi K=7 + RS(16,12) + CRC-16/ARC verified):"))
-        if not self.recent_events:
+        recent = list(self.recent_events)[-6:] if self.recent_events else []
+        if not recent:
             lines.append(self.colorize(COLOR_DIM, "   (Listening for RF bursts across sampling phases...)"))
+            for _ in range(5):
+                lines.append("")
         else:
-            for ev in list(self.recent_events)[-6:]:
+            for ev in recent:
                 t_str = ev["time_str"]
                 ch = ev["channel"]
                 rate = ev["rate"]
@@ -4166,15 +4431,42 @@ class ApexBOSGrabberApplication:
                     detail_str = ev["hex"][:24] + ".."
 
                 df_val = ev.get("freq_offset_hz")
-                df_str = f" Δf:{df_val:+.0f}Hz" if df_val is not None else ""
+                if df_val is not None:
+                    if abs(df_val) > 9999:
+                        raw_df = f"Δf:{int(round(df_val))//1000:+d}kHz"
+                    else:
+                        raw_df = f"Δf:{df_val:+.0f}Hz"
+                else:
+                    raw_df = "Δf:--Hz"
+                df_str = f"{raw_df:>10s}"[:10]
+
+                desc_str = f"{desc:<8s}"[:8]
+                desc_colored = self.colorize(COLOR_GREEN, desc_str)
+
                 lines.append(
-                    f"   [{t_str}] Ch {ch:3d} ({rate}) | RSSI:{rssi:5.1f} SNR:{snr:4.1f}{df_str} | "
-                    f"{self.colorize(COLOR_GREEN, desc):<10} | {self.colorize(COLOR_YELLOW, detail_str)}"
+                    f"   [{t_str}] Ch {ch:3d} ({rate:>3s}) | RSSI:{rssi:5.1f} SNR:{snr:4.1f} {df_str} | "
+                    f"{desc_colored} | {self.colorize(COLOR_YELLOW, detail_str)}"
                 )
+            for _ in range(6 - len(recent)):
+                lines.append("")
 
         lines.append(self.colorize(COLOR_DIM, "-" * 80))
-        lines.append(f" Status: {self.colorize(COLOR_WHITE, self.status_banner)}")
-        lines.append(self.colorize(COLOR_DIM, " Controls: 'p <ppm>', 'g <gain|auto>', 'b <0|1>', 'tune <on|off>', 'afc <on|off>', 'dedup <sec>', '+ <ch>', '- <ch>', 'chans', 'q' to quit"))
+        p1, p2 = self.split_status_banner(self.status_banner, max_len=68)
+        lines.append(f" Status: {self.colorize(COLOR_WHITE, p1)}")
+        if p2:
+            lines.append(f"         {self.colorize(COLOR_WHITE, p2)}")
+        lines.append(
+            self.colorize(
+                COLOR_DIM,
+                " Controls: 'p <ppm>', 'g <gain|auto>', 'b <0|1>', 'e <err>', 'autopm <on|off>', 'tune <on|off>'"
+            )
+        )
+        lines.append(
+            self.colorize(
+                COLOR_DIM,
+                "           'afc <on|off>', 'dedup <sec>', '+ <ch>', '- <ch>', 'chans', 'q' to quit"
+            )
+        )
 
         # Cross-platform screen refresh: VT cursor-home for Windows 11/Linux/macOS, or native clear fallback
         if self.use_color:
@@ -4222,8 +4514,9 @@ def get_grabber_default_config() -> dict:
         "max_errors": 8,
         "auto_tune": False,
         "tune_interval": 5.0,
-        "channel_afc": True,
+        "channel_afc": False,
         "afc_limit": 500.0,
+        "auto_ppm": True,
         "dedup_ttl": 1.0,
         "chans": None,
         "chans_file": None,
@@ -4292,10 +4585,18 @@ class ApexBOSGrabberArgumentParser(argparse.ArgumentParser):
                     clean_cfg[norm_k] = v
 
                 # Handle aliases
+                if "auto_ppm" in clean_cfg and isinstance(clean_cfg["auto_ppm"], str):
+                    clean_cfg["auto_ppm"] = clean_cfg["auto_ppm"].strip().lower() in ("1", "on", "true", "yes", "enable")
+                if "autopm" in clean_cfg and "auto_ppm" not in clean_cfg:
+                    clean_cfg["auto_ppm"] = clean_cfg["autopm"]
+                if "ppm_afc" in clean_cfg and "auto_ppm" not in clean_cfg:
+                    clean_cfg["auto_ppm"] = clean_cfg["ppm_afc"]
                 if "afc" in clean_cfg and "channel_afc" not in clean_cfg:
                     clean_cfg["channel_afc"] = clean_cfg["afc"]
                 if "enable_afc" in clean_cfg and "channel_afc" not in clean_cfg:
                     clean_cfg["channel_afc"] = clean_cfg["enable_afc"]
+                if "channel_afc" in clean_cfg and isinstance(clean_cfg["channel_afc"], str):
+                    clean_cfg["channel_afc"] = clean_cfg["channel_afc"].strip().lower() in ("1", "on", "true", "yes", "enable")
                 if "auto_tune_interval" in clean_cfg and "tune_interval" not in clean_cfg:
                     clean_cfg["tune_interval"] = clean_cfg["auto_tune_interval"]
                 if "dedup_window" in clean_cfg and "dedup_ttl" not in clean_cfg:
@@ -4376,12 +4677,26 @@ def build_cli_parser():
     parser.add_argument("--tune-interval", "--auto-tune-interval", type=float, default=5.0, help="Evaluation interval in seconds for automated PID tuner (default: 5.0s)")
     parser.add_argument("--pid", dest="auto_tune", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
+        "--auto-ppm", "--autopm", "--ppm-afc",
+        dest="auto_ppm",
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable automatic PPM adjustment based on packet frequency offsets (default: enabled, use --no-auto-ppm to disable)",
+    )
+    parser.add_argument(
+        "--no-auto-ppm", "--no-autopm", "--disable-auto-ppm",
+        dest="auto_ppm",
+        action="store_false",
+        help="Disable automatic PPM adjustment",
+    )
+    parser.add_argument(
         "--channel-afc", "--afc", "--enable-afc",
         dest="channel_afc",
         nargs="?",
         const=True,
-        default=True,
-        help="Enable per-channel dynamic frequency error correction (default: enabled, use --no-afc to disable)",
+        default=False,
+        help="Enable per-channel dynamic frequency error correction (default: disabled, use --afc to enable)",
     )
     parser.add_argument(
         "--no-channel-afc", "--no-afc", "--disable-afc",
@@ -4404,6 +4719,22 @@ def build_cli_parser():
     parser.add_argument("--udp-port", type=int, default=None, help="Base UDP port (default: same as ZMQ port)")
 
     # Display & Compatibility
+    parser.add_argument(
+        "--scan", "--search",
+        dest="scan_mode",
+        action="store_true",
+        default=False,
+        help="Scan channel frequencies 97-176, optimize PPM (±4) per 5 sec, and generate start script",
+    )
+    parser.add_argument("--start-ch", type=int, default=97, help="Starting channel for scan mode (default: 97)")
+    parser.add_argument("--end-ch", type=int, default=176, help="Ending channel for scan mode (default: 176)")
+    parser.add_argument(
+        "-d", "--dwell", "--dwell-time",
+        type=float,
+        default=2.0,
+        dest="dwell",
+        help="Observation dwell time per channel in seconds for scan mode (--scan) (default: 2.0s)",
+    )
     parser.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
     parser.add_argument("--full", action="store_true", help="Print full packet hex and details")
     parser.add_argument("--all", action="store_true", help="Print all messages including unknown transmitters")

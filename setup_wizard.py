@@ -990,6 +990,100 @@ def run_cli_wizard(
             else:
                 default_chans_str = config_loader.DEFAULT_CHANNELS_STR
 
+        # Initial 220 MHz Channel Scan Option
+        scan_opt_in = False
+        if "--scan" in sys.argv:
+            scan_opt_in = True
+        elif not auto_defaults:
+            print("\n  [Initial 220 MHz Channel Scan & SDR Calibration]")
+            print("  ApexBOS can perform an initial channel scan (10s dwell per channel) to automatically")
+            print("  detect active PTC frequencies in your area and calibrate SDR tuner PPM.")
+            opt_ans = input("  [?] Perform initial 220 MHz channel scan now? [y/N]: ").strip().lower()
+            if opt_ans in ("y", "yes"):
+                scan_opt_in = True
+
+        if scan_opt_in:
+            print("\n  [*] Starting initial 220 MHz channel scan (10.0s dwell per channel)...")
+            try:
+                import ApexBOSScanner
+                scan_dev = device_index if device_index is not None else int(ex_grab.get("device", 0) if str(ex_grab.get("device", 0)).isdigit() else 0)
+                ex_ppm_val = int(ex_grab.get("ppm", ex_grab.get("frequency_correction", 0)))
+                ex_gain_raw = str(ex_grab.get("gain", "20.7"))
+                ex_gain_val = float(ex_gain_raw) if ex_gain_raw.replace('.', '', 1).isdigit() else 20.7
+                use_mock_scan = ("--mock" in sys.argv or os.environ.get("APEXBOS_MOCK_SCAN") == "1")
+
+                s_ch = int(_arg_value("--start-ch") or ex_grab.get("start_ch") or 97)
+                e_ch = int(_arg_value("--end-ch") or ex_grab.get("end_ch") or 176)
+                dwell_arg = _arg_value("--dwell") or _arg_value("-d")
+                dwell_val = float(dwell_arg) if dwell_arg else 10.0
+                inband_arg = _arg_value("--inband-duration")
+                inband_val = float(inband_arg) if inband_arg else 10.0
+                opt_arg = _arg_value("--opt-duration")
+                opt_val = float(opt_arg) if opt_arg else 5.0
+
+                scanner = ApexBOSScanner.ApexBOSChannelScanner(
+                    start_ch=s_ch,
+                    end_ch=e_ch,
+                    base_ppm=ex_ppm_val,
+                    gain=ex_gain_val,
+                    device_idx=scan_dev,
+                    bias_tee=True,
+                    probe_duration_sec=dwell_val,
+                    inband_duration=inband_val,
+                    opt_duration_sec=opt_val,
+                    use_mock=use_mock_scan,
+                    verbose=True,
+                )
+                scanner.run()
+
+                if scanner.active_channels:
+                    sorted_detected = sorted(scanner.active_channels)
+                    locked_set = set(getattr(scanner, "crc_verified_channels", set())) & set(sorted_detected)
+                    for ch, info in scanner.scan_results.items():
+                        if info.get("crc_5s", 0) > 0:
+                            locked_set.add(ch)
+                    locked_detected = sorted(locked_set)
+                    chans_tokens = [f"{c}." if c in locked_set else str(c) for c in sorted_detected]
+                    chans_tokens_str = ", ".join(chans_tokens)
+                    rec_ppm = scanner.recommended_ppm
+                    peak_rssi = max((r["avg_rssi"] for r in scanner.scan_results.values()), default=-20.0)
+                    rec_gain = 16.6 if peak_rssi > -6.0 else (20.7 if peak_rssi > -12.0 else 22.9)
+
+                    print("\n  " + "=" * 68)
+                    print(f"  Initial Scan Complete: {len(sorted_detected)} Active Channels Detected")
+                    print(f"    Channels (--chans)  : {chans_tokens_str}")
+                    print(f"    Locked (CRC Valid)  : {', '.join(f'{c}.' for c in locked_detected) if locked_detected else 'None'}")
+                    print(f"    Consensus PPM       : {rec_ppm:+d}")
+                    print(f"    Recommended Gain    : {rec_gain:.1f} dB")
+                    print("  " + "=" * 68)
+
+                    apply_scan_defaults = True
+                    if not auto_defaults:
+                        apply_ans = input("  [?] Offer scan results as default configuration for the Grabber? [Y/n]: ").strip().lower()
+                        if apply_ans in ("n", "no"):
+                            apply_scan_defaults = False
+
+                    if apply_scan_defaults:
+                        default_chans_str = chans_tokens_str
+                        ex_grab["chans"] = chans_tokens_str
+                        ex_grab["channels"] = sorted_detected
+                        ex_grab["locked_channels"] = locked_detected
+                        ex_grab["ppm"] = rec_ppm
+                        ex_grab["frequency_correction"] = rec_ppm
+                        ex_grab["gain"] = f"{rec_gain:.1f}"
+                        calc_procs = min(len(sorted_detected), max_procs)
+                        ex_grab["process_count"] = calc_procs
+                        suggested_p = config_loader.generate_default_ports(sorted_detected, calc_procs)
+                        ex_grab["ports"] = suggested_p
+                        ex_grab["procs"] = ",".join(str(p) for p in suggested_p)
+                        print(f"  [+] Applied scan results as defaults for channels ({len(locked_detected)} locked), PPM, and gain.")
+                else:
+                    print("\n  [!] Initial scan completed, but no active channels were detected.")
+                    print("      Continuing with standard defaults.")
+            except Exception as scan_err:
+                print(f"\n  [!] Initial scan encountered an error: {scan_err}")
+                print("      Continuing with standard defaults.")
+
         print("  Specify PTC channels to monitor (comma-separated or ranges).")
         print("  Tip: Lock a channel to prevent re-tuning by appending '.' or 'l' (e.g. 101, 102., 107l).")
         if auto_defaults:
@@ -1380,6 +1474,12 @@ class PygameSetupWizard:
 
         self.status_msg = ""
         self.firewall_toast: Optional[str] = None
+        self.scanning = False
+        self.scan_progress = ""
+        self.scan_summary = ""
+        self.scan_active_channels: List[int] = []
+        self.scan_recommended_ppm: int = 0
+        self.scan_recommended_gain: float = 20.7
 
     # ----- layout ---------------------------------------------------------
     def _rect(self, name: str):
@@ -1415,6 +1515,7 @@ class PygameSetupWizard:
             "enc_key": (50, 305, 520, 36),
             "key_paste": (580, 305, 100, 36),
             "key_regen": (690, 305, 120, 36),
+            "scan_channels": (550, 105, 260, 32),
             "grabber_chans": (50, 155, 760, 34),
             "procs_minus": (50, 252, 40, 34),
             "procs_val": (95, 252, 70, 34),
@@ -2098,7 +2199,10 @@ class PygameSetupWizard:
                 self._set_active(None)
 
         elif self.step == 5:
-            if self._rect("grabber_chans").collidepoint(pos):
+            if self._rect("scan_channels").collidepoint(pos) and not getattr(self, "scanning", False):
+                self._trigger_channel_scan()
+                return
+            elif self._rect("grabber_chans").collidepoint(pos):
                 self._set_active("grabber_chans")
                 self.cursor_pos = self._calc_cursor_pos("grabber_chans", pos[0])
                 return
@@ -2221,6 +2325,89 @@ class PygameSetupWizard:
         _, clean_chans, _ = config_loader.parse_channels_with_locks(self.fields.get("grabber_chans", ""))
         ports = config_loader.generate_default_ports(clean_chans, self.process_count)
         self.fields["grabber_ports"] = ", ".join(str(p) for p in ports)
+
+    def _trigger_channel_scan(self):
+        """Spawns background channel scan thread with 10s dwell time."""
+        if getattr(self, "scanning", False):
+            return
+        self.scanning = True
+        self.scan_progress = "Initializing SDR scan..."
+        self.scan_summary = ""
+
+        def _worker():
+            try:
+                import ApexBOSScanner
+                sdr_dev = self.device_index
+                ppm_raw = self.fields.get("sdr_ppm", "0").strip()
+                base_ppm = int(ppm_raw) if ppm_raw.lstrip("-").isdigit() else 0
+                gain_raw = self.fields.get("sdr_gain", "auto").strip()
+                gain_val = float(gain_raw) if gain_raw.replace('.', '', 1).isdigit() else 20.7
+                use_mock_scan = ("--mock" in sys.argv or os.environ.get("APEXBOS_MOCK_SCAN") == "1")
+
+                s_ch = int(_arg_value("--start-ch") or 97)
+                e_ch = int(_arg_value("--end-ch") or 176)
+                dwell_arg = _arg_value("--dwell") or _arg_value("-d")
+                dwell_val = float(dwell_arg) if dwell_arg else 10.0
+                inband_arg = _arg_value("--inband-duration")
+                inband_val = float(inband_arg) if inband_arg else 10.0
+                opt_arg = _arg_value("--opt-duration")
+                opt_val = float(opt_arg) if opt_arg else 5.0
+
+                def _prog_cb(msg):
+                    self.scan_progress = msg
+
+                scanner = ApexBOSScanner.ApexBOSChannelScanner(
+                    start_ch=s_ch,
+                    end_ch=e_ch,
+                    base_ppm=base_ppm,
+                    gain=gain_val,
+                    device_idx=sdr_dev,
+                    bias_tee=True,
+                    probe_duration_sec=dwell_val,
+                    inband_duration=inband_val,
+                    opt_duration_sec=opt_val,
+                    use_mock=use_mock_scan,
+                    verbose=True,
+                    progress_cb=_prog_cb,
+                )
+                scanner.run()
+
+                if scanner.active_channels:
+                    sorted_ch = sorted(scanner.active_channels)
+                    locked_set = set(getattr(scanner, "crc_verified_channels", set())) & set(sorted_ch)
+                    for ch, info in scanner.scan_results.items():
+                        if info.get("crc_5s", 0) > 0:
+                            locked_set.add(ch)
+                    locked_ch = sorted(locked_set)
+                    chans_tokens = [f"{c}." if c in locked_set else str(c) for c in sorted_ch]
+                    chans_tokens_str = ", ".join(chans_tokens)
+                    self.scan_active_channels = sorted_ch
+                    self.scan_locked_channels = locked_ch
+                    self.scan_recommended_ppm = scanner.recommended_ppm
+                    peak_rssi = max((r["avg_rssi"] for r in scanner.scan_results.values()), default=-20.0)
+                    rec_gain = 16.6 if peak_rssi > -6.0 else (20.7 if peak_rssi > -12.0 else 22.9)
+                    self.scan_recommended_gain = rec_gain
+
+                    # Offer scan results as default configuration for the Grabber
+                    self.fields["grabber_chans"] = chans_tokens_str
+                    self.fields["sdr_ppm"] = str(scanner.recommended_ppm)
+                    self.fields["sdr_gain"] = f"{rec_gain:.1f}"
+                    self.process_count = min(len(sorted_ch), self.max_allowed_procs)
+                    self.custom_ports_edited = False
+                    self._sync_ports_for_procs()
+                    locked_desc = f"{len(locked_ch)} locked" if locked_ch else "0 locked"
+                    self.scan_summary = f"Detected {len(sorted_ch)} channels ({chans_tokens_str}, {locked_desc}), PPM {scanner.recommended_ppm:+d}, Gain {rec_gain:.1f} dB (applied)."
+                    self.status_msg = f"Scan complete: Applied {len(sorted_ch)} channels ({len(locked_ch)} locked) and PPM {scanner.recommended_ppm:+d} to Grabber."
+                else:
+                    self.scan_summary = "Scan complete: No active channels detected (kept existing config)."
+                    self.status_msg = "Scan complete: No channels detected. Verify antenna/SDR."
+            except Exception as e:
+                self.scan_summary = f"Scan failed: {e}"
+                self.status_msg = f"Scan error: {str(e)[:80]}"
+            finally:
+                self.scanning = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _trigger_ssh_banc_deploy(self):
         """Packages Banc + whitelist and deploys to the cloud Linux VM via SCP/SSH."""
@@ -2732,6 +2919,12 @@ class PygameSetupWizard:
         # 1. Channels
         lbl_ch = self.font_h2.render("Radio Channels (--chans):", True, COLOR_TEXT)
         self.screen.blit(lbl_ch, (50, 108))
+
+        # Initial Scan button
+        btn_scan_col = COLOR_BORDER if self.scanning else COLOR_ACCENT
+        btn_scan_txt = "Scanning... (10s Dwell)" if self.scanning else "🔍 Initial Scan (10s Dwell)"
+        self._draw_button("scan_channels", btn_scan_txt, btn_scan_col, COLOR_TEXT_DIM if self.scanning else (10, 10, 10))
+
         tip_ch = self.font_sm.render(
             "Comma-separated numbers or ranges. Append '.' or 'l' to lock a channel (e.g. 101, 102., 107l).",
             True, COLOR_TEXT_DIM
@@ -2739,18 +2932,26 @@ class PygameSetupWizard:
         self.screen.blit(tip_ch, (50, 131))
         self._draw_field("grabber_chans", placeholder="e.g. 101, 102., 107l, 111-120")
 
-        # Live channel stats
-        chans_input = self.fields.get("grabber_chans", "").strip()
-        if chans_input:
-            raw_ch, clean_chans, locked_chans = config_loader.parse_channels_with_locks(chans_input)
-            locked_text = f"Locked ({len(locked_chans)}): {', '.join(str(c) for c in sorted(list(locked_chans)))}" if locked_chans else "No locked channels"
-            stats_txt = self.font_sm.render(
-                f"Total Channels: {len(clean_chans)}  |  {locked_text}",
-                True, COLOR_ACCENT
-            )
+        # Live channel stats / Scan progress
+        if getattr(self, "scanning", False):
+            scan_txt = self.font_sm.render(f"Scanning 220 MHz band (10s dwell)... {self.scan_progress[:65]}", True, COLOR_GREEN)
+            self.screen.blit(scan_txt, (50, 194))
+        elif getattr(self, "scan_summary", ""):
+            scan_col = COLOR_GREEN if getattr(self, "scan_active_channels", []) else (255, 190, 80)
+            scan_txt = self.font_sm.render(f"✓ {self.scan_summary[:90]}", True, scan_col)
+            self.screen.blit(scan_txt, (50, 194))
         else:
-            stats_txt = self.font_sm.render("No channels specified. Enter channel numbers.", True, COLOR_ERR)
-        self.screen.blit(stats_txt, (50, 194))
+            chans_input = self.fields.get("grabber_chans", "").strip()
+            if chans_input:
+                raw_ch, clean_chans, locked_chans = config_loader.parse_channels_with_locks(chans_input)
+                locked_text = f"Locked ({len(locked_chans)}): {', '.join(str(c) for c in sorted(list(locked_chans)))}" if locked_chans else "No locked channels"
+                stats_txt = self.font_sm.render(
+                    f"Total Channels: {len(clean_chans)}  |  {locked_text}",
+                    True, COLOR_ACCENT
+                )
+            else:
+                stats_txt = self.font_sm.render("No channels specified. Enter channel numbers.", True, COLOR_ERR)
+            self.screen.blit(stats_txt, (50, 194))
 
         # 2. Worker Processes
         cpu_str = f"CPU threads: {self.cpu_threads or 'unknown'}"

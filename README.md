@@ -84,6 +84,7 @@ ApexBOS is partitioned into modular, independently executable components. Each c
 | Component | Source File | Documentation | Role & Capabilities |
 | :--- | :--- | :--- | :--- |
 | **ApexBOSGrabber** | [ApexBOSGrabber.py](ApexBOSGrabber.py) | [GRABBER_README.md](GRABBER_README.md) | High-speed SDR receiver and $\pi/4$-DQPSK demodulator. Decodes 220 MHz bursts, executes Viterbi and Reed-Solomon FEC, and publishes streams over ZeroMQ PUB sockets (defaulting to ports 18071–18131) and UDP. |
+| **ApexBOSScanner** | [ApexBOSScanner.py](ApexBOSScanner.py) | [SCANNER_README.md](SCANNER_README.md) | Automated ITC 220 MHz channel scanner & master oscillator PPM calibrator. Hunts active PTC channels (97–176), sweeps tuner offsets $\pm 4$ PPM, calculates consensus tuner PPM and safe gain headroom, and updates Grabber configurations. |
 | **ApexBOSFlux** | [ApexBOSFlux.py](ApexBOSFlux.py) | [FLUX_README.md](FLUX_README.md) | Asynchronous multi-channel telemetry aggregator. Collects ZMQ worker streams, performs sliding-window deduplication, relays packets locally on UDP multicast (`239.1.1.1:23003`), and uploads encrypted bursts to Banc Cloud. |
 | **ApexBOSBanc** | [ApexBOSBanc.py](ApexBOSBanc.py) | [BANC_README.md](BANC_README.md) | Dual-stack (IPv4/IPv6) cloud telemetry server. Features SQLite WAL database storage, rolling TOTP authentication (`mosfet_auth`), centralized layout distribution, and inter-station Foamer Chat relay (TCP `23009`). |
 | **Dispatcher Engine** | [ApexBOS.220.py](ApexBOS.220.py)<br/>[dispatcher_engine.py](dispatcher_engine.py) | [ENGINE_README.md](ENGINE_README.md) | The computational heart of the system. Compiles layout geometries, ingests telemetry from multicast or Banc, resolves WIU bit offsets, computes train speeds, predicts collisions, and broadcasts delta frames (`224.1.1.1:5007`). |
@@ -288,6 +289,15 @@ flowchart LR
 ```
 
 #### Step 1: Terminal 1 — Start the SDR Demodulator (Grabber)
+
+> [!TIP]
+> **Not sure which 220 MHz channels are active in your area?**
+> Run the automated scanner to hunt active channels (97–176) and calibrate tuner PPM:
+> ```bash
+> python ApexBOSScanner.py --dwell 3.5
+> ```
+> Or in `ApexBOSLauncher.py`, click **[Scan 220 MHz Channels]** (or **[SCAN]** on the Grabber row) to automatically inherit your SDR settings and apply discovered channels directly to `config.json`. See [SCANNER_README.md](SCANNER_README.md).
+
 Tune Grabber to monitor active 220 MHz telemetry channels (e.g. 71, 101, 102) via RTL-SDR pipe:
 ```bash
 python ApexBOSGrabber.py --channels 71,101,102 --pipe --gain 42
@@ -496,6 +506,9 @@ python View_ApexBOS.220.py --engine-port 5018 --mcast-port 5017
 ### Antennas & RF Filtering
 - **Tuned 220 MHz Ground Plane or Yagi**: A vertical whip cut to approximately 12.8 inches (quarter-wave) or a tuned directional Yagi provides strong signal gain.
 - **220 MHz Bandpass Filter**: Highly recommended in urban environments. Attenuates strong out-of-band interference (broadcast FM at 88–108 MHz and VHF paging at 152–158 MHz) that can overload the SDR tuner.
+
+### Automatic Frequency Calibration & Gain Optimization
+- **ApexBOSScanner**: Built-in channel scanner and oscillator calibration tool ([ApexBOSScanner.py](ApexBOSScanner.py) / [SCANNER_README.md](SCANNER_README.md)). Sweeps channels 97 to 176, identifies active transmitters via physical-layer 64-bit unique word correlation, performs a $\pm 4\text{ PPM}$ sweep to find the consensus tuner offset, and calculates the optimal RF gain providing $\ge 12\text{ dB}$ headroom to prevent front-end clipping. Run standalone or from the Launcher dashboard.
 
 ---
 
