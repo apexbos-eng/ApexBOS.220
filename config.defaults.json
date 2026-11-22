@@ -1,5 +1,5 @@
 {
-  "version": "v26.1121.09",
+  "version": "v26.1121.10",
   "common": {
     "deployment_mode": "local",
     "packet_source": "flux",
@@ -12,7 +12,7 @@
       "ui_port": 23010,
       "auth_secret": "",
       "encryption_key": "",
-      "identity": "ApexNode_2a13fef4",
+      "identity": "ApexNode_87c0fbb9",
       "banc_initial_history_sec": 60
     },
     "multicast": {
@@ -135,7 +135,7 @@
       "banc_port": "none",
       "auth_secret": "",
       "encryption_key": "",
-      "identity": "ApexNode_2a13fef4",
+      "identity": "ApexNode_87c0fbb9",
       "banc_initial_history_sec": 60
     }
   },
@@ -150,7 +150,7 @@
     "banc_port": 23009,
     "auth_secret": "",
     "encryption_key": "",
-    "identity": "ApexNode_2a13fef4"
+    "identity": "ApexNode_87c0fbb9"
   },
   "creator": {
     "db_path": "wius.db",
@@ -159,7 +159,7 @@
     "banc_port": 23009,
     "auth_secret": "",
     "encryption_key": "",
-    "identity": "ApexNode_2a13fef4"
+    "identity": "ApexNode_87c0fbb9"
   },
   "banc": {
     "port": 23009,

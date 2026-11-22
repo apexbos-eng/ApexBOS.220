@@ -154,6 +154,34 @@ def format_host_port(host: str, port: int) -> str:
     return f"{clean}:{int(port)}"
 
 
+def normalize_sources_list(raw_sources: Any) -> List[str]:
+    """Normalizes raw sources into a flat list of source strings.
+
+    Accepts comma-separated strings, lists/tuples/sets of strings or ints,
+    or None/empty, ensuring compatibility with all configuration formats.
+    """
+    if raw_sources is None:
+        return []
+    if isinstance(raw_sources, (list, tuple, set)):
+        items: List[str] = []
+        for x in raw_sources:
+            if isinstance(x, (list, tuple, set)):
+                items.extend(normalize_sources_list(x))
+            elif isinstance(x, str):
+                items.extend([s.strip() for s in x.split(",") if s.strip()])
+            elif isinstance(x, int):
+                items.append(f"127.0.0.1:{x}")
+            elif x:
+                items.append(str(x).strip())
+        return [s for s in items if s]
+    if isinstance(raw_sources, str):
+        return [s.strip() for s in raw_sources.split(",") if s.strip()]
+    if isinstance(raw_sources, int):
+        return [f"127.0.0.1:{raw_sources}"]
+    s = str(raw_sources).strip()
+    return [s] if s else []
+
+
 def extract_ips_from_traceroute(output_text: str) -> List[str]:
     """Legacy helper retained for compatibility: delegates to mosfet_client."""
     return mosfet_client.extract_ips_from_traceroute(output_text)
@@ -1091,12 +1119,21 @@ async def main():
                             new_sources.add(f"{ip}:{port}")
                             
                 if new_sources:
-                    existing_sources = set(s.strip() for s in config.get("sources", "").split(",") if s.strip())
+                    raw_cfg_sources = config.get("sources", "")
+                    is_list_format = isinstance(raw_cfg_sources, (list, tuple))
+                    existing_sources = set()
+                    for s in normalize_sources_list(raw_cfg_sources):
+                        if "://" in s:
+                            s = s.partition("://")[2]
+                        existing_sources.add(s)
                     original_len = len(existing_sources)
                     existing_sources.update(new_sources)
                     
                     if len(existing_sources) > original_len:
-                        config["sources"] = ", ".join(sorted(existing_sources))
+                        if is_list_format:
+                            config["sources"] = [f"tcp://{s}" for s in sorted(existing_sources)]
+                        else:
+                            config["sources"] = ", ".join(sorted(existing_sources))
                         with open(args.config, 'w') as f:
                             json.dump(config, f, indent=4)
                         if not args.display:
@@ -1144,21 +1181,36 @@ async def main():
         except Exception:
             pass
 
-    raw_sources = config.get("sources", "")
+    raw_sources = normalize_sources_list(config.get("sources", ""))
     direct_endpoints, scan_pool = [], []
     
-    for src in raw_sources.split(","):
-        src = src.strip()
-        if not src: continue
+    for raw_src in raw_sources:
+        src = raw_src.strip()
+        if not src:
+            continue
+        proto = "tcp://"
+        if "://" in src:
+            proto_part, _, rem = src.partition("://")
+            proto = f"{proto_part}://"
+            src = rem.strip()
+
         if ":" in src:
             host_part, port_part = src.rsplit(":", 1)
-            if host_part.lower() == "localhost":
+            if host_part.lower() in ("localhost", "127.0.0.1", ""):
                 host_part = "127.0.0.1"
-            direct_endpoints.append(f"tcp://{host_part}:{port_part}")
+            endpoint = f"{proto}{host_part}:{port_part}"
+            if endpoint not in direct_endpoints:
+                direct_endpoints.append(endpoint)
         else:
-            host_part = "127.0.0.1" if src.lower() == "localhost" else src
-            for p in range(18000, 18175): scan_pool.append((host_part, p))
-            for p in range(20101, 20175): scan_pool.append((host_part, p))
+            host_part = "127.0.0.1" if src.lower() in ("localhost", "") else src
+            for p in range(18000, 18175):
+                item = (host_part, p)
+                if item not in scan_pool:
+                    scan_pool.append(item)
+            for p in range(20101, 20175):
+                item = (host_part, p)
+                if item not in scan_pool:
+                    scan_pool.append(item)
 
     ctx = zmq.asyncio.Context()
     active_connections = {}
