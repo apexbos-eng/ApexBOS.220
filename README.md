@@ -67,11 +67,11 @@ The answer is **both**. ApexBOS is architected as a modular ecosystem where the 
                            |                                       |
                            v                                       v
        +---------------------------------------+ +---------------------------------------+
-       |           VIEWER INTERFACE            | |         DEVELOPER / SPY SUITE         |
-       |  ApexBOS Viewer (Pygame Display)      | |  PackFIG (Packet Disassembler)        |
-       |  - Interactive Track Schematic        | |  ApexBOSSpy (ANSI Protocol Spy)       |
-       |  - Train Tracking & GPS Speed         | |  ApexBOSCreator (Layout Studio)       |
-       |  - Foamer Chat & Audio Annunciator    | |  parse_packets.py (Rule Compiler)     |
+       |           VIEWER INTERFACE            | |      RF ANALYSIS & DEVELOPER SUITE    |
+       |  ApexBOS Viewer (Pygame Display)      | |  ApexBOSChroma (RF Spectrum/Waterfall)|
+       |  - Interactive Track Schematic        | |  PackFIG (Packet Disassembler)        |
+       |  - Train Tracking & GPS Speed         | |  ApexBOSSpy (ANSI Protocol Spy)       |
+       |  - Foamer Chat & Audio Annunciator    | |  ApexBOSCreator (Layout Studio)       |
        +---------------------------------------+ +---------------------------------------+
 ```
 
@@ -85,6 +85,7 @@ ApexBOS is partitioned into modular, independently executable components. Each c
 | :--- | :--- | :--- | :--- |
 | **ApexBOSGrabber** | [ApexBOSGrabber.py](ApexBOSGrabber.py) | [GRABBER_README.md](GRABBER_README.md) | High-speed SDR receiver and $\pi/4$-DQPSK demodulator. Decodes 220 MHz bursts, executes Viterbi and Reed-Solomon FEC, and publishes streams over ZeroMQ PUB sockets (defaulting to ports 18071–18131) and UDP. |
 | **ApexBOSScanner** | [ApexBOSScanner.py](ApexBOSScanner.py) | [SCANNER_README.md](SCANNER_README.md) | Automated ITC 220 MHz channel scanner & master oscillator PPM calibrator. Hunts active PTC channels (97–176), sweeps tuner offsets $\pm 4$ PPM, calculates consensus tuner PPM and safe gain headroom, and updates Grabber configurations. |
+| **ApexBOSChroma** | [ApexBOSChroma.py](ApexBOSChroma.py) | [CHROMA_README.md](CHROMA_README.md) | Real-time Pygame FFT spectrum analyzer & scrolling waterfall tailored to PTC Channels 97–176. Runs alongside Grabber from the same RTL-SDR with zero demod impact (plus Standalone & `--mock` modes), dynamic Native/Wideband (`2.304 MS/s`) switching, live PPM/Gain/Bias-T controls, interactive channel ruler, and flowing WIU/`src->dst` packet blips. |
 | **ApexBOSFlux** | [ApexBOSFlux.py](ApexBOSFlux.py) | [FLUX_README.md](FLUX_README.md) | Asynchronous multi-channel telemetry aggregator. Collects ZMQ worker streams, performs sliding-window deduplication, relays packets locally on UDP multicast (`239.1.1.1:23003`), and uploads encrypted bursts to Banc Cloud. |
 | **ApexBOSBanc** | [ApexBOSBanc.py](ApexBOSBanc.py) | [BANC_README.md](BANC_README.md) | Dual-stack (IPv4/IPv6) cloud telemetry server. Features SQLite WAL database storage, rolling TOTP authentication (`mosfet_auth`), centralized layout distribution, and inter-station Foamer Chat relay (TCP `23009`). |
 | **Dispatcher Engine** | [ApexBOS.220.py](ApexBOS.220.py)<br/>[dispatcher_engine.py](dispatcher_engine.py) | [ENGINE_README.md](ENGINE_README.md) | The computational heart of the system. Compiles layout geometries, ingests telemetry from multicast or Banc, resolves WIU bit offsets, computes train speeds, predicts collisions, and broadcasts delta frames (`224.1.1.1:5007`). |
@@ -111,6 +112,7 @@ flowchart TD
     subgraph Relay_Layer["2. Telemetry Aggregation"]
         GRAB -->|"ZMQ PUB 18071..18131"| FLUX["ApexBOSFlux.py<br/>Local Multicast Relay"]
         GRAB -.->|"ZeroMQ or UDP"| SPY["ApexBOSSpy.py<br/>Packet Inspector"]
+        GRAB -.->|"ZMQ XPUB 18099 + REP 18098"| CHROMA["ApexBOSChroma.py<br/>RF Spectrum & Waterfall"]
     end
 
     subgraph Cloud_Layer["3. Cloud WAN Infrastructure"]
@@ -135,7 +137,8 @@ flowchart TD
 
 | Port / Address | Transport Protocol | Direction | Source Component | Destination Component | Purpose & Description |
 | :--- | :--- | :---: | :--- | :--- | :--- |
-| `18071`–`18131` | TCP (ZeroMQ PUB/SUB) | Unicast | ApexBOSGrabber | ApexBOSFlux / ApexBOSSpy | High-speed channelized telemetry slices published by Grabber demodulator workers (starting at 18071, 18000 + channel). |
+| `18071`–`18131` | TCP (ZeroMQ PUB/SUB) | Unicast | ApexBOSGrabber | ApexBOSFlux / Spy / Chroma | High-speed channelized telemetry slices published by Grabber demodulator workers (starting at 18071, 18000 + channel). |
+| `18098`–`18099` | TCP (ZeroMQ REP / XPUB) | Localhost | ApexBOSGrabber | ApexBOSChroma | Localhost-only gated IQ spectrum tap (`18099`, 0% load when unsubscribed) and live SDR control bridge (`18098`) for ApexBOSChroma. |
 | `239.1.1.1:23003` | UDP Multicast | Local LAN | ApexBOSFlux | Dispatcher Engine / Spy | Local area network telemetry distribution for sub-millisecond packet delivery. |
 | `23009` | TCP (Dual-Stack IPv4/IPv6) | WAN / LAN | ApexBOSFlux / Engine / Viewer | ApexBOSBanc Cloud | Encrypted cloud telemetry uplink, packet archives, layout synchronization, and Foamer Chat. |
 | `23010` | TCP (HTTP / Telnet) | Localhost / LAN | Browser / Terminal | ApexBOSBanc | Banc cloud telemetry monitoring dashboard, active connection table, and cooldown manager. |
@@ -507,8 +510,9 @@ python View_ApexBOS.220.py --engine-port 5018 --mcast-port 5017
 - **Tuned 220 MHz Ground Plane or Yagi**: A vertical whip cut to approximately 12.8 inches (quarter-wave) or a tuned directional Yagi provides strong signal gain.
 - **220 MHz Bandpass Filter**: Highly recommended in urban environments. Attenuates strong out-of-band interference (broadcast FM at 88–108 MHz and VHF paging at 152–158 MHz) that can overload the SDR tuner.
 
-### Automatic Frequency Calibration & Gain Optimization
+### Automatic Frequency Calibration, Live Spectrum & Gain Optimization
 - **ApexBOSScanner**: Built-in channel scanner and oscillator calibration tool ([ApexBOSScanner.py](ApexBOSScanner.py) / [SCANNER_README.md](SCANNER_README.md)). Sweeps channels 97 to 176, identifies active transmitters via physical-layer 64-bit unique word correlation, performs a $\pm 4\text{ PPM}$ sweep to find the consensus tuner offset, and calculates the optimal RF gain providing $\ge 12\text{ dB}$ headroom to prevent front-end clipping. Run standalone or from the Launcher dashboard.
+- **ApexBOSChroma**: Real-time PTC 220 MHz FFT spectrum analyzer & scrolling waterfall ([ApexBOSChroma.py](ApexBOSChroma.py) / [CHROMA_README.md](CHROMA_README.md)). Attaches directly to a running Grabber without impacting demodulation (or runs standalone directly on the RTL-SDR), letting you visually inspect signal quality, ADC clipping, fading RSSI peaks, and flowing packet blips while adjusting PPM, Gain, Bias-T, Wideband (`2.304 MS/s`), and monitored channels live.
 
 ---
 

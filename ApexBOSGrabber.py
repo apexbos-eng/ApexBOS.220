@@ -142,6 +142,11 @@ try:
 except ImportError:
     np = None
 
+try:
+    import zmq
+except ImportError:
+    zmq = None
+
 from version import VERSION, __version__
 
 # Python 3.6 - 3.9 compatibility
@@ -259,6 +264,9 @@ def get_failure_rate_bg_and_tag(rate):
 
 DEFAULT_SAMPLE_RATE = 192000
 DEFAULT_CHUNK_SIZE = 148000  # I/Q samples
+DEFAULT_CHROMA_IQ_PORT = 18099
+DEFAULT_CHROMA_CTRL_PORT = 18098
+CHROMA_WIDEBAND_RATE = 2304000  # 12 * 192 kS/s (covers full PTC Ch 97-176 cleanly)
 SLIDING_WINDOW_SECONDS = 60.0
 SHORT_SLIDING_WINDOW_SECONDS = 5.0
 
@@ -1546,10 +1554,13 @@ class SubprocessPipeSource:
             self.process = None
             raise RuntimeError(f"Failed to start rtl_sdr ({self.bin}): {e}")
 
-    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None):
+    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
         restart_needed = False
         if freq is not None and int(freq) != self.center_freq:
             self.center_freq = int(freq)
+            restart_needed = True
+        if rate is not None and int(rate) != self.sample_rate:
+            self.sample_rate = int(rate)
             restart_needed = True
         if gain is not None:
             g_db, g_tenths = parse_gain_value(gain)
@@ -1606,7 +1617,7 @@ class StandardInputStreamSource:
     def __init__(self):
         pass
 
-    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None):
+    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
         pass
 
     def read_exact_bytes(self, byte_count: int) -> bytes:
@@ -1704,7 +1715,10 @@ class DirectRtlTcpSource:
             msg = bytes([cmd_id]) + struct.pack(">I", int(arg_val) & 0xFFFFFFFF)
         self.sock.sendall(msg)
 
-    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None):
+    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
+        if rate is not None and int(rate) != self.sample_rate:
+            self.sample_rate = int(rate)
+            self._send_command(0x02, self.sample_rate)
         if freq is not None:
             self.center_freq = int(freq)
             self._send_command(0x01, self.center_freq)
@@ -1805,9 +1819,16 @@ class DirectRtlSdrSource:
             except Exception:
                 pass
 
-    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None):
+    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
         if not self.sdr:
             return
+        if rate is not None and int(rate) != self.sample_rate:
+            self.sample_rate = int(rate)
+            try:
+                self.sdr.sample_rate = self.sample_rate
+                self._buffer.clear()
+            except Exception:
+                pass
         if freq is not None and int(freq) != self.center_freq:
             self.center_freq = int(freq)
             try:
@@ -2021,6 +2042,16 @@ def native_demod_worker(
                     elif req.get("cmd") == "set_max_errors":
                         if "max_errors" in req:
                             max_sync_errors = max(0, int(req["max_errors"]))
+                    elif req.get("cmd") == "set_rate":
+                        new_rate = int(req.get("rate", channelizer.input_rate))
+                        if "center_freq" in req and req["center_freq"] is not None:
+                            current_center_freq = int(req["center_freq"])
+                        if new_rate != channelizer.input_rate:
+                            channelizer = ContinuousChannelizer(new_rate)
+                        else:
+                            channelizer.reset()
+                        channel_buffers_fr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
+                        channel_buffers_hr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
                     elif req.get("cmd") == "reset_peak_rssi":
                         peak_burst_rssi = -100.0
                         interval_peak_burst_rssi = -100.0
@@ -2030,9 +2061,23 @@ def native_demod_worker(
 
             # 2. Receive sample bank from reader queue
             try:
-                raw_bank, bank_rssi = data_queue.get(timeout=0.05)
+                bank_item = data_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
+
+            if len(bank_item) >= 4:
+                raw_bank, bank_rssi, chunk_rate, chunk_center = (
+                    bank_item[0], bank_item[1], int(bank_item[2]), int(bank_item[3])
+                )
+                if chunk_rate != channelizer.input_rate:
+                    channelizer = ContinuousChannelizer(chunk_rate)
+                    channel_buffers_fr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
+                    channel_buffers_hr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
+                if chunk_center != current_center_freq:
+                    current_center_freq = chunk_center
+                    channelizer.reset()
+            else:
+                raw_bank, bank_rssi = bank_item[0], bank_item[1]
 
             total_samples_proc += len(raw_bank) // 2
             total_banks_proc += 1
@@ -2350,10 +2395,14 @@ def sdr_stream_reader_worker(
     metrics_queue: multiprocessing.Queue,
     shutdown_flag: multiprocessing.Event,
     bias_tee: bool = True,
+    chroma_port: int = 18099,
+    initial_meta: Optional[dict] = None,
 ):
     """
     Dedicated SDR reader process:
     Acquires sample chunks from rtl_sdr pipe, stdin, or rtl_tcp and fans them out.
+    Optionally publishes gated, non-blocking I/Q snapshots to ApexBOSChroma via ZMQ XPUB
+    (zero overhead when no Chroma subscriber is connected).
     """
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -2361,10 +2410,12 @@ def sdr_stream_reader_worker(
         pass
 
     stream = None
-    center_freq = initial_center_freq
+    center_freq = int(initial_center_freq)
+    cur_sample_rate = int(sample_rate)
     gain = tuner_gain
-    ppm = ppm_correction
-    bias = bias_tee
+    ppm = int(ppm_correction)
+    bias = bool(bias_tee)
+    base_chunk_sec = float(chunk_samples) / float(max(192000, cur_sample_rate))
     bytes_per_chunk = chunk_samples * 2
 
     total_iq_samples = 0
@@ -2372,15 +2423,36 @@ def sdr_stream_reader_worker(
     total_chunks = 0
     last_reader_report_time = time.time()
 
+    # Optional gated XPUB spectrum tap for ApexBOSChroma (0% load when unsubscribed)
+    chroma_ctx = None
+    chroma_xpub = None
+    chroma_subs = 0
+    last_chroma_send = 0.0
+    chroma_meta: Dict[str, Any] = dict(initial_meta or {})
+    if zmq is not None and chroma_port and int(chroma_port) > 0:
+        try:
+            chroma_ctx = zmq.Context()
+            chroma_xpub = chroma_ctx.socket(zmq.XPUB)
+            chroma_xpub.setsockopt(zmq.SNDHWM, 2)
+            chroma_xpub.setsockopt(zmq.LINGER, 0)
+            chroma_xpub.bind(f"tcp://127.0.0.1:{int(chroma_port)}")
+        except Exception:
+            if chroma_xpub is not None:
+                try:
+                    chroma_xpub.close(linger=0)
+                except Exception:
+                    pass
+            chroma_xpub = None
+
     try:
         if stream_kind == "pipe":
-            stream = SubprocessPipeSource(sdr_binary, center_freq, sample_rate, gain, ppm, device_num, bias_tee=bias)
+            stream = SubprocessPipeSource(sdr_binary, center_freq, cur_sample_rate, gain, ppm, device_num, bias_tee=bias)
         elif stream_kind == "stdin":
             stream = StandardInputStreamSource()
         elif stream_kind == "tcp":
-            stream = DirectRtlTcpSource(host_addr, tcp_port, center_freq, sample_rate, gain, ppm, bias_tee=bias)
+            stream = DirectRtlTcpSource(host_addr, tcp_port, center_freq, cur_sample_rate, gain, ppm, bias_tee=bias)
         elif stream_kind == "rtlsdr":
-            stream = DirectRtlSdrSource(center_freq, sample_rate, gain, ppm, device_num, bias_tee=bias)
+            stream = DirectRtlSdrSource(center_freq, cur_sample_rate, gain, ppm, device_num, bias_tee=bias)
     except Exception as e:
         metrics_queue.put({
             "type": "error",
@@ -2395,6 +2467,7 @@ def sdr_stream_reader_worker(
         "type": "reader_status",
         "stream": stream_kind,
         "center_freq": center_freq,
+        "sample_rate": cur_sample_rate,
         "gain_db": g_db,
         "gain": g_tenths,
         "ppm": ppm,
@@ -2409,23 +2482,60 @@ def sdr_stream_reader_worker(
                     cmd_obj = control_queue.get_nowait()
                     cmd = cmd_obj.get("cmd")
                     if cmd == "set_freq":
-                        center_freq = cmd_obj["freq"]
+                        center_freq = int(cmd_obj["freq"])
                         if stream:
                             stream.update_hardware_params(freq=center_freq)
+                    elif cmd == "set_rate":
+                        new_rate = int(cmd_obj["rate"])
+                        new_freq = int(cmd_obj["freq"]) if cmd_obj.get("freq") is not None else center_freq
+                        cur_sample_rate = new_rate
+                        center_freq = new_freq
+                        # Keep chunk duration proportional and aligned to 512 bytes & decimation factor
+                        dec_f = max(1, cur_sample_rate // 192000)
+                        target_samps = max(16384, int(round(cur_sample_rate * base_chunk_sec)))
+                        align = max(256, dec_f * 256)
+                        target_samps = ((target_samps + align - 1) // align) * align
+                        bytes_per_chunk = target_samps * 2
+                        if stream:
+                            stream.update_hardware_params(freq=center_freq, rate=cur_sample_rate)
                     elif cmd == "set_gain":
                         gain = cmd_obj["gain"]
+                        g_db, g_tenths = parse_gain_value(gain)
                         if stream:
                             stream.update_hardware_params(gain=gain)
                     elif cmd == "set_ppm":
-                        ppm = cmd_obj["ppm"]
+                        ppm = int(cmd_obj["ppm"])
                         if stream:
                             stream.update_hardware_params(ppm=ppm)
                     elif cmd == "set_bias_tee":
                         bias = bool(cmd_obj["bias_tee"])
                         if stream:
                             stream.update_hardware_params(bias_tee=bias)
+                    elif cmd == "set_meta":
+                        meta_upd = cmd_obj.get("meta")
+                        if isinstance(meta_upd, dict):
+                            chroma_meta.update(meta_upd)
                 except queue.Empty:
                     break
+
+            # Drain XPUB subscription events (non-blocking) to track active Chroma listeners
+            if chroma_xpub is not None:
+                prev_subs = chroma_subs
+                while True:
+                    try:
+                        sub_ev = chroma_xpub.recv(flags=zmq.NOBLOCK)
+                        if sub_ev:
+                            if sub_ev[0] == 1:
+                                chroma_subs += 1
+                            elif sub_ev[0] == 0:
+                                chroma_subs = max(0, chroma_subs - 1)
+                    except Exception:
+                        break
+                if chroma_subs != prev_subs:
+                    try:
+                        metrics_queue.put({"type": "chroma_sub_count", "count": chroma_subs})
+                    except Exception:
+                        pass
 
             raw_chunk = stream.read_exact_bytes(bytes_per_chunk)
             if not raw_chunk or len(raw_chunk) < bytes_per_chunk:
@@ -2439,7 +2549,8 @@ def sdr_stream_reader_worker(
 
             bank_rssi = compute_signal_power_dbfs(raw_chunk)
 
-            # Fan out to worker queues with automatic backlog drain
+            # Fan out to worker queues with automatic backlog drain (tagged with rate & center_freq)
+            tagged_bank = (raw_chunk, bank_rssi, cur_sample_rate, center_freq)
             for q in worker_queues:
                 try:
                     if q.qsize() > 6:
@@ -2452,7 +2563,7 @@ def sdr_stream_reader_worker(
                     pass
 
                 try:
-                    q.put_nowait((raw_chunk, bank_rssi))
+                    q.put_nowait(tagged_bank)
                 except queue.Full:
                     # On platforms like macOS where qsize() raises NotImplementedError, or under sudden burst saturation,
                     # drain oldest banks to ensure pipeline remains strictly real-time
@@ -2462,11 +2573,36 @@ def sdr_stream_reader_worker(
                     except queue.Empty:
                         pass
                     try:
-                        q.put_nowait((raw_chunk, bank_rssi))
+                        q.put_nowait(tagged_bank)
                     except queue.Full:
                         pass
 
             now_t = time.time()
+
+            # Gated non-blocking Chroma IQ snapshot tap (~26 Hz max, strictly skipped if no subscriber)
+            if chroma_xpub is not None and chroma_subs > 0 and (now_t - last_chroma_send) >= 0.036:
+                last_chroma_send = now_t
+                try:
+                    # Send up to 65536 IQ samples (131072 bytes) for low-variance multi-segment Welch FFT
+                    iq_slice = raw_chunk[-131072:] if chunk_len > 131072 else raw_chunk
+                    tap_meta = dict(chroma_meta) if chroma_meta else {}
+                    # Authoritative reader-thread hardware state always wins over cached meta
+                    tap_meta.update({
+                        "center_freq": center_freq,
+                        "sample_rate": cur_sample_rate,
+                        "ppm": ppm,
+                        "gain_db": g_db,
+                        "bias_tee": bias,
+                        "bank_rssi": round(float(bank_rssi), 2),
+                        "timestamp": now_t,
+                    })
+                    chroma_xpub.send_multipart(
+                        [b"IQ", json.dumps(tap_meta).encode("utf-8"), iq_slice],
+                        flags=zmq.NOBLOCK,
+                    )
+                except Exception:
+                    pass
+
             if now_t - last_reader_report_time >= 0.5:
                 metrics_queue.put({
                     "type": "reader_report",
@@ -2479,6 +2615,16 @@ def sdr_stream_reader_worker(
     except KeyboardInterrupt:
         pass
     finally:
+        if chroma_xpub is not None:
+            try:
+                chroma_xpub.close(linger=0)
+            except Exception:
+                pass
+        if chroma_ctx is not None:
+            try:
+                chroma_ctx.term()
+            except Exception:
+                pass
         if stream:
             stream.close()
 
@@ -3020,6 +3166,14 @@ class ApexBOSGrabberApplication:
                 self.sample_rate = int(math.ceil(self.sample_rate / 192000.0) * 192000)
 
         self.center_freq = calculate_optimal_center_freq(self.channels, max_bandwidth=self.sample_rate)
+        self.base_sample_rate = int(self.sample_rate)
+        self.chroma_port = int(getattr(cli_args, "chroma_port", DEFAULT_CHROMA_IQ_PORT) or 0)
+        self.ctrl_port = int(getattr(cli_args, "ctrl_port", DEFAULT_CHROMA_CTRL_PORT) or 0)
+        self.wideband_active = False
+        self.chroma_sub_count = 0
+        self.chroma_last_disconnect_ts = 0.0
+        self._ctrl_zmq_ctx = None
+        self._ctrl_zmq_rep = None
 
         # Channels, base channel tracking & inactivity timeout
         self.channel_timeout = float(getattr(cli_args, "channel_timeout", 300.0))
@@ -3712,7 +3866,16 @@ class ApexBOSGrabberApplication:
         return dropped
 
     def _update_pipeline_channels(self):
-        new_freq = calculate_optimal_center_freq(self.channels, max_bandwidth=self.sample_rate)
+        if self.wideband_active:
+            # Keep wideband center if all monitored channels fit safely inside passband
+            wb_center = 221000000
+            half_safe = int(self.sample_rate * 0.46)
+            if self.channels and all(abs(itc_channel_frequency(c) - wb_center) <= half_safe for c in self.channels):
+                new_freq = wb_center
+            else:
+                new_freq = calculate_optimal_center_freq(self.channels, max_bandwidth=self.sample_rate)
+        else:
+            new_freq = calculate_optimal_center_freq(self.channels, max_bandwidth=self.sample_rate)
         if new_freq != self.center_freq:
             self.center_freq = new_freq
             self.reader_ctrl_queue.put({"cmd": "set_freq", "freq": self.center_freq})
@@ -3724,6 +3887,213 @@ class ApexBOSGrabberApplication:
                 "channels": b,
                 "center_freq": self.center_freq,
             })
+        self._push_chroma_meta()
+
+    def _chroma_meta_snapshot(self) -> Dict[str, Any]:
+        return {
+            "channels": sorted(self.channels),
+            "locked_channels": sorted(self.locked_channels),
+            "worker_ports": list(self.zmq_ports),
+            "wideband": bool(self.wideband_active),
+            "base_sample_rate": int(self.base_sample_rate),
+            "auto_ppm": bool(getattr(self, "auto_ppm_enabled", True)),
+            "auto_tune": bool(getattr(self, "auto_tune_enabled", False)),
+            "peak_rssi": round(float(getattr(self, "peak_rssi", -100.0)), 2),
+        }
+
+    def _push_chroma_meta(self):
+        try:
+            self.reader_ctrl_queue.put({"cmd": "set_meta", "meta": self._chroma_meta_snapshot()})
+        except Exception:
+            pass
+
+    def get_chroma_state_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "version": VERSION,
+            "stream_kind": self.stream_kind,
+            "center_freq": int(self.center_freq),
+            "sample_rate": int(self.sample_rate),
+            "base_sample_rate": int(self.base_sample_rate),
+            "wideband": bool(self.wideband_active),
+            "wideband_rate": int(CHROMA_WIDEBAND_RATE),
+            "ppm": int(self.ppm),
+            "gain_db": float(self.gain_db),
+            "gain_tenths": int(self.gain_tenths),
+            "bias_tee": bool(self.bias_tee),
+            "auto_ppm": bool(getattr(self, "auto_ppm_enabled", True)),
+            "auto_tune": bool(getattr(self, "auto_tune_enabled", False)),
+            "channels": sorted(self.channels),
+            "locked_channels": sorted(self.locked_channels),
+            "worker_ports": list(self.zmq_ports),
+            "chroma_port": int(self.chroma_port),
+            "peak_rssi": round(float(getattr(self, "peak_rssi", -100.0)), 2),
+            "total_packets": int(getattr(self, "total_packets", 0)),
+        }
+
+    def set_wideband_mode(self, enabled: bool) -> Tuple[bool, str]:
+        """Dynamically expands Grabber sample rate to 2.304 MS/s (Ch 97-176) for Chroma, or reverts to minimal rate."""
+        enabled = bool(enabled)
+        if enabled:
+            target_rate = max(int(self.base_sample_rate), int(CHROMA_WIDEBAND_RATE))
+            wb_center = 221000000
+            half_safe = int(target_rate * 0.46)
+            if self.channels and all(abs(itc_channel_frequency(c) - wb_center) <= half_safe for c in self.channels):
+                target_center = wb_center
+            else:
+                target_center = calculate_optimal_center_freq(self.channels, max_bandwidth=target_rate)
+            self.wideband_active = True
+        else:
+            # Compute minimum safe rate for active channels
+            if self.channels:
+                freqs = [itc_channel_frequency(c) for c in self.channels]
+                span = max(freqs) - min(freqs)
+                needed = int(math.ceil((span + 50000) / 192000.0) * 192000)
+                min_hw = 960000 if self.stream_kind in ("pipe", "tcp", "rtlsdr") else DEFAULT_SAMPLE_RATE
+                target_rate = max(int(self.base_sample_rate), needed, min_hw)
+            else:
+                target_rate = int(self.base_sample_rate)
+            target_center = calculate_optimal_center_freq(self.channels, max_bandwidth=target_rate)
+            self.wideband_active = False
+
+        changed = (target_rate != int(self.sample_rate)) or (target_center != int(self.center_freq))
+        self.sample_rate = int(target_rate)
+        self.center_freq = int(target_center)
+
+        if changed:
+            self.reader_ctrl_queue.put({
+                "cmd": "set_rate",
+                "rate": self.sample_rate,
+                "freq": self.center_freq,
+            })
+            for q in self.worker_ctrl_queues:
+                q.put({
+                    "cmd": "set_rate",
+                    "rate": self.sample_rate,
+                    "center_freq": self.center_freq,
+                })
+            mode_lbl = "WIDEBAND (2.304 MS/s)" if self.wideband_active else f"NATIVE ({self.sample_rate / 1e6:.3f} MS/s)"
+            self.status_banner = f"Chroma BW -> {mode_lbl} @ {self.center_freq / 1e6:.4f} MHz"
+
+        self._push_chroma_meta()
+        return True, f"Sample rate={self.sample_rate} S/s, center={self.center_freq} Hz"
+
+    def handle_chroma_control_request(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        """Processes a JSON control request from ApexBOSChroma (runs on Grabber main loop)."""
+        if not isinstance(req, dict):
+            return {"ok": False, "error": "Invalid request payload"}
+        cmd = str(req.get("cmd") or "").strip().lower()
+        try:
+            if cmd == "get_state" or cmd == "ping":
+                return self.get_chroma_state_dict()
+            elif cmd == "set_ppm":
+                new_ppm = max(-150, min(150, int(req["ppm"])))
+                self.ppm = new_ppm
+                self.base_ppm = new_ppm
+                self.reader_ctrl_queue.put({"cmd": "set_ppm", "ppm": self.ppm})
+                self.status_banner = f"Chroma set PPM -> {self.ppm:+d}"
+                self._push_chroma_meta()
+                return self.get_chroma_state_dict()
+            elif cmd == "set_gain":
+                g_val = req["gain"]
+                g_db, g_tenths = parse_gain_value(g_val)
+                self.gain_db, self.gain_tenths = g_db, g_tenths
+                self.base_gain_tenths = g_tenths
+                self.reader_ctrl_queue.put({"cmd": "set_gain", "gain": g_val})
+                g_lbl = f"{self.gain_db:.1f} dB" if self.gain_tenths > 0 else "AGC"
+                self.status_banner = f"Chroma set Gain -> {g_lbl}"
+                self._push_chroma_meta()
+                return self.get_chroma_state_dict()
+            elif cmd == "set_bias_tee":
+                self.bias_tee = bool(req["bias_tee"])
+                self.reader_ctrl_queue.put({"cmd": "set_bias_tee", "bias_tee": self.bias_tee})
+                self.status_banner = f"Chroma set Bias-T -> {'ON' if self.bias_tee else 'OFF'}"
+                self._push_chroma_meta()
+                return self.get_chroma_state_dict()
+            elif cmd == "set_auto_ppm":
+                self.auto_ppm_enabled = bool(req["enabled"])
+                self.status_banner = f"Chroma set Auto-PPM -> {'ON' if self.auto_ppm_enabled else 'OFF'}"
+                self._push_chroma_meta()
+                return self.get_chroma_state_dict()
+            elif cmd == "set_auto_tune":
+                self.auto_tune_enabled = bool(req["enabled"])
+                self.status_banner = f"Chroma set Auto-Tune -> {'ON' if self.auto_tune_enabled else 'OFF'}"
+                self._push_chroma_meta()
+                return self.get_chroma_state_dict()
+            elif cmd == "set_wideband":
+                self.set_wideband_mode(bool(req.get("enabled", True)))
+                return self.get_chroma_state_dict()
+            elif cmd == "add_channel":
+                ch = int(req["channel"])
+                if not (1 <= ch <= 255):
+                    return {"ok": False, "error": f"Invalid channel {ch}"}
+                if ch not in self.channels:
+                    self.channels.append(ch)
+                    self.channels.sort()
+                    self.channel_last_seen[ch] = time.time()
+                if req.get("locked"):
+                    self.locked_channels.add(ch)
+                self._update_pipeline_channels()
+                self.status_banner = f"Chroma added channel {ch}"
+                return self.get_chroma_state_dict()
+            elif cmd == "remove_channel":
+                ch = int(req["channel"])
+                if ch in self.channels:
+                    if len(self.channels) <= 1:
+                        return {"ok": False, "error": "Cannot remove last remaining channel"}
+                    self.channels.remove(ch)
+                    self.locked_channels.discard(ch)
+                    self.channel_last_seen.pop(ch, None)
+                    self._update_pipeline_channels()
+                    self.status_banner = f"Chroma removed channel {ch}"
+                return self.get_chroma_state_dict()
+            else:
+                return {"ok": False, "error": f"Unknown command: {cmd}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _start_chroma_ctrl_socket(self):
+        if zmq is None or not self.ctrl_port or self.ctrl_port <= 0:
+            return
+        try:
+            self._ctrl_zmq_ctx = zmq.Context()
+            self._ctrl_zmq_rep = self._ctrl_zmq_ctx.socket(zmq.REP)
+            self._ctrl_zmq_rep.setsockopt(zmq.LINGER, 0)
+            self._ctrl_zmq_rep.bind(f"tcp://127.0.0.1:{int(self.ctrl_port)}")
+        except Exception:
+            self._stop_chroma_ctrl_socket()
+
+    def _poll_chroma_ctrl_socket(self):
+        if self._ctrl_zmq_rep is None:
+            return
+        for _ in range(8):
+            try:
+                raw_req = self._ctrl_zmq_rep.recv(flags=zmq.NOBLOCK)
+            except Exception:
+                break
+            try:
+                req = json.loads(raw_req.decode("utf-8"))
+                resp = self.handle_chroma_control_request(req)
+            except Exception as e:
+                resp = {"ok": False, "error": str(e)}
+            try:
+                self._ctrl_zmq_rep.send(json.dumps(resp).encode("utf-8"), flags=zmq.NOBLOCK)
+            except Exception:
+                break
+
+    def _stop_chroma_ctrl_socket(self):
+        if self._ctrl_zmq_rep is not None:
+            try:
+                self._ctrl_zmq_rep.close(linger=0)
+            except Exception:
+                pass
+            self._ctrl_zmq_rep = None
+        if self._ctrl_zmq_ctx is not None:
+            try:
+                self._ctrl_zmq_ctx.term()
+            except Exception:
+                pass
+            self._ctrl_zmq_ctx = None
 
     def process_metrics(self):
         """Processes all pending IPC messages from worker and reader queues."""
@@ -3826,6 +4196,15 @@ class ApexBOSGrabberApplication:
                     g_label = f"{m.get('gain_db', 0):.1f} dB" if m.get('gain_db', 0) > 0 else "AGC"
                     b_label = "Bias:ON" if m.get('bias_tee', False) else "Bias:OFF"
                     self.status_banner = f"SDR {m.get('stream').upper()} active @ {m.get('center_freq')/1e6:.4f} MHz ({g_label}, {b_label})"
+
+                elif m_type == "chroma_sub_count":
+                    cnt = int(m.get("count", 0))
+                    prev_cnt = self.chroma_sub_count
+                    self.chroma_sub_count = cnt
+                    if cnt == 0 and prev_cnt > 0:
+                        self.chroma_last_disconnect_ts = time.time()
+                    elif cnt > 0:
+                        self.chroma_last_disconnect_ts = 0.0
             except queue.Empty:
                 break
 
@@ -3973,10 +4352,15 @@ class ApexBOSGrabberApplication:
                 self.metrics_queue,
                 self.shutdown_flag,
                 self.bias_tee,
+                self.chroma_port,
+                self._chroma_meta_snapshot(),
             ),
             daemon=True,
         )
         reader_proc.start()
+
+        # 2b. Start non-blocking Chroma Control ZMQ REP socket
+        self._start_chroma_ctrl_socket()
 
         # 3. Start Command Listener Thread
         self.cmd_thread = TerminalCommandListener(self.handle_terminal_input, self.shutdown_flag, app=self)
@@ -3986,8 +4370,18 @@ class ApexBOSGrabberApplication:
         try:
             while not self.shutdown_flag.is_set():
                 self.process_metrics()
+                self._poll_chroma_ctrl_socket()
 
                 now = time.time()
+                # Auto-revert dynamic wideband mode 8s after last Chroma client disconnects
+                if (
+                    self.wideband_active
+                    and self.chroma_sub_count == 0
+                    and self.chroma_last_disconnect_ts > 0.0
+                    and (now - self.chroma_last_disconnect_ts) >= 8.0
+                ):
+                    self.chroma_last_disconnect_ts = 0.0
+                    self.set_wideband_mode(False)
                 while self.packet_timestamps and now - self.packet_timestamps[0] > 60:
                     self.packet_timestamps.popleft()
                 for q in self.worker_packet_timestamps:
@@ -4030,6 +4424,7 @@ class ApexBOSGrabberApplication:
             pass
         finally:
             self.shutdown_flag.set()
+            self._stop_chroma_ctrl_socket()
             time.sleep(0.2)
             reader_proc.terminate()
             for p in workers:
@@ -4717,6 +5112,8 @@ def build_cli_parser():
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes (overrides --procs port count)")
     parser.add_argument("--zmq-port", type=int, default=None, help="Base ZMQ PUB port (default: 18000 + first channel, e.g. 18071)")
     parser.add_argument("--udp-port", type=int, default=None, help="Base UDP port (default: same as ZMQ port)")
+    parser.add_argument("--chroma-port", type=int, default=DEFAULT_CHROMA_IQ_PORT, help=f"Local ZMQ XPUB IQ tap port for ApexBOSChroma (default: {DEFAULT_CHROMA_IQ_PORT}, 0 to disable)")
+    parser.add_argument("--ctrl-port", type=int, default=DEFAULT_CHROMA_CTRL_PORT, help=f"Local ZMQ REP control port for ApexBOSChroma (default: {DEFAULT_CHROMA_CTRL_PORT}, 0 to disable)")
 
     # Display & Compatibility
     parser.add_argument(

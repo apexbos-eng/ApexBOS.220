@@ -14,7 +14,7 @@ A Pygame-native dashboard for managing all applications in the ApexBOS suite:
       * DispatcherEngine Host
       * Pygame Railroad Viewer
       * ApexBOSBanc Cloud Server
-      * Utilities: ApexBOSSpy, PackFIG
+      * Utilities: ApexBOSChroma, ApexBOSSpy, PackFIG
   - Setup Wizard re-configuration launcher (setup_wizard.py)
   - Native multi-window terminal launcher for Windows, Linux, and macOS.
 """
@@ -356,6 +356,7 @@ SUBSYSTEM_SCRIPTS = {
     "viewer": "View_ApexBOS.220.py",
     "banc": "ApexBOSBanc.py",
     "creator": "ApexBOSCreator.py",
+    "chroma": "ApexBOSChroma.py",
     "spy": "ApexBOSSpy.py",
     "packfig": "PackFIG.py",
     "scanner": "ApexBOSScanner.py",
@@ -415,7 +416,7 @@ class ProcessManager:
                 continue
 
             # Check single subsystems
-            for skey in ("grabber", "flux", "banc", "creator", "spy", "packfig", "scanner"):
+            for skey in ("grabber", "flux", "banc", "creator", "chroma", "spy", "packfig", "scanner"):
                 script = SUBSYSTEM_SCRIPTS.get(skey)
                 if script and script.lower() in cmd_low and skey not in live:
                     live[skey] = int(p["pid"])
@@ -1010,6 +1011,25 @@ class ProcessManager:
         self.procs["creator"] = p
         self.set_toast(f"Launched ApexBOSCreator Studio ({os.path.basename(resolved_layout)}).")
 
+    def start_chroma(self):
+        """Starts ApexBOSChroma RF Spectrum Analyzer & Waterfall in a graphical window."""
+        if self.is_running("chroma"):
+            self.set_toast("ApexBOSChroma is already running.")
+            return
+        cmd = [
+            sys.executable,
+            os.path.join(self.work_dir, "ApexBOSChroma.py"),
+            "--config", self.config_path,
+        ]
+        child_env = os.environ.copy()
+        child_env.pop("SDL_WINDOWID", None)
+        child_env.pop("SDL_VIDEO_WINDOW_POS", None)
+        p = subprocess.Popen(cmd, cwd=self.work_dir, env=child_env, stdin=subprocess.DEVNULL)
+        self.procs["chroma"] = p
+        with self._lock:
+            self._starting_until["chroma"] = time.time() + 2.5
+        self.set_toast("Launched ApexBOSChroma RF Spectrum Analyzer.")
+
     def start_spy(self):
         """Starts ApexBOSSpy connected to all Grabber ZMQ ports with default parsers."""
         grabber_cfg = self.config.get("grabber", {})
@@ -1185,6 +1205,9 @@ class ProcessManager:
             if bias_tee:
                 args.append("--bias-tee")
             return subprocess.list2cmdline(args)
+
+        if key_low == "chroma":
+            return subprocess.list2cmdline([py_exe, "ApexBOSChroma.py", "--config", "config.json"])
 
         if key_low == "spy":
             grabber_cfg = self.config.get("grabber", {})
@@ -1680,28 +1703,33 @@ class ApexBOSLauncherApp:
         self.screen.blit(ut_lbl, (25, y))
         y += 22
 
+        chroma_running = self.mgr.is_running("chroma")
         ut_btns = [
             ("scanner", "Scan 220 MHz Channels", self._open_scanner_prompt),
+            ("chroma", "Chroma RF (RUNNING)" if chroma_running else "Chroma RF Spectrum", self.mgr.start_chroma),
             ("spy", "ApexBOSSpy Inspector", self.mgr.start_spy),
             ("packfig", "PackFIG Binary Decoder", self.mgr.start_packfig),
             ("wizard", "Re-Run Setup Wizard", self._run_wizard_external),
-            ("reload", "Reload config.json", self.mgr.reload_config),
         ]
         ux = 25
         ubtn_w = (self.width - 50 - 4 * 10) // 5
         for ukey, utext, ufn in ut_btns:
             urect = pygame.Rect(ux, y, ubtn_w, 32)
-            pygame.draw.rect(self.screen, COLOR_BTN_BG, urect, border_radius=4)
-            pygame.draw.rect(self.screen, COLOR_BORDER, urect, 1, border_radius=4)
-            ulbl = self.font_sm.render(utext, True, COLOR_TEXT)
+            ubg = (22, 54, 46) if (ukey == "chroma" and chroma_running) else COLOR_BTN_BG
+            ubd = COLOR_GREEN if (ukey == "chroma" and chroma_running) else ((70, 210, 240) if ukey == "chroma" else COLOR_BORDER)
+            pygame.draw.rect(self.screen, ubg, urect, border_radius=4)
+            pygame.draw.rect(self.screen, ubd, urect, 1, border_radius=4)
+            utxt_col = COLOR_GREEN if (ukey == "chroma" and chroma_running) else ((90, 225, 250) if ukey == "chroma" else COLOR_TEXT)
+            ulbl = self.font_sm.render(utext, True, utxt_col)
             if ulbl.get_width() > urect.width - 6:
-                ulbl = self.font_tiny.render(utext, True, COLOR_TEXT)
+                ulbl = self.font_tiny.render(utext, True, utxt_col)
             self.screen.blit(ulbl, ulbl.get_rect(center=urect.center))
             self.buttons[ukey] = ButtonEntry(urect, ufn, cmd_key=ukey, label=utext)
             ux += ubtn_w + 10
 
         y += 38
         maint_btns = [
+            ("reload", "Reload config.json", self.mgr.reload_config, COLOR_BTN_BG),
             ("update", "Update (ZIP)", self._run_update_external, COLOR_BTN_BG),
             ("uninstall", "Uninstall", self._run_uninstall_external, COLOR_STOP_BG),
         ]
@@ -1713,6 +1741,8 @@ class ApexBOSLauncherApp:
             pygame.draw.rect(self.screen, mbg, mrect, border_radius=4)
             pygame.draw.rect(self.screen, COLOR_BORDER, mrect, 1, border_radius=4)
             mlbl = self.font_sm.render(mtext, True, COLOR_TEXT)
+            if mlbl.get_width() > mrect.width - 6:
+                mlbl = self.font_tiny.render(mtext, True, COLOR_TEXT)
             self.screen.blit(mlbl, mlbl.get_rect(center=mrect.center))
             self.buttons[mkey] = ButtonEntry(mrect, mfn, cmd_key=mkey, label=mtext)
             mx += ubtn_w + 10

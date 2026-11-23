@@ -39,8 +39,8 @@ INSTALL_RECORD_NAME = "install_record.json"
 # Scripts whose processes belong to an ApexBOS installation.
 APEXBOS_SCRIPTS = (
     "ApexBOSGrabber.py", "ApexBOSFlux.py", "ApexBOS.220.py", "View_ApexBOS.220.py",
-    "ApexBOSCreator.py", "ApexBOSBanc.py", "ApexBOSSpy.py", "PackFIG.py",
-    "ApexBOSScanner.py",
+    "ApexBOSCreator.py", "ApexBOSBanc.py", "ApexBOSChroma.py", "ApexBOSSpy.py",
+    "PackFIG.py", "ApexBOSScanner.py",
 )
 
 # Files that belong to the user: never overwritten by an update, only created if missing.
