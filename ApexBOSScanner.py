@@ -1578,6 +1578,12 @@ def build_scanner_cli_parser() -> argparse.ArgumentParser:
         help="Automatically update config.json and grabber_config.json with discovered channels and PPM",
     )
     parser.add_argument(
+        "--no-update-prompt",
+        action="store_true",
+        default=False,
+        help="Skip interactive config.json update prompt at scan completion (used when invoked by Setup Wizard)",
+    )
+    parser.add_argument(
         "--config",
         default=None,
         help="Path to unified config.json (default: config.json in project root)",
@@ -1611,7 +1617,7 @@ def main():
     if scanner.scan_results:
         cfg_file = args.config or os.path.join(PROJECT_ROOT, "config.json")
         do_update = args.update_config
-        if not do_update and sys.stdin.isatty() and not args.quiet:
+        if not do_update and not args.no_update_prompt and sys.stdin.isatty() and not args.quiet:
             try:
                 chans_disp = ", ".join(str(c) for c in sorted(scanner.scan_results.keys()))
                 prompt_txt = (
@@ -1624,6 +1630,8 @@ def main():
                 do_update = user_ans in ("y", "yes")
             except Exception:
                 do_update = False
+        elif args.no_update_prompt and not args.quiet:
+            print(f"\n{COLOR_GREEN}[✓] Scan complete! Results have been sent to the ApexBOS Setup Wizard.{COLOR_RESET}\n")
 
         if do_update:
             try:
@@ -1638,7 +1646,13 @@ def main():
                     print(f"\n{COLOR_YELLOW}[!] {msg}{COLOR_RESET}\n")
             except Exception as e:
                 print(f"\n{COLOR_RED}[!] Failed to update configuration: {e}{COLOR_RESET}\n", file=sys.stderr)
+    elif args.no_update_prompt and not args.quiet:
+        print(f"\n{COLOR_YELLOW}[*] Scan finished with no active channels detected.{COLOR_RESET}\n")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{COLOR_YELLOW}[*] Scanner stopped by user.{COLOR_RESET}")
+        sys.exit(0)

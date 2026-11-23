@@ -1478,8 +1478,10 @@ class PygameSetupWizard:
         self.scan_progress = ""
         self.scan_summary = ""
         self.scan_active_channels: List[int] = []
+        self.scan_locked_channels: List[int] = []
         self.scan_recommended_ppm: int = 0
         self.scan_recommended_gain: float = 20.7
+        self._scan_proc = None
 
     # ----- layout ---------------------------------------------------------
     def _rect(self, name: str):
@@ -2326,88 +2328,259 @@ class PygameSetupWizard:
         ports = config_loader.generate_default_ports(clean_chans, self.process_count)
         self.fields["grabber_ports"] = ", ".join(str(p) for p in ports)
 
-    def _trigger_channel_scan(self):
-        """Spawns background channel scan thread with 10s dwell time."""
+    def _apply_scan_results_payload(self, data: Dict[str, Any]):
+        """Applies a scan results dict (from apexbos_scan_results.json or scanner object) to wizard fields."""
+        active_ch = sorted(int(c) for c in (data.get("active_channels") or []))
+        if active_ch:
+            locked_set = {int(c) for c in (data.get("locked_channels") or [])} & set(active_ch)
+            for ch_k, info in (data.get("channel_details") or {}).items():
+                try:
+                    if int(info.get("crc_5s", 0) or 0) > 0:
+                        ch_num = int(info.get("channel", ch_k))
+                        if ch_num in active_ch:
+                            locked_set.add(ch_num)
+                except (ValueError, TypeError):
+                    pass
+            locked_ch = sorted(locked_set)
+            chans_tokens = [f"{c}." if c in locked_set else str(c) for c in active_ch]
+            chans_tokens_str = ", ".join(chans_tokens)
+
+            rec_ppm = int(data.get("recommended_ppm", 0) or 0)
+            rec_gain_val = data.get("recommended_gain")
+            if rec_gain_val is None:
+                ch_dets = data.get("channel_details") or {}
+                peak_rssi = max((float(r.get("avg_rssi", -20.0)) for r in ch_dets.values()), default=-20.0)
+                rec_gain = 16.6 if peak_rssi > -6.0 else (20.7 if peak_rssi > -12.0 else 22.9)
+            else:
+                rec_gain = float(rec_gain_val)
+
+            self.scan_active_channels = active_ch
+            self.scan_locked_channels = locked_ch
+            self.scan_recommended_ppm = rec_ppm
+            self.scan_recommended_gain = rec_gain
+
+            # Offer scan results as default configuration for the Grabber
+            self.fields["grabber_chans"] = chans_tokens_str
+            self.fields["sdr_ppm"] = str(rec_ppm)
+            self.fields["sdr_gain"] = f"{rec_gain:.1f}"
+            self.process_count = max(1, min(len(active_ch), self.max_allowed_procs))
+            self.custom_ports_edited = False
+            self._sync_ports_for_procs()
+            locked_desc = f"{len(locked_ch)} locked" if locked_ch else "0 locked"
+            self.scan_summary = f"Detected {len(active_ch)} channels ({chans_tokens_str}, {locked_desc}), PPM {rec_ppm:+d}, Gain {rec_gain:.1f} dB (applied)."
+            self.status_msg = f"Scan complete: Applied {len(active_ch)} channels ({len(locked_ch)} locked) and PPM {rec_ppm:+d} to Grabber."
+        else:
+            self.scan_active_channels = []
+            self.scan_locked_channels = []
+            self.scan_summary = "Scan complete: No active channels detected (kept existing config)."
+            self.status_msg = "Scan complete: No channels detected. Verify antenna/SDR."
+
+    def _trigger_channel_scan(self, force_terminal: bool = False):
+        """
+        Launches ApexBOSScanner in its own native terminal window so the operator sees live
+        Phase 0/1/2 progress and interactive controls, then automatically imports the discovered
+        channels, locks, PPM, and gain into the Setup Wizard once the scan finishes.
+        """
         if getattr(self, "scanning", False):
             return
         self.scanning = True
-        self.scan_progress = "Initializing SDR scan..."
+        self.scan_progress = "Launching scanner terminal..."
         self.scan_summary = ""
+        self.scan_active_channels = []
+        self.scan_locked_channels = []
 
-        def _worker():
-            try:
-                import ApexBOSScanner
-                sdr_dev = self.device_index
-                ppm_raw = self.fields.get("sdr_ppm", "0").strip()
-                base_ppm = int(ppm_raw) if ppm_raw.lstrip("-").isdigit() else 0
-                gain_raw = self.fields.get("sdr_gain", "auto").strip()
-                gain_val = float(gain_raw) if gain_raw.replace('.', '', 1).isdigit() else 20.7
-                use_mock_scan = ("--mock" in sys.argv or os.environ.get("APEXBOS_MOCK_SCAN") == "1")
+        sdr_dev = self.device_index
+        ppm_raw = self.fields.get("sdr_ppm", "0").strip()
+        base_ppm = int(ppm_raw) if ppm_raw.lstrip("-").isdigit() else 0
+        gain_raw = self.fields.get("sdr_gain", "auto").strip()
+        gain_val = float(gain_raw) if gain_raw.replace('.', '', 1).isdigit() else 20.7
+        bias_tee = bool((self.existing or {}).get("grabber", {}).get("bias_tee", 1))
+        use_mock_scan = ("--mock" in sys.argv or os.environ.get("APEXBOS_MOCK_SCAN") == "1")
 
-                s_ch = int(_arg_value("--start-ch") or 97)
-                e_ch = int(_arg_value("--end-ch") or 176)
-                dwell_arg = _arg_value("--dwell") or _arg_value("-d")
-                dwell_val = float(dwell_arg) if dwell_arg else 10.0
-                inband_arg = _arg_value("--inband-duration")
-                inband_val = float(inband_arg) if inband_arg else 10.0
-                opt_arg = _arg_value("--opt-duration")
-                opt_val = float(opt_arg) if opt_arg else 5.0
+        s_ch = int(_arg_value("--start-ch") or 97)
+        e_ch = int(_arg_value("--end-ch") or 176)
+        dwell_arg = _arg_value("--dwell") or _arg_value("-d")
+        dwell_val = float(dwell_arg) if dwell_arg else 10.0
+        inband_arg = _arg_value("--inband-duration")
+        inband_val = float(inband_arg) if inband_arg else 10.0
+        opt_arg = _arg_value("--opt-duration")
+        opt_val = float(opt_arg) if opt_arg else 5.0
 
-                def _prog_cb(msg):
-                    self.scan_progress = msg
+        is_headless_mock = (
+            use_mock_scan
+            and not force_terminal
+            and os.environ.get("SDL_VIDEODRIVER", "").lower() == "dummy"
+        )
 
-                scanner = ApexBOSScanner.ApexBOSChannelScanner(
-                    start_ch=s_ch,
-                    end_ch=e_ch,
-                    base_ppm=base_ppm,
-                    gain=gain_val,
-                    device_idx=sdr_dev,
-                    bias_tee=True,
-                    probe_duration_sec=dwell_val,
-                    inband_duration=inband_val,
-                    opt_duration_sec=opt_val,
-                    use_mock=use_mock_scan,
-                    verbose=True,
-                    progress_cb=_prog_cb,
-                )
-                scanner.run()
+        if is_headless_mock:
+            def _mock_worker():
+                try:
+                    import ApexBOSScanner
 
-                if scanner.active_channels:
-                    sorted_ch = sorted(scanner.active_channels)
+                    def _prog_cb(msg):
+                        self.scan_progress = msg
+
+                    scanner = ApexBOSScanner.ApexBOSChannelScanner(
+                        start_ch=s_ch,
+                        end_ch=e_ch,
+                        base_ppm=base_ppm,
+                        gain=gain_val,
+                        device_idx=sdr_dev,
+                        bias_tee=bias_tee,
+                        probe_duration_sec=dwell_val,
+                        inband_duration=inband_val,
+                        opt_duration_sec=opt_val,
+                        use_mock=True,
+                        verbose=True,
+                        progress_cb=_prog_cb,
+                    )
+                    scanner.run()
+
+                    sorted_ch = sorted(scanner.active_channels) if scanner.active_channels else []
                     locked_set = set(getattr(scanner, "crc_verified_channels", set())) & set(sorted_ch)
                     for ch, info in scanner.scan_results.items():
                         if info.get("crc_5s", 0) > 0:
                             locked_set.add(ch)
-                    locked_ch = sorted(locked_set)
-                    chans_tokens = [f"{c}." if c in locked_set else str(c) for c in sorted_ch]
-                    chans_tokens_str = ", ".join(chans_tokens)
-                    self.scan_active_channels = sorted_ch
-                    self.scan_locked_channels = locked_ch
-                    self.scan_recommended_ppm = scanner.recommended_ppm
                     peak_rssi = max((r["avg_rssi"] for r in scanner.scan_results.values()), default=-20.0)
                     rec_gain = 16.6 if peak_rssi > -6.0 else (20.7 if peak_rssi > -12.0 else 22.9)
-                    self.scan_recommended_gain = rec_gain
+                    self._apply_scan_results_payload({
+                        "active_channels": sorted_ch,
+                        "locked_channels": sorted(locked_set),
+                        "recommended_ppm": scanner.recommended_ppm,
+                        "recommended_gain": rec_gain,
+                        "channel_details": {str(k): v for k, v in scanner.scan_results.items()},
+                    })
+                except Exception as e:
+                    self.scan_summary = f"Scan failed: {e}"
+                    self.status_msg = f"Scan error: {str(e)[:80]}"
+                finally:
+                    self.scanning = False
 
-                    # Offer scan results as default configuration for the Grabber
-                    self.fields["grabber_chans"] = chans_tokens_str
-                    self.fields["sdr_ppm"] = str(scanner.recommended_ppm)
-                    self.fields["sdr_gain"] = f"{rec_gain:.1f}"
-                    self.process_count = min(len(sorted_ch), self.max_allowed_procs)
-                    self.custom_ports_edited = False
-                    self._sync_ports_for_procs()
-                    locked_desc = f"{len(locked_ch)} locked" if locked_ch else "0 locked"
-                    self.scan_summary = f"Detected {len(sorted_ch)} channels ({chans_tokens_str}, {locked_desc}), PPM {scanner.recommended_ppm:+d}, Gain {rec_gain:.1f} dB (applied)."
-                    self.status_msg = f"Scan complete: Applied {len(sorted_ch)} channels ({len(locked_ch)} locked) and PPM {scanner.recommended_ppm:+d} to Grabber."
-                else:
-                    self.scan_summary = "Scan complete: No active channels detected (kept existing config)."
-                    self.status_msg = "Scan complete: No channels detected. Verify antenna/SDR."
+            threading.Thread(target=_mock_worker, daemon=True).start()
+            return
+
+        # Interactive GUI mode: launch ApexBOSScanner.py in its own native terminal window
+        scan_out_dir = tempfile.mkdtemp(prefix="apexbos_wiz_scan_")
+        results_json_path = os.path.join(scan_out_dir, "apexbos_scan_results.json")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        scanner_script = os.path.join(script_dir, "ApexBOSScanner.py")
+
+        args: List[str] = [
+            "--dwell", f"{dwell_val:.1f}",
+            "--start-ch", str(s_ch),
+            "--end-ch", str(e_ch),
+            "--inband-duration", f"{inband_val:.1f}",
+            "--opt-dwell", f"{opt_val:.1f}",
+            "--ppm", str(base_ppm),
+            "--output-dir", scan_out_dir,
+            "--no-update-prompt",
+        ]
+        if gain_raw and gain_raw.lower() != "auto" and gain_raw.replace(".", "", 1).isdigit():
+            args.extend(["--gain", gain_raw])
+        if sdr_dev:
+            args.extend(["--device", str(sdr_dev)])
+        if bias_tee:
+            args.append("--bias-tee")
+        if use_mock_scan:
+            args.append("--mock")
+
+        title = f"ApexBOS Initial 220 MHz Scan (Dwell {dwell_val:.1f}s | PPM {base_ppm} | Bias-T {'ON' if bias_tee else 'OFF'})"
+        try:
+            import ApexBOSLauncher
+            marker = ApexBOSLauncher.get_stop_marker_path("scanner")
+            ApexBOSLauncher._clear_stop_marker(marker)
+            proc = ApexBOSLauncher.spawn_in_new_terminal(
+                title,
+                scanner_script,
+                args,
+                cwd=script_dir,
+                keep_open="on_error",
+                stop_marker=marker,
+            )
+        except Exception as e:
+            proc = None
+            self.scanning = False
+            self.scan_summary = f"Scan failed: {e}"
+            self.status_msg = f"Failed to launch scanner terminal: {str(e)[:80]}"
+            return
+
+        if proc is None:
+            self.scanning = False
+            self.scan_summary = "Scan failed: could not open scanner terminal."
+            self.status_msg = "Failed to launch scanner terminal window."
+            return
+
+        self._scan_proc = proc
+        self.scan_progress = "Scanner running in terminal window... (waiting for results)"
+        self.status_msg = "Initial scan opened in a new terminal window. Results will apply automatically when finished."
+
+        def _watch_terminal_scan():
+            try:
+                import install_utils
+            except Exception:
+                install_utils = None
+
+            start_t = time.time()
+            last_proc_check = 0.0
+            seen_running = False
+            try:
+                while self.scanning:
+                    if os.path.exists(results_json_path):
+                        time.sleep(0.15)
+                        try:
+                            with open(results_json_path, "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                            if isinstance(data, dict) and "active_channels" in data:
+                                self._apply_scan_results_payload(data)
+                                return
+                        except Exception:
+                            pass
+
+                    now = time.time()
+                    if (now - last_proc_check) >= 1.5:
+                        last_proc_check = now
+                        scanner_alive = False
+                        if install_utils is not None:
+                            try:
+                                for pr in install_utils.list_apexbos_processes(include_launcher=False):
+                                    cmd_low = str(pr.get("cmd") or "").lower()
+                                    exe_low = str(pr.get("name") or "").lower()
+                                    if exe_low in ("cmd.exe", "wt.exe", "bash", "sh", "zsh", "osascript"):
+                                        continue
+                                    if "apexbosscanner.py" in cmd_low:
+                                        scanner_alive = True
+                                        break
+                            except Exception:
+                                if proc is not None and proc.poll() is None:
+                                    scanner_alive = True
+                        elif proc is not None and proc.poll() is None:
+                            scanner_alive = True
+
+                        if scanner_alive:
+                            seen_running = True
+                        elif seen_running or (now - start_t > 15.0):
+                            if os.path.exists(results_json_path):
+                                try:
+                                    with open(results_json_path, "r", encoding="utf-8") as f:
+                                        data = json.load(f)
+                                    if isinstance(data, dict) and "active_channels" in data:
+                                        self._apply_scan_results_payload(data)
+                                        return
+                                except Exception:
+                                    pass
+                            self.scan_summary = "Scanner exited without results (kept existing config)."
+                            self.status_msg = "Scanner closed without results. Check terminal window or retry."
+                            return
+
+                    time.sleep(0.4)
             except Exception as e:
-                self.scan_summary = f"Scan failed: {e}"
+                self.scan_summary = f"Scan watcher error: {e}"
                 self.status_msg = f"Scan error: {str(e)[:80]}"
             finally:
                 self.scanning = False
+                self._scan_proc = None
 
-        threading.Thread(target=_worker, daemon=True).start()
+        threading.Thread(target=_watch_terminal_scan, daemon=True).start()
 
     def _trigger_ssh_banc_deploy(self):
         """Packages Banc + whitelist and deploys to the cloud Linux VM via SCP/SSH."""
@@ -2934,11 +3107,13 @@ class PygameSetupWizard:
 
         # Live channel stats / Scan progress
         if getattr(self, "scanning", False):
-            scan_txt = self.font_sm.render(f"Scanning 220 MHz band (10s dwell)... {self.scan_progress[:65]}", True, COLOR_GREEN)
+            scan_txt = self.font_sm.render(f"Scanning 220 MHz band... {self.scan_progress[:75]}", True, COLOR_GREEN)
             self.screen.blit(scan_txt, (50, 194))
         elif getattr(self, "scan_summary", ""):
-            scan_col = COLOR_GREEN if getattr(self, "scan_active_channels", []) else (255, 190, 80)
-            scan_txt = self.font_sm.render(f"✓ {self.scan_summary[:90]}", True, scan_col)
+            has_found = bool(getattr(self, "scan_active_channels", []))
+            scan_col = COLOR_GREEN if has_found else (255, 190, 80)
+            prefix = "✓" if has_found else "!"
+            scan_txt = self.font_sm.render(f"{prefix} {self.scan_summary[:90]}", True, scan_col)
             self.screen.blit(scan_txt, (50, 194))
         else:
             chans_input = self.fields.get("grabber_chans", "").strip()

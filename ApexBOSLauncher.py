@@ -117,21 +117,115 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def get_stop_marker_path(subsystem_key: str) -> str:
+    """Returns a deterministic temp file path used to mark a Launcher-initiated stop."""
+    safe_key = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in str(subsystem_key).strip().lower())
+    return os.path.join(tempfile.gettempdir(), f"apexbos_stop_{safe_key}.flag")
+
+
+def _clear_stop_marker(marker_path: Optional[str]):
+    if marker_path:
+        try:
+            if os.path.exists(marker_path):
+                os.remove(marker_path)
+        except Exception:
+            pass
+
+
+def _touch_stop_marker(marker_path: Optional[str]):
+    if marker_path:
+        try:
+            with open(marker_path, "w", encoding="utf-8") as f:
+                f.write("stopped\n")
+        except Exception:
+            pass
+
+
+def _quote_bat_arg(arg: str, force_quote: bool = False) -> str:
+    """Quotes an argument safely for execution inside a Windows .bat wrapper."""
+    s = str(arg).replace("%", "%%")
+    if force_quote or not s or any(ch in s for ch in ' \t"&|<>^()'):
+        escaped = s.replace('"', '\\"')
+        if escaped.endswith("\\"):
+            escaped += "\\"
+        return f'"{escaped}"'
+    return s
+
+
+def _write_windows_terminal_wrapper(
+    py_exe: str,
+    target_script: str,
+    args: List[str],
+    stop_marker: Optional[str] = None,
+) -> str:
+    """
+    Creates a temporary Windows .bat wrapper that runs py_exe target_script args,
+    closes the terminal cleanly when exit code == 0 or stop_marker exists, and
+    keeps the shell open (cmd /k) ONLY if a non-zero error exit is detected.
+    """
+    cmd_parts = [
+        _quote_bat_arg(py_exe, force_quote=True),
+        _quote_bat_arg(target_script, force_quote=True),
+    ] + [_quote_bat_arg(a) for a in args]
+    run_line = " ".join(cmd_parts)
+
+    lines = [
+        "@echo off",
+        run_line,
+        'set "APEX_RC=%ERRORLEVEL%"',
+    ]
+    if stop_marker:
+        safe_marker = str(stop_marker).replace("%", "%%")
+        lines.append(f'if exist "{safe_marker}" goto :clean_exit')
+    lines.extend([
+        'if "%APEX_RC%"=="0" goto :clean_exit',
+        "echo.",
+        "echo [Process exited with error code %APEX_RC%. Close this terminal when done.]",
+        'del /f /q "%~f0" >nul 2>&1 & cmd /k & exit 0',
+        ":clean_exit",
+    ])
+    if stop_marker:
+        safe_marker = str(stop_marker).replace("%", "%%")
+        lines.append(f'if exist "{safe_marker}" del /f /q "{safe_marker}" >nul 2>&1')
+    lines.append('del /f /q "%~f0" >nul 2>&1 & exit 0')
+
+    fd, bat_path = tempfile.mkstemp(prefix="apexbos_run_", suffix=".bat")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        raise
+    return bat_path
+
+
 def spawn_in_new_terminal(
     title: str,
     script_path: str,
     args: List[str],
     cwd: Optional[str] = None,
-    keep_open: bool = True,
+    keep_open: Any = "on_error",
+    stop_marker: Optional[str] = None,
 ) -> Optional[subprocess.Popen]:
     """
     Spawns an interactive script in its own native terminal window across
-    Windows, macOS, and Linux. When keep_open=True, the terminal shell stays
-    open after the script exits so residual messages remain readable.
+    Windows, macOS, and Linux.
+    - keep_open="on_error" (default): closes the terminal automatically when the
+      script exits cleanly (code 0) or is stopped via stop_marker, and keeps the
+      terminal open ONLY if a non-zero error exit is detected.
+    - keep_open=True: always leaves the terminal shell open after exit.
+    - keep_open=False: always closes the terminal after exit.
     """
     work_dir = os.path.abspath(cwd or os.getcwd())
     target_script = os.path.abspath(os.path.join(work_dir, script_path)) if not os.path.isabs(script_path) else os.path.abspath(script_path)
     py_exe = sys.executable
+    if sys.platform == "win32" and os.path.basename(py_exe).lower() == "pythonw.exe":
+        cand_py = os.path.join(os.path.dirname(py_exe), "python.exe")
+        if os.path.exists(cand_py):
+            py_exe = cand_py
 
     cmd = [py_exe, target_script] + args
     child_env = os.environ.copy()
@@ -139,33 +233,64 @@ def spawn_in_new_terminal(
     child_env.pop("SDL_VIDEO_WINDOW_POS", None)
 
     if sys.platform == "win32":
-        shell_flag = "/k" if keep_open else "/c"
-        if shutil.which("wt.exe"):
-            full_cmd = ["wt.exe", "-w", "0", "nt", "-d", work_dir, "--title", title, "cmd.exe", shell_flag, py_exe, target_script] + args
+        if keep_open == "on_error":
+            bat_path = _write_windows_terminal_wrapper(py_exe, target_script, args, stop_marker=stop_marker)
+            if shutil.which("wt.exe"):
+                full_cmd = ["wt.exe", "-w", "0", "nt", "-d", work_dir, "--title", title, "cmd.exe", "/c", bat_path]
+                try:
+                    return subprocess.Popen(full_cmd, cwd=work_dir, env=child_env)
+                except Exception:
+                    pass
+            full_cmd = ["cmd.exe", "/c", bat_path]
             try:
-                return subprocess.Popen(full_cmd, cwd=work_dir, env=child_env)
+                return subprocess.Popen(
+                    full_cmd,
+                    cwd=work_dir,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    env=child_env,
+                )
             except Exception:
-                pass
-        full_cmd = ["cmd.exe", shell_flag, py_exe, target_script] + args
-        try:
-            return subprocess.Popen(
-                full_cmd,
-                cwd=work_dir,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-                env=child_env,
-            )
-        except Exception:
-            return subprocess.Popen(full_cmd, cwd=work_dir, env=child_env)
+                return subprocess.Popen(full_cmd, cwd=work_dir, env=child_env)
+        else:
+            shell_flag = "/k" if keep_open else "/c"
+            if shutil.which("wt.exe"):
+                full_cmd = ["wt.exe", "-w", "0", "nt", "-d", work_dir, "--title", title, "cmd.exe", shell_flag, py_exe, target_script] + args
+                try:
+                    return subprocess.Popen(full_cmd, cwd=work_dir, env=child_env)
+                except Exception:
+                    pass
+            full_cmd = ["cmd.exe", shell_flag, py_exe, target_script] + args
+            try:
+                return subprocess.Popen(
+                    full_cmd,
+                    cwd=work_dir,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    env=child_env,
+                )
+            except Exception:
+                return subprocess.Popen(full_cmd, cwd=work_dir, env=child_env)
 
     elif sys.platform == "darwin":
         quoted_cmd = " ".join(shlex.quote(c) for c in cmd)
-        if keep_open:
+        if keep_open == "on_error":
+            marker_check = ""
+            if stop_marker:
+                qm = shlex.quote(stop_marker)
+                marker_check = f"if [ -f {qm} ]; then rm -f {qm}; exit 0; fi; "
+            shell_cmd = (
+                f"cd {shlex.quote(work_dir)} && {quoted_cmd}; rc=$?; "
+                f"{marker_check}"
+                'if [ "$rc" -ne 0 ]; then '
+                'echo ""; echo "[Process exited with error code $rc. Close this terminal when done.]"; '
+                "else exit 0; fi"
+            )
+        elif keep_open:
             shell_cmd = (
                 f"cd {shlex.quote(work_dir)} && {quoted_cmd}; "
                 'rc=$?; echo ""; echo "[Process exited with code $rc. Close this terminal when done.]"'
             )
         else:
-            shell_cmd = f"cd {shlex.quote(work_dir)} && {quoted_cmd}"
+            shell_cmd = f"cd {shlex.quote(work_dir)} && {quoted_cmd}; exit 0"
         osa_escaped = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
         osa_script = f'tell application "Terminal" to do script "{osa_escaped}"'
         return subprocess.Popen(["osascript", "-e", osa_script], env=child_env)
@@ -174,7 +299,22 @@ def spawn_in_new_terminal(
         quoted_cmd = " ".join(shlex.quote(c) for c in cmd)
         shell_bin = "bash" if shutil.which("bash") else "sh"
         title_esc = f'printf "\\033]2;%s\\007" {shlex.quote(title)}; ' if title else ""
-        if keep_open:
+        if keep_open == "on_error":
+            marker_check = ""
+            if stop_marker:
+                qm = shlex.quote(stop_marker)
+                marker_check = f"if [ -f {qm} ]; then rm -f {qm}; exit 0; fi; "
+            inner = (
+                f"{title_esc}{quoted_cmd}; rc=$?; "
+                f"{marker_check}"
+                'if [ "$rc" -ne 0 ]; then '
+                "echo ''; "
+                'echo "[Process exited with error code $rc. Close this terminal when done.]"; '
+                f"exec {shell_bin}; "
+                "fi"
+            )
+            launch_cmd = [shell_bin, "-c", inner]
+        elif keep_open:
             inner = (
                 f"{title_esc}{quoted_cmd}; rc=$?; echo ''; "
                 'echo "[Process exited with code $rc. Close this terminal when done.]"; '
@@ -381,7 +521,7 @@ class ProcessManager:
         return None
 
     def stop_process(self, name: str):
-        """Stops a single managed process cleanly (leaving its terminal shell open if spawned in one)."""
+        """Stops a single managed process cleanly (closing its terminal window automatically)."""
         aliases = [name]
         if name == "engine_1":
             aliases.append("engine")
@@ -391,6 +531,10 @@ class ProcessManager:
             aliases.append("viewer")
         elif name == "viewer":
             aliases.append("viewer_1")
+
+        # Mark Launcher-initiated stop before signalling so terminal wrappers close cleanly
+        for a in aliases:
+            _touch_stop_marker(get_stop_marker_path(a))
 
         stopped_any = False
         for a in aliases:
@@ -506,7 +650,9 @@ class ProcessManager:
             args.extend(["--ppm", str(ppm_val).strip()])
 
         title = f"ApexBOSGrabber (SDR #{device_idx} | {num_procs} Procs | Bias-T ON)"
-        p = spawn_in_new_terminal(title, "ApexBOSGrabber.py", args, cwd=self.work_dir)
+        marker = get_stop_marker_path("grabber")
+        _clear_stop_marker(marker)
+        p = spawn_in_new_terminal(title, "ApexBOSGrabber.py", args, cwd=self.work_dir, stop_marker=marker)
         if p:
             self.procs["grabber"] = p
             with self._lock:
@@ -541,7 +687,9 @@ class ProcessManager:
             args.append("--update-config")
 
         title = f"ApexBOS 220 MHz Scanner (Dwell {dwell}s | PPM {ppm_val or 0} | Bias-T {'ON' if bias_tee else 'OFF'})"
-        p = spawn_in_new_terminal(title, "ApexBOSScanner.py", args, cwd=self.work_dir)
+        marker = get_stop_marker_path("scanner")
+        _clear_stop_marker(marker)
+        p = spawn_in_new_terminal(title, "ApexBOSScanner.py", args, cwd=self.work_dir, stop_marker=marker)
         if p:
             self.procs["scanner"] = p
             with self._lock:
@@ -642,7 +790,9 @@ class ProcessManager:
             self.set_toast("ApexBOSFlux is already running.")
             return
         args = ["--config", self.config_path, "--display"]
-        p = spawn_in_new_terminal("ApexBOSFlux Relay", "ApexBOSFlux.py", args, cwd=self.work_dir)
+        marker = get_stop_marker_path("flux")
+        _clear_stop_marker(marker)
+        p = spawn_in_new_terminal("ApexBOSFlux Relay", "ApexBOSFlux.py", args, cwd=self.work_dir, stop_marker=marker)
         if p:
             self.procs["flux"] = p
             with self._lock:
@@ -744,7 +894,11 @@ class ProcessManager:
             args.extend(["--source", "banc"])
 
         title = f"ApexBOS DispatcherEngine (Pair #{pair_idx} | UDP {mcast_port} | TCP {tcp_port})"
-        p = spawn_in_new_terminal(title, "ApexBOS.220.py", args, cwd=self.work_dir)
+        marker = get_stop_marker_path(proc_key)
+        _clear_stop_marker(marker)
+        if pair_idx == 1:
+            _clear_stop_marker(get_stop_marker_path("engine"))
+        p = spawn_in_new_terminal(title, "ApexBOS.220.py", args, cwd=self.work_dir, stop_marker=marker)
         if p:
             self.procs[proc_key] = p
             if pair_idx == 1:
@@ -831,7 +985,9 @@ class ProcessManager:
             self.set_toast("ApexBOSBanc is already running.")
             return
         args = ["--config", self.config_path, "--display"]
-        p = spawn_in_new_terminal("ApexBOSBanc Cloud Server", "ApexBOSBanc.py", args, cwd=self.work_dir)
+        marker = get_stop_marker_path("banc")
+        _clear_stop_marker(marker)
+        p = spawn_in_new_terminal("ApexBOSBanc Cloud Server", "ApexBOSBanc.py", args, cwd=self.work_dir, stop_marker=marker)
         if p:
             self.procs["banc"] = p
             with self._lock:
@@ -870,14 +1026,18 @@ class ProcessManager:
             for r in rules:
                 rule_path = r if os.path.isabs(r) or os.path.exists(r) else os.path.join("config", r)
                 args.append(rule_path)
-        p = spawn_in_new_terminal("ApexBOSSpy Rule Inspector", "ApexBOSSpy.py", args, cwd=self.work_dir)
+        marker = get_stop_marker_path("spy")
+        _clear_stop_marker(marker)
+        p = spawn_in_new_terminal("ApexBOSSpy Rule Inspector", "ApexBOSSpy.py", args, cwd=self.work_dir, stop_marker=marker)
         if p:
             self.procs["spy"] = p
             self.set_toast("Launched ApexBOSSpy.")
 
     def start_packfig(self):
         """Starts PackFIG in a terminal."""
-        p = spawn_in_new_terminal("PackFIG Binary Decoder", "PackFIG.py", [], cwd=self.work_dir)
+        marker = get_stop_marker_path("packfig")
+        _clear_stop_marker(marker)
+        p = spawn_in_new_terminal("PackFIG Binary Decoder", "PackFIG.py", [], cwd=self.work_dir, stop_marker=marker)
         if p:
             self.procs["packfig"] = p
             self.set_toast("Launched PackFIG.")
