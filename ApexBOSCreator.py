@@ -35,6 +35,7 @@ try:
     import dataclasses
 except ImportError:
     raise ImportError("Python 3.6 requires the 'dataclasses' package. Install it via: pip install dataclasses")
+import glob
 import json
 import math
 import re
@@ -77,7 +78,7 @@ from train_logic import (
 from version import VERSION, __version__
 CREATOR_VERSION = VERSION
 
-LOGICAL_GRID_SCALE = 24.0
+LOGICAL_GRID_SCALE = 16.0
 WIU_CACHE_FILE = ".wiu_address_cache.json"
 MAP_CACHE_DIR = ".map_tile_cache"
 FRAGS_DIR = os.path.join(os.getcwd(), "frags")
@@ -109,6 +110,17 @@ COLOR_TURNOUT_TIE = (100, 112, 130)
 COLOR_SIGNAL_MAST = (165, 175, 190)
 COLOR_HANDLE = (0, 215, 255)
 COLOR_HANDLE_ACTIVE = (255, 210, 50)
+
+SIGNAL_DIR_OFFSETS: Dict[str, Tuple[float, float]] = {
+    "E": (1.0, 0.0),
+    "W": (-1.0, 0.0),
+    "N": (0.0, -1.0),
+    "S": (0.0, 1.0),
+    "NE": (0.7071, -0.7071),
+    "SE": (0.7071, 0.7071),
+    "NW": (-0.7071, -0.7071),
+    "SW": (-0.7071, 0.7071),
+}
 
 LAMP_COLORS: Dict[str, Tuple[int, int, int]] = {
     "GREEN": (35, 235, 90),
@@ -722,11 +734,7 @@ class WIUAddressCache:
         ref_gps: Optional[Tuple[float, float]] = None,
     ) -> List[str]:
         ids: Set[str] = set()
-        for k, v in self.wiu_records.items():
-            raw = v.get("wiu_id", k) if isinstance(v, dict) else k
-            nk = _normalize_wiu_key(raw)
-            if nk:
-                ids.add(nk)
+        layout_gps_by_wiu: Dict[str, Tuple[float, float]] = {}
         for el in (layout_elements or {}).values():
             el_wid = getattr(el, "wiu_id", None)
             if el_wid is None and getattr(el, "elem_type", "") == "base":
@@ -735,13 +743,33 @@ class WIUAddressCache:
                 nk = _normalize_wiu_key(el_wid)
                 if nk:
                     ids.add(nk)
+                    if nk not in layout_gps_by_wiu:
+                        g = _parse_wiu_gps(getattr(el, "gps", None))
+                        if g is not None:
+                            layout_gps_by_wiu[nk] = g
+
+        for k, v in self.wiu_records.items():
+            raw = v.get("wiu_id", k) if isinstance(v, dict) else k
+            nk = _normalize_wiu_key(raw)
+            if nk:
+                ids.add(nk)
 
         parsed_ref = _parse_wiu_gps(ref_gps)
         if parsed_ref is not None:
             ref_lat, ref_lon = parsed_ref
+            wiu_gps_map: Dict[str, Tuple[float, float]] = {}
+            for wid_str in ids:
+                rec = self.wiu_records.get(wid_str)
+                g = None
+                if isinstance(rec, dict):
+                    g = _parse_wiu_gps(rec.get("gps"))
+                if g is None:
+                    g = layout_gps_by_wiu.get(wid_str)
+                if g is not None:
+                    wiu_gps_map[wid_str] = g
 
             def _prox_key(wid_str: str) -> Tuple[int, float, Tuple[int, int, str]]:
-                g = self.get_wiu_gps(wid_str, layout_elements)
+                g = wiu_gps_map.get(wid_str)
                 if g is not None:
                     dist = _haversine_miles_coords(ref_lat, ref_lon, g[0], g[1])
                     return (0, round(dist, 6), _wiu_sort_scalar(wid_str))
@@ -902,8 +930,8 @@ class LayoutTopologyAssistant:
 
     @staticmethod
     def endpoints_in_same_tile(p1: Tuple[float, float], p2: Tuple[float, float]) -> bool:
-        """Returns True if two logical points lie within the same grid tile square."""
-        return int(round(p1[0])) == int(round(p2[0])) and int(round(p1[1])) == int(round(p2[1]))
+        """Returns True if two logical points lie within the same grid tile square or radius."""
+        return math.hypot(p1[0] - p2[0], p1[1] - p2[1]) <= 0.85
 
     @classmethod
     def connect_track_ends_in_same_tile(cls, target: TrackSegment, elements: Dict[str, BaseElement]) -> int:
@@ -3643,6 +3671,7 @@ class ApexBOSCreatorApp:
         self.playback_btn_rects: Dict[str, pygame.Rect] = {}
 
         self.show_labels: bool = True
+        self.show_element_attributes: bool = False
         self.show_inferred_trains: bool = True
         self.enable_inference_logic: bool = True
 
@@ -4588,8 +4617,7 @@ class ApexBOSCreatorApp:
         self.confirm_new_modal = False
         if not self.layout_filepath:
             self.pending_post_save_action = "new_layout"
-            self.file_prompt_mode = "save_as"
-            self.file_prompt_buffer = "new_layout.json"
+            self.open_file_prompt("save_as", "")
             self.status_toast = "Save changes to file before creating new layout (Enter=Save, Esc=Cancel)."
         else:
             self.save_current_layout()
@@ -4612,8 +4640,7 @@ class ApexBOSCreatorApp:
         target = target_path if target_path is not None else self.pending_load_target
         self.pending_load_target = None
         if target is None:
-            self.file_prompt_mode = "load"
-            self.file_prompt_buffer = self.layout_filepath or "complex_layout.json"
+            self.open_file_prompt("load", "")
         elif isinstance(target, tuple) and len(target) == 3 and target[0] == "banc":
             _, layout_dict, layout_name = target
             self.open_layout_from_banc(layout_dict, layout_name)
@@ -4622,15 +4649,13 @@ class ApexBOSCreatorApp:
             if itcvl_path:
                 self.import_itcvl_layout(itcvl_path)
             else:
-                default_itcvl = "UPMOFAT.itcvl" if os.path.exists("UPMOFAT.itcvl") else ("SoCalAll.itcvl" if os.path.exists("SoCalAll.itcvl") else "")
-                self.open_file_prompt("import_itcvl", default_itcvl)
+                self.open_file_prompt("import_itcvl", "")
         elif isinstance(target, tuple) and len(target) == 2 and target[0] == "import_atcs":
             _, atcs_path = target
             if atcs_path:
                 self.import_atcs_layout(atcs_path)
             else:
-                default_atcs = "up_yuma_0201_20.lay" if os.path.exists("up_yuma_0201_20.lay") else ""
-                self.open_file_prompt("import_atcs", default_atcs)
+                self.open_file_prompt("import_atcs", "")
         elif isinstance(target, str):
             self._execute_load_layout(target)
 
@@ -4653,8 +4678,7 @@ class ApexBOSCreatorApp:
         self.confirm_load_modal = False
         if not self.layout_filepath:
             self.pending_post_save_action = ("load", self.pending_load_target)
-            self.file_prompt_mode = "save_as"
-            self.file_prompt_buffer = "new_layout.json"
+            self.open_file_prompt("save_as", "")
             self.status_toast = "Save changes to file before loading layout (Enter=Save, Esc=Cancel)."
         else:
             self.save_current_layout()
@@ -4678,8 +4702,25 @@ class ApexBOSCreatorApp:
         if target_path:
             self.import_itcvl_layout(target_path)
         else:
-            default_itcvl = "UPMOFAT.itcvl" if os.path.exists("UPMOFAT.itcvl") else ("SoCalAll.itcvl" if os.path.exists("SoCalAll.itcvl") else "")
-            self.open_file_prompt("import_itcvl", default_itcvl)
+            self.open_file_prompt("import_itcvl", "")
+
+    @staticmethod
+    def _snap_layout_dict_to_grid(layout_dict: dict, snap_step: float = 0.5):
+        """Snaps all layout elements to the grid (multiples of snap_step, e.g. 0.5 logical units),
+        discarding original floating-point drift and re-aligning elements nicely on the new grid.
+        """
+        for el in layout_dict.get("elements", []):
+            if "x" in el and el["x"] is not None:
+                nx = round(float(el["x"]) / snap_step) * snap_step
+                el["x"] = int(nx) if nx.is_integer() else nx
+            if "y" in el and el["y"] is not None:
+                ny = round(float(el["y"]) / snap_step) * snap_step
+                el["y"] = int(ny) if ny.is_integer() else ny
+            if el.get("elem_type") == "track" and "length_miles" in el:
+                orient = el.get("orientation", "E-W")
+                if orient in ("E-W", "N-S"):
+                    lm = float(el.get("length_miles") or 0.5)
+                    el["length_miles"] = max(0.25, round(lm * 4.0) / 4.0)
 
     def import_itcvl_layout(self, filepath: str):
         """
@@ -4705,6 +4746,7 @@ class ApexBOSCreatorApp:
                 output_layout_path=None,
                 frags_dir=itcvl_frags_dir,
             )
+            self._snap_layout_dict_to_grid(layout_dict, snap_step=0.5)
             self.push_undo_state()
             self.layout_filepath = own_filepath
             self.engine.load_layout_data(
@@ -4737,8 +4779,7 @@ class ApexBOSCreatorApp:
         if target_path:
             self.import_atcs_layout(target_path)
         else:
-            default_atcs = "up_yuma_0201_20.lay" if os.path.exists("up_yuma_0201_20.lay") else ""
-            self.open_file_prompt("import_atcs", default_atcs)
+            self.open_file_prompt("import_atcs", "")
 
     def import_atcs_layout(self, filepath: str):
         """
@@ -4764,6 +4805,7 @@ class ApexBOSCreatorApp:
                 output_layout_path=None,
                 frags_dir=atcs_frags_dir,
             )
+            self._snap_layout_dict_to_grid(layout_dict, snap_step=0.5)
             self.push_undo_state()
             self.layout_filepath = own_filepath
             self.engine.load_layout_data(
@@ -4787,8 +4829,7 @@ class ApexBOSCreatorApp:
     def save_current_layout(self, filepath: Optional[str] = None):
         target = filepath or self.layout_filepath
         if not target:
-            self.file_prompt_mode = "save_as"
-            self.file_prompt_buffer = "new_layout.json"
+            self.open_file_prompt("save_as", "")
             self.status_toast = "Enter filepath to save layout."
             return
         self.layout_filepath = target
@@ -5550,8 +5591,8 @@ class ApexBOSCreatorApp:
             shift_held = bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
             if shift_held:
                 if self.selected_ids and self._shift_arrow_repeat_ts > 0.0 and time.time() >= self._shift_arrow_repeat_ts:
-                    dx = (-1 if keys[pygame.K_LEFT] else 0) + (1 if keys[pygame.K_RIGHT] else 0)
-                    dy = (-1 if keys[pygame.K_UP] else 0) + (1 if keys[pygame.K_DOWN] else 0)
+                    dx = (-0.5 if keys[pygame.K_LEFT] else 0.0) + (0.5 if keys[pygame.K_RIGHT] else 0.0)
+                    dy = (-0.5 if keys[pygame.K_UP] else 0.0) + (0.5 if keys[pygame.K_DOWN] else 0.0)
                     if dx != 0 or dy != 0:
                         self.move_selected_elements(dx, dy, push_undo=False, auto_connect=False)
                         self._shift_arrow_repeat_ts = time.time() + 0.07
@@ -5582,78 +5623,199 @@ class ApexBOSCreatorApp:
         mode = self.file_prompt_mode
         raw_buf = getattr(self, "file_prompt_buffer", "")
         clean_buf = raw_buf.strip()
-
-        if mode == "load_log":
-            valid_exts = {".log", ".jsonl", ".txt", ".json"}
-        elif mode == "import_itcvl":
-            valid_exts = {".itcvl"}
-        elif mode == "import_atcs":
-            valid_exts = {".lay"}
-        elif mode == "save_frag":
-            valid_exts = {".json"}
-        else:
-            valid_exts = {".json"}
-
-        frags_dir = getattr(self, "FRAGS_DIR", getattr(sys.modules.get("ApexBOSCreator", None), "FRAGS_DIR", FRAGS_DIR))
-        if mode == "save_frag" and not ("/" in clean_buf or "\\" in clean_buf):
-            search_dir = frags_dir if os.path.exists(frags_dir) else "."
-            prefix = clean_buf
-            dir_prefix = ""
-        else:
-            if "/" in clean_buf or "\\" in clean_buf:
-                last_sep = max(clean_buf.rfind("/"), clean_buf.rfind("\\"))
-                dir_part = clean_buf[:last_sep + 1]
-                prefix = clean_buf[last_sep + 1:]
-                search_dir = dir_part if os.path.isdir(dir_part) else (os.path.dirname(dir_part) or ".")
-                dir_prefix = dir_part
-            else:
-                search_dir = "."
-                prefix = clean_buf
-                dir_prefix = ""
+        p_lower = clean_buf.lower()
+        has_dir = ("/" in clean_buf or "\\" in clean_buf)
 
         matches = []
         try:
-            if os.path.isdir(search_dir):
-                for entry in sorted(os.listdir(search_dir), key=lambda s: s.lower()):
-                    if entry.startswith(".") or entry.startswith("__"):
-                        continue
-                    full_path = os.path.join(search_dir, entry)
-                    is_dir = os.path.isdir(full_path)
-                    ext = os.path.splitext(entry)[1].lower()
+            if mode == "import_itcvl":
+                if has_dir:
+                    last_sep = max(clean_buf.rfind("/"), clean_buf.rfind("\\"))
+                    dir_part = clean_buf[:last_sep + 1]
+                    prefix = clean_buf[last_sep + 1:].lower()
+                    search_dir = dir_part if os.path.isdir(dir_part) else (os.path.dirname(dir_part) or ".")
+                    if os.path.isdir(search_dir):
+                        for entry in sorted(os.listdir(search_dir), key=lambda s: s.lower()):
+                            full_p = os.path.join(search_dir, entry)
+                            if os.path.isdir(full_p):
+                                if not entry.startswith((".", "__")):
+                                    cand = f"{dir_part}{entry}/"
+                                    if not prefix or prefix in entry.lower():
+                                        matches.append((0 if entry.lower().startswith(prefix) else 1, entry.lower(), cand))
+                            elif entry.lower().endswith(".itcvl"):
+                                cand = f"{dir_part}{entry}".replace("\\", "/")
+                                if not prefix or prefix in entry.lower():
+                                    matches.append((0 if entry.lower().startswith(prefix) else 1, entry.lower(), cand))
+                else:
+                    found = sorted(glob.glob("*.itcvl") + glob.glob("itcvl/*.itcvl"))
+                    for f in found:
+                        cand = f.replace("\\", "/")
+                        b_lower = os.path.basename(cand).lower()
+                        if not p_lower:
+                            matches.append((0, b_lower, cand))
+                        elif b_lower.startswith(p_lower):
+                            matches.append((0, b_lower, cand))
+                        elif p_lower in b_lower:
+                            matches.append((1, b_lower, cand))
 
-                    if is_dir:
-                        cand = f"{dir_prefix}{entry}/"
-                    elif not valid_exts or ext in valid_exts:
-                        cand = f"{dir_prefix}{entry}"
-                    else:
-                        continue
+            elif mode == "import_atcs":
+                if has_dir:
+                    last_sep = max(clean_buf.rfind("/"), clean_buf.rfind("\\"))
+                    dir_part = clean_buf[:last_sep + 1]
+                    prefix = clean_buf[last_sep + 1:].lower()
+                    search_dir = dir_part if os.path.isdir(dir_part) else (os.path.dirname(dir_part) or ".")
+                    if os.path.isdir(search_dir):
+                        for entry in sorted(os.listdir(search_dir), key=lambda s: s.lower()):
+                            full_p = os.path.join(search_dir, entry)
+                            if os.path.isdir(full_p):
+                                if not entry.startswith((".", "__")):
+                                    cand = f"{dir_part}{entry}/"
+                                    if not prefix or prefix in entry.lower():
+                                        matches.append((0 if entry.lower().startswith(prefix) else 1, entry.lower(), cand))
+                            elif entry.lower().endswith(".lay"):
+                                cand = f"{dir_part}{entry}".replace("\\", "/")
+                                if not prefix or prefix in entry.lower():
+                                    matches.append((0 if entry.lower().startswith(prefix) else 1, entry.lower(), cand))
+                else:
+                    found = sorted(glob.glob("*.lay") + glob.glob("atcs/*.lay"))
+                    for f in found:
+                        cand = f.replace("\\", "/")
+                        b_lower = os.path.basename(cand).lower()
+                        if not p_lower:
+                            matches.append((0, b_lower, cand))
+                        elif b_lower.startswith(p_lower):
+                            matches.append((0, b_lower, cand))
+                        elif p_lower in b_lower:
+                            matches.append((1, b_lower, cand))
 
-                    p_lower = prefix.lower()
-                    entry_lower = entry.lower()
+            elif mode in ("load", "merge", "save_as"):
+                if has_dir:
+                    last_sep = max(clean_buf.rfind("/"), clean_buf.rfind("\\"))
+                    dir_part = clean_buf[:last_sep + 1]
+                    prefix = clean_buf[last_sep + 1:].lower()
+                    search_dir = dir_part if os.path.isdir(dir_part) else (os.path.dirname(dir_part) or ".")
+                    if os.path.isdir(search_dir):
+                        for entry in sorted(os.listdir(search_dir), key=lambda s: s.lower()):
+                            full_p = os.path.join(search_dir, entry)
+                            if os.path.isdir(full_p):
+                                if not entry.startswith((".", "__")):
+                                    cand = f"{dir_part}{entry}/"
+                                    if not prefix or prefix in entry.lower():
+                                        matches.append((0 if entry.lower().startswith(prefix) else 1, entry.lower(), cand))
+                            elif entry.lower().endswith(".json"):
+                                cand = f"{dir_part}{entry}".replace("\\", "/")
+                                if not prefix or prefix in entry.lower():
+                                    matches.append((0 if entry.lower().startswith(prefix) else 1, entry.lower(), cand))
+                else:
+                    cands = []
+                    for p in sorted(glob.glob("layouts/*_layout.json")):
+                        norm = p.replace("\\", "/")
+                        if norm not in cands:
+                            cands.append((0, norm))
+                    for p in sorted(glob.glob("layouts/*.json")):
+                        norm = p.replace("\\", "/")
+                        if not any(norm == c[1] for c in cands):
+                            cands.append((1, norm))
+                    for p in sorted(glob.glob("*_layout.json")):
+                        if os.path.basename(p).startswith("prefs_"):
+                            continue
+                        norm = p.replace("\\", "/")
+                        if not any(norm == c[1] for c in cands):
+                            cands.append((2, norm))
+                    for root_f in ("complex_layout.json", "SoCalAll.json", "UPMOFAT.json", "up_yuma_0201_20.json"):
+                        if os.path.exists(root_f) and not any(root_f == c[1] for c in cands):
+                            cands.append((3, root_f))
 
-                    if not p_lower:
-                        matches.append((1 if is_dir else 2, entry_lower, cand))
-                    elif entry_lower.startswith(p_lower):
-                        matches.append((0 if is_dir else 1, entry_lower, cand))
-                    elif p_lower in entry_lower:
-                        matches.append((2 if is_dir else 3, entry_lower, cand))
+                    for prio, cand in cands:
+                        cand_lower = cand.lower()
+                        b_lower = os.path.basename(cand_lower)
+                        if not p_lower:
+                            matches.append((prio, cand_lower, cand))
+                        elif b_lower.startswith(p_lower):
+                            matches.append((prio * 2, cand_lower, cand))
+                        elif p_lower in cand_lower:
+                            matches.append((prio * 2 + 1, cand_lower, cand))
+
+            elif mode == "save_frag":
+                frags_dir = getattr(self, "FRAGS_DIR", getattr(sys.modules.get("ApexBOSCreator", None), "FRAGS_DIR", FRAGS_DIR))
+                search_dir = frags_dir if (os.path.exists(frags_dir) and not has_dir) else "."
+                dir_prefix = ""
+                prefix = clean_buf
+                if has_dir:
+                    last_sep = max(clean_buf.rfind("/"), clean_buf.rfind("\\"))
+                    dir_part = clean_buf[:last_sep + 1]
+                    prefix = clean_buf[last_sep + 1:]
+                    search_dir = dir_part if os.path.isdir(dir_part) else (os.path.dirname(dir_part) or ".")
+                    dir_prefix = dir_part
+                if os.path.isdir(search_dir):
+                    for entry in sorted(os.listdir(search_dir), key=lambda s: s.lower()):
+                        if entry.startswith((".", "__")):
+                            continue
+                        full_path = os.path.join(search_dir, entry)
+                        is_dir = os.path.isdir(full_path)
+                        ext = os.path.splitext(entry)[1].lower()
+                        if is_dir:
+                            cand = f"{dir_prefix}{entry}/"
+                        elif ext == ".json":
+                            cand = f"{dir_prefix}{entry}".replace("\\", "/")
+                        else:
+                            continue
+                        p_sub = prefix.lower()
+                        e_sub = entry.lower()
+                        if not p_sub:
+                            matches.append((1 if is_dir else 2, e_sub, cand))
+                        elif e_sub.startswith(p_sub):
+                            matches.append((0 if is_dir else 1, e_sub, cand))
+                        elif p_sub in e_sub:
+                            matches.append((2 if is_dir else 3, e_sub, cand))
+
+            elif mode == "load_log":
+                search_dir = "."
+                dir_prefix = ""
+                prefix = clean_buf
+                if has_dir:
+                    last_sep = max(clean_buf.rfind("/"), clean_buf.rfind("\\"))
+                    dir_part = clean_buf[:last_sep + 1]
+                    prefix = clean_buf[last_sep + 1:]
+                    search_dir = dir_part if os.path.isdir(dir_part) else (os.path.dirname(dir_part) or ".")
+                    dir_prefix = dir_part
+                if os.path.isdir(search_dir):
+                    for entry in sorted(os.listdir(search_dir), key=lambda s: s.lower()):
+                        if entry.startswith((".", "__")):
+                            continue
+                        full_path = os.path.join(search_dir, entry)
+                        is_dir = os.path.isdir(full_path)
+                        ext = os.path.splitext(entry)[1].lower()
+                        if is_dir:
+                            cand = f"{dir_prefix}{entry}/"
+                        elif ext in {".log", ".jsonl", ".txt", ".json"}:
+                            cand = f"{dir_prefix}{entry}".replace("\\", "/")
+                        else:
+                            continue
+                        p_sub = prefix.lower()
+                        e_sub = entry.lower()
+                        if not p_sub:
+                            matches.append((1 if is_dir else 2, e_sub, cand))
+                        elif e_sub.startswith(p_sub):
+                            matches.append((0 if is_dir else 1, e_sub, cand))
+                        elif p_sub in e_sub:
+                            matches.append((2 if is_dir else 3, e_sub, cand))
+                if not dir_prefix:
+                    try:
+                        temp_dir = tempfile.gettempdir()
+                        default_log = getattr(self.engine, "raw_log_filepath", os.path.join(temp_dir, "apexbos_raw_packets.log"))
+                        if os.path.exists(default_log):
+                            b_name = os.path.basename(default_log)
+                            if not prefix or prefix.lower() in b_name.lower():
+                                if default_log not in [m[2] for m in matches]:
+                                    matches.append((1, b_name.lower(), default_log.replace("\\", "/")))
+                    except Exception:
+                        pass
         except Exception:
             pass
 
-        if mode == "load_log" and not dir_prefix:
-            try:
-                temp_dir = tempfile.gettempdir()
-                default_log = getattr(self.engine, "raw_log_filepath", os.path.join(temp_dir, "apexbos_raw_packets.log"))
-                if os.path.exists(default_log):
-                    b_name = os.path.basename(default_log)
-                    if not prefix or prefix.lower() in b_name.lower():
-                        if default_log not in [m[2] for m in matches]:
-                            matches.append((1, b_name.lower(), default_log))
-            except Exception:
-                pass
-
         matches.sort(key=lambda t: (t[0], t[1]))
-        self.file_prompt_suggestions = [cand for _, _, cand in matches[:8]]
+        self.file_prompt_suggestions = [cand for _, _, cand in matches[:16]]
 
         if self.file_prompt_selected_idx >= len(self.file_prompt_suggestions):
             self.file_prompt_selected_idx = -1
@@ -6036,7 +6198,7 @@ class ApexBOSCreatorApp:
             cur = "E-W"
         return rot_cycle[(rot_cycle.index(cur) + step) % 4]
 
-    def move_selected_elements(self, dx: int, dy: int, push_undo: bool = True, auto_connect: bool = True) -> bool:
+    def move_selected_elements(self, dx: float, dy: float, push_undo: bool = True, auto_connect: bool = True) -> bool:
         """Moves all currently selected layout elements by (dx, dy) logical grid units."""
         targets = [
             self.engine.elements[sid]
@@ -6051,8 +6213,10 @@ class ApexBOSCreatorApp:
             self.push_undo_state()
 
         for el in targets:
-            el.x = int(el.x) + int(dx)
-            el.y = int(el.y) + int(dy)
+            nx = round((float(el.x) + float(dx)) * 2.0) / 2.0
+            ny = round((float(el.y) + float(dy)) * 2.0) / 2.0
+            el.x = int(nx) if nx.is_integer() else nx
+            el.y = int(ny) if ny.is_integer() else ny
 
         if auto_connect:
             for el in targets:
@@ -6066,7 +6230,7 @@ class ApexBOSCreatorApp:
             t0 = targets[0]
             self.status_toast = f"Moved '{t0.id}' to ({t0.x}, {t0.y})."
         else:
-            self.status_toast = f"Moved {len(targets)} selected elements by ({dx:+d}, {dy:+d})."
+            self.status_toast = f"Moved {len(targets)} selected elements by ({dx:+g}, {dy:+g})."
         return True
 
     def rotate_selected_track(self, direction: int = 1, mx: Optional[int] = None, my: Optional[int] = None) -> bool:
@@ -6529,8 +6693,8 @@ class ApexBOSCreatorApp:
             self.status_toast = "Deselected all elements."
         elif event.key in (pygame.K_DELETE, pygame.K_BACKSPACE): self.delete_selected()
         elif shift and not ctrl and event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
-            dx = -1 if event.key == pygame.K_LEFT else (1 if event.key == pygame.K_RIGHT else 0)
-            dy = -1 if event.key == pygame.K_UP else (1 if event.key == pygame.K_DOWN else 0)
+            dx = -0.5 if event.key == pygame.K_LEFT else (0.5 if event.key == pygame.K_RIGHT else 0.0)
+            dy = -0.5 if event.key == pygame.K_UP else (0.5 if event.key == pygame.K_DOWN else 0.0)
             if self.move_selected_elements(dx, dy, push_undo=True, auto_connect=True):
                 self._shift_arrow_repeat_ts = time.time() + 0.35
                 self._shift_arrow_moved_during_hold = False
@@ -6544,6 +6708,7 @@ class ApexBOSCreatorApp:
             sel_id = next(iter(sorted(self.selected_ids)))
             if sel_id in self.engine.elements:
                 el = self.engine.elements[sel_id]
+                self.status_toast = f"Opening edit panel for '{sel_id}'..."
                 self.push_undo_state()
                 self.selected_ids = {sel_id}
                 sx, sy = self.logical_to_screen(float(el.x), float(el.y))
@@ -6568,7 +6733,7 @@ class ApexBOSCreatorApp:
         elif ctrl and event.key == pygame.K_n: self.new_layout()
         elif ctrl and event.key == pygame.K_s and not shift: self.save_current_layout()
         elif ctrl and event.key == pygame.K_s and shift:
-            self.file_prompt_mode = "save_as"; self.file_prompt_buffer = self.layout_filepath or "new_layout.json"
+            self.open_file_prompt("save_as", "")
         elif ctrl and event.key == pygame.K_o:
             self.request_load_layout()
         elif ctrl and shift and event.key == pygame.K_f: self.prompt_save_fragment()
@@ -6576,7 +6741,7 @@ class ApexBOSCreatorApp:
         elif ctrl and shift and event.key == pygame.K_b: self.upload_current_to_banc()
         elif ctrl and event.key == pygame.K_b: self.open_banc_coverage_modal()
         elif event.key == pygame.K_m and not ctrl:
-            self.file_prompt_mode = "merge"; self.file_prompt_buffer = ""
+            self.open_file_prompt("merge", "")
         elif event.key == pygame.K_v and not ctrl: self.run_verification()
         elif event.key == pygame.K_k:
             self.crank_engine()
@@ -6595,6 +6760,9 @@ class ApexBOSCreatorApp:
             is_on = self.engine.toggle_raw_packet_logging()
             st = "ENABLED" if is_on else "DISABLED"
             self.status_toast = f"Engine Raw Packet Logging: {st} -> '{self.engine.raw_log_filepath}'"
+        elif event.key == pygame.K_t and not ctrl and not shift and not self.inplace_editor and not self.file_prompt_mode:
+            self.show_element_attributes = not self.show_element_attributes
+            self.status_toast = f"Element Attributes: {'ON (●WIU ●CTC_ID ●Rules ●GPS ●Occ)' if self.show_element_attributes else 'OFF'}"
         elif event.key == pygame.K_b and not ctrl and not self.inplace_editor:
             self.open_big_map()
         elif event.key == pygame.K_a and self.selected_ids:
@@ -6834,7 +7002,10 @@ class ApexBOSCreatorApp:
 
             if self.active_tool in ELEMENT_TYPES:
                 lx, ly = self.screen_to_logical(mx, my)
-                rx, ry = int(round(lx)), int(round(ly))
+                rx = round(lx * 2.0) / 2.0
+                ry = round(ly * 2.0) / 2.0
+                rx = int(rx) if rx.is_integer() else rx
+                ry = int(ry) if ry.is_integer() else ry
                 self.create_element_at(self.active_tool, rx, ry, (mx, my))
                 self.active_tool = "select"
                 return
@@ -6859,6 +7030,7 @@ class ApexBOSCreatorApp:
                     return
 
                 if hit_id == self.last_click_id and (now - self.last_click_time) < 0.35:
+                    self.status_toast = f"Opening edit panel for '{hit_id}'..."
                     self.push_undo_state()
                     self.selected_ids = {hit_id}
                     self.inplace_editor = InPlaceElementEditor(
@@ -6872,6 +7044,7 @@ class ApexBOSCreatorApp:
                         is_newly_created=False,
                         get_ref_gps_cb=lambda el_ref=el: self.get_active_ref_gps(el_ref),
                     )
+                    self.status_toast = f"Opened editor for '{hit_id}'."
                     self.last_click_time = 0.0
                     return
 
@@ -6985,15 +7158,17 @@ class ApexBOSCreatorApp:
                 self._apply_track_endpoint_drag(trk, fixed_pt, self.track_end_drag_curr_logical, finalize_subdivision=False)
         elif self.dragging_selection and self.selected_ids:
             mlx, mly = self.screen_to_logical(mx, my)
-            dx = int(round(mlx - self.drag_anchor_logical[0]))
-            dy = int(round(mly - self.drag_anchor_logical[1]))
+            dx = round((mlx - self.drag_anchor_logical[0]) * 2.0) / 2.0
+            dy = round((mly - self.drag_anchor_logical[1]) * 2.0) / 2.0
             if (dx != 0 or dy != 0) and not self.drag_moved:
                 self.push_undo_state()
                 self.drag_moved = True
             for sid, (ox, oy) in self.drag_initial_positions.items():
                 if sid in self.engine.elements:
-                    self.engine.elements[sid].x = ox + dx
-                    self.engine.elements[sid].y = oy + dy
+                    nx = round((float(ox) + float(dx)) * 2.0) / 2.0
+                    ny = round((float(oy) + float(dy)) * 2.0) / 2.0
+                    self.engine.elements[sid].x = int(nx) if nx.is_integer() else nx
+                    self.engine.elements[sid].y = int(ny) if ny.is_integer() else ny
         elif self.box_selecting:
             self.box_curr_screen = (mx, my)
         elif self.is_panning:
@@ -7041,9 +7216,9 @@ class ApexBOSCreatorApp:
             self.request_import_atcs()
         elif bkey == "save": self.save_current_layout()
         elif bkey == "save_as":
-            self.file_prompt_mode = "save_as"; self.file_prompt_buffer = self.layout_filepath or "new_layout.json"
+            self.open_file_prompt("save_as", "")
         elif bkey == "merge":
-            self.file_prompt_mode = "merge"; self.file_prompt_buffer = ""
+            self.open_file_prompt("merge", "")
         elif bkey == "save_frag":
             self.prompt_save_fragment()
         elif bkey == "load_frag":
@@ -7055,6 +7230,9 @@ class ApexBOSCreatorApp:
         elif bkey == "toggle_labels":
             self.show_labels = not self.show_labels
             self.status_toast = f"Labels {'Shown' if self.show_labels else 'Hidden'}"
+        elif bkey == "toggle_elem_attrs":
+            self.show_element_attributes = not self.show_element_attributes
+            self.status_toast = f"Element Attributes: {'ON (●WIU ●CTC_ID ●Rules ●GPS ●Occ)' if self.show_element_attributes else 'OFF'}"
         elif bkey == "toggle_inferred":
             self.show_inferred_trains = not self.show_inferred_trains
             self.status_toast = f"Inferred Train Badges {'Shown' if self.show_inferred_trains else 'Hidden'}"
@@ -7409,6 +7587,7 @@ class ApexBOSCreatorApp:
         lbl_font_bold = self._get_element_label_font(bold=True) if self.show_labels else self.font_sm_bold
 
         for eid, el in elements.items():
+            top_y = None
             etype = el["elem_type"]
             sx, sy = self.logical_to_screen(el["x"], el["y"])
             is_sel = (eid in self.selected_ids)
@@ -7443,6 +7622,7 @@ class ApexBOSCreatorApp:
                     lamp_rgb = LAMP_COLORS["BLACK"]
                 if self.zoom < 0.55:
                     pygame.draw.circle(self.screen, lamp_rgb, (sx, sy), r_sig)
+                    self._draw_signal_circle_direction(sx, sy, r_sig, el.get("direction", "E"), lamp_rgb)
                 else:
                     pygame.draw.circle(self.screen, (18, 22, 28), (sx, sy), r_sig + 2)
                     pygame.draw.circle(self.screen, lamp_rgb, (sx, sy), r_sig)
@@ -7457,6 +7637,10 @@ class ApexBOSCreatorApp:
                     self.screen.blit(s_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
                         pygame.draw.rect(self.screen, (0, 240, 255), (lbl_x - 3, lbl_y - 2, s_surf.get_width() + 6, s_surf.get_height() + 4), 1, border_radius=2)
+                    if lpos == "top":
+                        top_y = lbl_y
+                if top_y is None:
+                    top_y = sy - (r_sig + 2)
 
             elif etype == "track":
                 if draw_handles_all or is_sel or (self.dragging_track_end is not None and self.dragging_track_end[0] == eid):
@@ -7484,6 +7668,8 @@ class ApexBOSCreatorApp:
                     self.screen.blit(id_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
                         pygame.draw.rect(self.screen, (0, 240, 255), (lbl_x - 3, lbl_y - 2, id_surf.get_width() + 6, id_surf.get_height() + 4), 1, border_radius=2)
+                    if lpos == "top":
+                        top_y = lbl_y
 
                 if el.get("occupied"):
                     is_inferred = el.get("inferred_occupied") and not el.get("hw_occupied")
@@ -7508,6 +7694,11 @@ class ApexBOSCreatorApp:
                         badge_pos = "bottom" if lpos == "top" else ("top" if lpos == "bottom" else ("right" if lpos == "left" else "left"))
                         bx, by = self._get_label_rect(sx, sy, pad_w, pad_h, badge_pos, int(12 * self.zoom))
                         self.screen.blit(badge_box, (bx, by))
+                        if badge_pos == "top":
+                            top_y = min(top_y, by) if top_y is not None else by
+
+                if top_y is None:
+                    top_y = sy - max(4, int(6 * self.zoom))
 
             elif etype == "turnout":
                 sz = max(4 if self.zoom < 0.55 else 6, int(7 * self.zoom))
@@ -7525,6 +7716,10 @@ class ApexBOSCreatorApp:
                     self.screen.blit(t_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
                         pygame.draw.rect(self.screen, (0, 240, 255), (lbl_x - 3, lbl_y - 2, t_surf.get_width() + 6, t_surf.get_height() + 4), 1, border_radius=2)
+                    if lpos == "top":
+                        top_y = lbl_y
+                if top_y is None:
+                    top_y = sy - sz
 
             elif etype == "crossing":
                 gate = el.get("gate_status", "OPEN")
@@ -7537,6 +7732,10 @@ class ApexBOSCreatorApp:
                     c_surf = self._render_cached_text(self.font_sm, f"{disp_tag}[{gate}]", col)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, c_surf.get_width(), c_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(c_surf, (lbl_x, lbl_y))
+                    if lpos == "top":
+                        top_y = lbl_y
+                if top_y is None:
+                    top_y = sy - sz
 
             elif etype == "base":
                 sz = max(7, int(9 * self.zoom))
@@ -7578,6 +7777,10 @@ class ApexBOSCreatorApp:
                     b_surf = self._render_cached_text(self.font_sm, f"{disp_tag}{rad_tag}(Ch{el.get('channel')})", col)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
+                    if lpos == "top":
+                        top_y = lbl_y
+                if top_y is None:
+                    top_y = sy - sz - 3
 
             elif etype == "station":
                 w, h = max(14, int(18 * self.zoom)), max(10, int(12 * self.zoom))
@@ -7587,16 +7790,24 @@ class ApexBOSCreatorApp:
                     s_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_LANDMARK)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, s_surf.get_width(), s_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(s_surf, (lbl_x, lbl_y))
+                    if lpos == "top":
+                        top_y = lbl_y
+                if top_y is None:
+                    top_y = sy - h // 2
 
             elif etype == "bridge":
                 w, h = max(18, int(24 * self.zoom)), max(10, int(14 * self.zoom))
-                pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy - h // 2), (sx + w // 2, sy - h // 2), 2)
-                pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy + h // 2), (sx + w // 2, sy + h // 2), 2)
+                pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy - h // 2, (sx + w // 2), sy - h // 2), 2)
+                pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy + h // 2, (sx + w // 2), sy + h // 2), 2)
 
                 if show_elem_labels or (is_sel and self.show_labels):
                     b_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
+                    if lpos == "top":
+                        top_y = lbl_y
+                if top_y is None:
+                    top_y = sy - h // 2
 
             elif etype == "diamond":
                 sz = max(8, int(11 * self.zoom))
@@ -7607,6 +7818,10 @@ class ApexBOSCreatorApp:
                     d_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, d_surf.get_width(), d_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(d_surf, (lbl_x, lbl_y))
+                    if lpos == "top":
+                        top_y = lbl_y
+                if top_y is None:
+                    top_y = sy - sz
 
             elif etype == "label":
                 if self.show_labels:
@@ -7627,6 +7842,10 @@ class ApexBOSCreatorApp:
                     j_surf = self._render_cached_text(self.font_sm, f"{eid}[{letter}{pair_tag}]", COLOR_EDIT_ACCENT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, j_surf.get_width(), j_surf.get_height(), lpos, rad + 4)
                     self.screen.blit(j_surf, (lbl_x, lbl_y))
+                    if lpos == "top":
+                        top_y = lbl_y
+                if top_y is None:
+                    top_y = sy - rad
 
             elif etype in ("ptc_datetime", "date_time", "datetime"):
                 def_w = el.get("width") or 240
@@ -7764,6 +7983,9 @@ class ApexBOSCreatorApp:
                         panel.blit(self.font_sm.render("Optional Telemetry List Panel (Double-click to configure size & rows)", True, COLOR_TEXT_DIM), (10, 34))
                     self.screen.blit(panel, (sx, sy))
 
+            if self.show_element_attributes and top_y is not None:
+                self._draw_element_attribute_dots(el, sx, sy, top_y)
+
         if self.box_selecting:
             x1, y1 = self.box_start_screen
             x2, y2 = self.box_curr_screen
@@ -7781,6 +8003,98 @@ class ApexBOSCreatorApp:
         else:
             pts = [(cx - sz, cy - sz // 2), (cx, cy + sz), (cx + sz, cy - sz // 2)]
         pygame.draw.lines(self.screen, (15, 18, 22), False, pts, 2)
+
+    def _draw_signal_circle_direction(self, cx: int, cy: int, r: int, direction: str, lamp_color: Tuple[int, int, int]):
+        ux, uy = SIGNAL_DIR_OFFSETS.get((direction or "E").upper(), (1.0, 0.0))
+        ext = r + 3
+        ex = int(cx + ux * ext)
+        ey = int(cy + uy * ext)
+        ptr_col = COLOR_SIGNAL_MAST if lamp_color == LAMP_COLORS["BLACK"] else lamp_color
+        pygame.draw.line(self.screen, ptr_col, (cx, cy), (ex, ey), 2)
+
+    def _draw_element_attribute_dots(self, el: dict, sx: int, sy: int, top_y: Optional[int] = None):
+        """
+        Draws visual attribute indicators above layout elements when show_element_attributes is True:
+        - Slot 0: Green dot if element has WIU ID defined
+        - Slot 1: Orange dot if element has CTC ID
+        - Slot 2: Purple dot if element has CTC Rules
+        - Slot 3: Cyan dot if element has GPS
+        - Slot 4: Red dot if element has occupancy information
+        Missing items leave their dot position blank.
+        """
+        if not getattr(self, "show_element_attributes", False):
+            return
+
+        etype = el.get("elem_type")
+        if etype in SYSTEM_LIST_TYPES or etype == "label" or etype in ("ptc_datetime", "date_time", "datetime"):
+            return
+
+        # 1. Green Dot if element has WIU ID defined
+        wiu = el.get("wiu_id")
+        if wiu is None and etype == "base":
+            wiu = el.get("radio_id")
+        has_wiu = wiu is not None and str(wiu).strip() not in ("", "None")
+
+        # 2. Orange Dot if element has CTC ID
+        ctc_id = el.get("ctc_id")
+        has_ctc_id = bool(ctc_id and str(ctc_id).strip() and str(ctc_id).strip() != "None")
+
+        # 3. Purple Dot if element has CTC Rules
+        ctc_rules = el.get("ctc_rules")
+        has_ctc_rules = bool(ctc_rules and str(ctc_rules).strip() and str(ctc_rules).strip() != "None")
+
+        # 4. Cyan Dot if element has GPS
+        gps = el.get("gps")
+        has_gps = bool(
+            gps and isinstance(gps, (list, tuple)) and len(gps) >= 2
+            and gps[0] is not None and gps[1] is not None
+            and str(gps[0]).strip() not in ("", "None") and str(gps[1]).strip() not in ("", "None")
+        )
+
+        # 5. Red Dot if element has occupancy information
+        occ_off = el.get("occ_bit_offset")
+        has_occ = bool(
+            str(el.get("has_occ_bit", "")).lower() in ("true", "1")
+            or (occ_off is not None and str(occ_off).strip() not in ("", "None"))
+            or el.get("occ_bit") is not None
+            or el.get("occupancy_bit") is not None
+        )
+
+        if not (has_wiu or has_ctc_id or has_ctc_rules or has_gps or has_occ):
+            return
+
+        dot_r = max(2, min(4, int(2.5 * self.zoom + 0.5)))
+        dot_step = max(5, int(dot_r * 2.5))
+
+        if top_y is not None:
+            dot_y = top_y - max(4, int(5 * self.zoom))
+        else:
+            dot_y = sy - max(9, int(12 * self.zoom))
+
+        if hasattr(self, "_last_drawn_attr_dots") and isinstance(self._last_drawn_attr_dots, dict):
+            self._last_drawn_attr_dots[el.get("id", "")] = {
+                "wiu": has_wiu,
+                "ctc_id": has_ctc_id,
+                "ctc_rules": has_ctc_rules,
+                "gps": has_gps,
+                "occ": has_occ,
+                "dots": [has_wiu, has_ctc_id, has_ctc_rules, has_gps, has_occ],
+                "y": dot_y,
+            }
+
+        slots = (
+            (has_wiu, (40, 220, 80)),        # 0: Green - WIU ID
+            (has_ctc_id, (255, 145, 0)),      # 1: Orange - CTC ID
+            (has_ctc_rules, (185, 80, 245)),  # 2: Purple - CTC Rules
+            (has_gps, (0, 230, 255)),         # 3: Cyan - GPS
+            (has_occ, (245, 50, 50)),         # 4: Red - Occupancy
+        )
+
+        for i, (present, col) in enumerate(slots):
+            if present:
+                xi = sx + (i - 2) * dot_step
+                pygame.draw.circle(self.screen, (15, 18, 24), (xi, dot_y), dot_r + 1)
+                pygame.draw.circle(self.screen, col, (xi, dot_y), dot_r)
 
     def draw_hud(self):
         self.hud_buttons.clear()
@@ -7847,6 +8161,7 @@ class ApexBOSCreatorApp:
             # Group 6: View & Logic Toggles
             [
                 ("toggle_labels", "Lbls(On)" if self.show_labels else "Lbls(Off)"),
+                ("toggle_elem_attrs", "Attrs(On)" if self.show_element_attributes else "Attrs(Off)"),
                 ("toggle_inferred", "InfTrns(On)" if self.show_inferred_trains else "InfTrns(Off)"),
                 ("toggle_infer_logic", "InferLogic(On)" if self.enable_inference_logic else "InferLogic(Off)"),
                 ("toggle_raw_log", "● REC LOG" if (getattr(self.engine, "raw_packet_logging", False) and (int(time.time() * 2) % 2 == 0)) else ("REC LOG" if getattr(self.engine, "raw_packet_logging", False) else "LogOff")),
@@ -7918,9 +8233,10 @@ class ApexBOSCreatorApp:
                     bg = (195, 35, 35) if (is_log_on and flash_log) else ((120, 25, 25) if is_log_on else (45, 52, 68))
                 elif bkey in ("tool_packet_scroller", "tool_address_table", "tool_train_scroller", "tool_chat"):
                     bg = (70, 52, 115)
-                elif bkey in ("toggle_labels", "toggle_inferred", "toggle_infer_logic"):
+                elif bkey in ("toggle_labels", "toggle_elem_attrs", "toggle_inferred", "toggle_infer_logic"):
                     bg = (45, 105, 155) if (
                         (self.show_labels and bkey == "toggle_labels") or
+                        (self.show_element_attributes and bkey == "toggle_elem_attrs") or
                         (self.show_inferred_trains and bkey == "toggle_inferred") or
                         (self.enable_inference_logic and bkey == "toggle_infer_logic")
                     ) else (45, 60, 85)
@@ -8203,6 +8519,26 @@ class ApexBOSCreatorApp:
 
         if node_id is not None and str(node_id).strip() != "" and str(node_id) != "None":
             parts.append(f"NodeID: {node_id}")
+
+        ctc_id = getattr(el, "ctc_id", None) or (el.get("ctc_id") if isinstance(el, dict) else None)
+        if ctc_id and str(ctc_id).strip() and str(ctc_id).strip() != "None":
+            parts.append(f"CTC: {str(ctc_id).strip()}")
+
+        ctc_rules = getattr(el, "ctc_rules", None) or (el.get("ctc_rules") if isinstance(el, dict) else None)
+        if ctc_rules and str(ctc_rules).strip() and str(ctc_rules).strip() != "None":
+            parts.append(f"Rules: {str(ctc_rules).strip()}")
+
+        gps_val = getattr(el, "gps", None) or (el.get("gps") if isinstance(el, dict) else None)
+        if gps_val and isinstance(gps_val, (list, tuple)) and len(gps_val) >= 2 and gps_val[0] is not None and gps_val[1] is not None:
+            try:
+                parts.append(f"GPS: ({float(gps_val[0]):.4f}, {float(gps_val[1]):.4f})")
+            except (ValueError, TypeError):
+                pass
+
+        has_occ = getattr(el, "has_occ_bit", False) or (el.get("has_occ_bit") if isinstance(el, dict) else False)
+        occ_off = getattr(el, "occ_bit_offset", None) or (el.get("occ_bit_offset") if isinstance(el, dict) else None)
+        if has_occ or (occ_off is not None and str(occ_off).strip() not in ("", "None")):
+            parts.append(f"OccBit: {occ_off if occ_off is not None else 'Yes'}")
 
         avg_rssi = getattr(el, "avg_rssi", getattr(el, "rssi_avg", None))
         if avg_rssi is None and isinstance(el, dict):

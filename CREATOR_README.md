@@ -64,10 +64,11 @@ Built on Pygame with anti-aliased vector rendering, the Creator allows hobbyists
    - [Track Neighbor Relationships (`N`, `S`, `E`, `W`)](#track-neighbor-relationships-n-s-e-w)
    - [Turnout Common, Normal & Reverse Route Binding](#turnout-common-normal--reverse-route-binding)
    - [Signal Governance, Protected & Rear Block Correlation](#signal-governance-protected--rear-block-correlation)
-6. [Related Elements Hover Visualization](#related-elements-hover-visualization)
+6. [Related Elements Hover & Attribute Visualization](#related-elements-hover--attribute-visualization)
    - [Track Element Hover: Neighbors & Parallel Tracks](#track-element-hover-neighbors--parallel-tracks)
    - [Signal Element Hover: Protected vs. Rear Blocks](#signal-element-hover-protected-vs-rear-blocks)
    - [Turnout Element Hover: Common, Normal, Reverse & Guard Signals](#turnout-element-hover-common-normal-reverse--guard-signals)
+   - [Graphical Element Attribute Indicators (Attrs Toggle)](#graphical-element-attribute-indicators-attrs-toggle)
 7. [In-Place Property Editor & WIU Assignment](#in-place-property-editor--wiu-assignment)
    - [Editing Element Properties](#editing-element-properties)
    - [Wayside Interface Unit (WIU ID) Assignment](#wayside-interface-unit-wiu-id-assignment)
@@ -343,7 +344,7 @@ Signals govern movements across specific track blocks:
 
 ---
 
-## Related Elements Hover Visualization
+## Related Elements Hover & Attribute Visualization
 
 To eliminate guesswork when inspecting complex junctions, the Creator incorporates real-time relationship highlighting activated by holding the **`Shift`** key while hovering over an element:
 
@@ -379,6 +380,56 @@ To eliminate guesswork when inspecting complex junctions, the Creator incorporat
 - **Green Outline & Leader Line**: Highlights the normal tangent track leg.
 - **Blue/Magenta Outline & Leader Line**: Highlights the reverse diverging track leg.
 - **Cyan Pulsing Rings**: Highlights all signals guarding movements across the switch points.
+
+### Graphical Element Attribute Indicators (Attrs Toggle)
+
+The Creator includes an on-demand graphical attribute overlay that renders a structured colored dotted line directly above each physical layout element (`Tracks`, `Turnouts`, `Signals`, `Crossings`, `Base Stations`, `Stations`, `Bridges`, `Diamonds`, and `Track Jumps`).
+
+#### Toggling the Attribute Display
+- **HUD Toolbar Button**: Click the **`Attrs(On)` / `Attrs(Off)`** button in Group 6 (*View & Logic Toggles*) on the top toolbar. When active, the button highlights with an active blue background `(45, 105, 155)`.
+- **Keyboard Shortcut**: Press **`T`** while working in the canvas.
+- **Status Toast Feedback**: Toggling the feature displays an instant confirmation toast in the status bar:
+  - Enabled: `Element Attributes: ON (●WIU ●CTC_ID ●Rules ●GPS ●Occ)`
+  - Disabled: `Element Attributes: OFF`
+- **Zero Overhead When Disabled**: Because evaluating attributes across large layouts (e.g. 500+ track segments and interlockings) requires numerous property queries, attribute determination and drawing are completely bypassed when the toggle is off.
+
+#### Dot Layout & Slot Positions
+Above each layout element, up to five colored dots are rendered in a horizontal dotted line. The dots occupy five fixed horizontal slots centered above the element:
+
+```
+    [Slot 0]      [Slot 1]      [Slot 2]      [Slot 3]      [Slot 4]
+       ●             ●             ●             ●             ●
+     Green        Orange        Purple         Cyan           Red
+    (WIU ID)     (CTC ID)       (Rules)        (GPS)         (Occ)
+```
+
+| Slot Index | Color | RGB Value | Attribute Checked | Description |
+|:---:|:---:|:---:|:---:|:---|
+| **0** | **Green** | `(40, 220, 80)` | **WIU ID Defined** | Element has a Wayside Interface Unit address (`wiu_id`) defined (or `radio_id` for base stations). |
+| **1** | **Orange** | `(255, 145, 0)` | **CTC ID Defined** | Element has an assigned Centralized Traffic Control identifier (`ctc_id`, e.g. `UP.0201.20`). |
+| **2** | **Purple** | `(185, 80, 245)` | **CTC Rules Defined** | Element has CTC interlocking rules assigned (`ctc_rules`, e.g. `K:1WG&1EG=1TE`). |
+| **3** | **Cyan** | `(0, 230, 255)` | **GPS Defined** | Element has real-world geographic coordinates (`gps` `[latitude, longitude]`) defined. |
+| **4** | **Red** | `(245, 50, 50)` | **Occupancy Defined** | Element has hardware track occupancy tracking configured (`has_occ_bit` or `occ_bit_offset`). |
+
+#### Blank Slot Behavior
+If an element is missing an attribute, its corresponding dot position is left **blank** rather than shifting adjacent dots. This maintains a fixed, columnar alignment across all elements on the canvas:
+- **Fully Configured Element**: `● ● ● ● ●` (All 5 dots present).
+- **Track with WIU & Occupancy Only**: `●       ●` (Green at Slot 0, blank at 1, 2, 3, Red at Slot 4).
+- **Element with GPS Coordinates Only**: `      ●   ` (Blank at 0, 1, 2, Cyan at Slot 3, blank at 4).
+- **Turnout with WIU, CTC ID & Rules**: `● ● ●     ` (Green at 0, Orange at 1, Purple at 2, blank at 3, 4).
+- **Bare / Unassigned Track**: No dots drawn (all 5 slots blank).
+
+#### Dynamic Vertical Positioning
+The dotted line automatically adjusts its vertical position so it never collides with labels, track lines, or train badges:
+- **Elements with Top Labels**: Floats cleanly above the element's label text (`lbl_y - 5px`).
+- **Elements with Bottom/Side Labels (or Labels Hidden)**: Positioned directly above the physical element body (`sy - offset`).
+- **Occupied Tracks with Top Train Badges**: When a train occupancy badge is drawn above the track (`lpos != "top"`), the attribute dots float above the top of the train badge.
+
+#### Contextual Hover Inspection
+In addition to the visual dotted overlay, hovering the mouse cursor over any layout element presents an expanded tooltip containing all configured attributes:
+```
+ID: T1 | 'Main 1' | WIU: 1001 | CTC: UP.1001.01 | Rules: K:1WG&1EG=1TE | GPS: (34.0522, -118.2437) | OccBit: 3 | RSSI Avg: -72.4 dBm
+```
 
 ---
 
@@ -518,9 +569,10 @@ python ApexBOSCreator.py --lat 34.1234 --lon -118.6543 --radius 25.0 layouts/my_
 | `0` | Canvas | **Track Jump Tool**: Activates broken-line track connector placement. |
 | `A` | Selected Elem | **Topology Assistant**: Auto-wires neighbors and route links. |
 | `X` | Selected Track | **Split Track**: Divides selected track segment into two halves. |
+| `T` | Canvas | **Toggle Attribute Indicators**: Toggles visual colored dotted attribute indicators above elements (`Attrs(On)` / `Attrs(Off)`). |
 | `R` / `Shift+R` | Selection | **Rotate 45° CW / CCW**: Rotates a single selected track in place, or rotates **multiple selected layout elements** together around their common center of mass (updating positions, track orientations/neighbor directions, turnout legs, signals, and track jumps). |
 | `Arrow Keys` | Canvas | **Pan Camera**: Scrolls the schematic viewport smoothly. |
-| `Shift+Arrow Keys` | Selection | **Move Selected Element(s)**: Nudges one or more selected elements by 1 logical grid unit per tap (hold to repeat smoothly) without panning the camera. |
+| `Shift+Arrow Keys` | Selection | **Move Selected Element(s)**: Nudges one or more selected elements by 0.5 logical grid units per tap (hold to repeat smoothly) without panning the camera. |
 | `K` | Canvas | **Crank Engine**: Runs in-memory DispatcherEngine simulation pass. |
 | `S` | Sim/Crank Mode | **All Stop**: Instantly turns all signals across layout to Red/Stop aspect. |
 | `V` | Canvas | **Verify Layout**: Runs automated topological and syntax audit. |
@@ -547,7 +599,7 @@ python ApexBOSCreator.py --lat 34.1234 --lon -118.6543 --radius 25.0 layouts/my_
 - **Left Click on Element**: Selects element for dragging, `Shift + Arrow` nudging, or editing (`Shift + Click` toggles multi-selection; dragging on empty canvas box-selects multiple elements).
 - **Double Click on Element**: Opens the In-Place Property Editor.
 - **Right Click & Drag (Track End)**: Stretches or curves track segment using endpoint handles.
-- **Hover on Element**: Displays contextual element identification tooltip (ID, Display Label, WIU, RSSI).
+- **Hover on Element**: Displays contextual element identification tooltip (ID, Display Label, WIU ID, Radio Ch, NodeID, CTC ID, CTC Rules, GPS coordinates, Occupancy Bit, RSSI).
 - **Shift + Hover on Element**: Displays contextual related-element lines, pulse rings, and relationship callouts (neighbors, normal/reverse legs, protected blocks).
 - **Inside Big Map (`B`)**:
   - Left-drag to pan geographic map.

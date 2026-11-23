@@ -38,6 +38,162 @@ DEFAULT_ATCS_FRAGS_DIR = os.path.join("frags", "atcs")
 LOGICAL_UNITS_PER_MILE = 4.0
 GRID_SCALE = 2  # Each ATCS tile maps to 2 logical grid units (0.5 mi tangent)
 
+DELTA_TO_DIR = {
+    (-1, 0): "W",
+    (1, 0): "E",
+    (0, -1): "N",
+    (0, 1): "S",
+    (1, -1): "NE",
+    (-1, 1): "SW",
+    (-1, -1): "NW",
+    (1, 1): "SE",
+}
+OPPOSITE_DIR = {
+    "E": "W",
+    "W": "E",
+    "N": "S",
+    "S": "N",
+    "NE": "SW",
+    "SW": "NE",
+    "NW": "SE",
+    "SE": "NW",
+}
+TRACK_VALID_DIRS = {
+    1: {"E", "W"},
+    2: {"E", "W"},
+    3: {"E", "W"},
+    7: {"E", "W"},
+    21: {"E", "W"},
+    15: {"N", "S"},
+    4: {"NE", "SW"},
+    5: {"NW", "SE"},
+    6: {"W", "NE"},
+    8: {"E", "SW"},
+    9: {"W", "SE"},
+    14: {"NW", "S"},
+}
+
+
+def _load_rrdata() -> Dict[str, str]:
+    """Loads railroad codes from config/rrdata.json, with built-in fallbacks."""
+    fallbacks = {
+        "802": "UP",
+        "022": "BNSF",
+        "076": "BNSF",
+        "891": "AMTK",
+        "340": "SCAX",
+        "125": "CSXT",
+        "168": "CSSB",
+        "190": "CSAO",
+        "400": "KCS",
+        "401": "KCT",
+        "103": "CN",
+        "024": "SEPTA",
+        "083": "BRC",
+        "105": "CPRS",
+        "107": "SFRV",
+        "263": "FEC",
+        "550": "NS",
+        "574": "NJTR",
+        "605": "CFRC",
+        "671": "MRL",
+        "708": "JPBX",
+        "751": "TRE",
+        "001": "NMRX",
+        "318": "NMRX",
+        "510": "METX",
+    }
+    for cand in ("config/rrdata.json", os.path.join(os.path.dirname(__file__), "config", "rrdata.json")):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        fallbacks.update({str(k): str(v) for k, v in data.items() if k != "DEF"})
+                        break
+            except Exception:
+                pass
+    return fallbacks
+
+
+def compute_ctc_id_from_device_id(raw_id: Any, rrdata: Optional[Dict[str, str]] = None) -> str:
+    """
+    Computes a CTC ID string formatted as '<rr>.<5th-10th_digit>.nn' where <rr> is the
+    lowercase Railroad identifier derived from the 2nd through 4th digits (1-indexed)
+    via rrdata.json, and 'nn' is the literal placeholder string.
+    Example: 78029430080202 -> 'up.943008.nn'.
+    """
+    if raw_id is None:
+        return ""
+    if isinstance(raw_id, dict):
+        raw_id = raw_id.get("wiu_id") or raw_id.get("id") or raw_id.get("label") or ""
+    elif hasattr(raw_id, "wiu_id") and getattr(raw_id, "wiu_id", None):
+        raw_id = getattr(raw_id, "wiu_id")
+    digits = re.sub(r"\D", "", str(raw_id))
+    if len(digits) < 4:
+        return ""
+    if rrdata is None:
+        rrdata = _load_rrdata()
+    rr_code = digits[1:4]
+    rr_name = rrdata.get(rr_code, rr_code).lower()
+    sub_id = digits[4:10] if len(digits) >= 10 else digits[4:]
+    return f"{rr_name}.{sub_id}.nn"
+
+
+def _resolve_ctc_rule(name: str, cp: str, candidate_rules: List[str]) -> str:
+    """Finds matching CTC rule starting with C: or K: for an element."""
+    clean_name = str(name or "").strip()
+    clean_cp = str(cp or "").strip()
+    if not clean_cp and ":" in clean_name:
+        pfx = clean_name.split(":", 1)[0]
+        clean_cp = pfx[1:] if pfx.startswith("P") and len(pfx) > 1 else pfx
+
+    # 1. Exact match to a candidate rule
+    for rule in candidate_rules:
+        if clean_name and (clean_name == rule or f"{clean_cp}:{clean_name}" == rule):
+            return rule
+
+    # 2. Extract tokens from clean_name
+    name_body = clean_name.split(":")[-1] if ":" in clean_name else clean_name
+    name_tokens = set(re.findall(r"[A-Za-z0-9]+", name_body))
+    name_digits = set(re.findall(r"\d+", name_body))
+
+    matched_rules: List[str] = []
+    # 3. Filter candidate rules for this CP
+    cp_rules = [r for r in candidate_rules if r.startswith(f"{clean_cp}:")] if clean_cp else candidate_rules
+
+    for rule in cp_rules:
+        rule_body = rule.split(":", 1)[1] if ":" in rule else rule
+        rule_tokens = set(re.findall(r"[A-Za-z0-9]+", rule_body))
+        rule_digits = set(re.findall(r"\d+", rule_body))
+
+        # Check exact token match (e.g. GT or HT in C:T=T=GT or HT matching C:GT or C:HT)
+        if name_tokens & rule_tokens:
+            if rule not in matched_rules:
+                matched_rules.append(rule)
+        # Check track digit match (e.g. '1' in 1WG&1EG=1TE matching '1' in 1T or 1EA)
+        elif name_digits and (name_digits & rule_digits):
+            if rule not in matched_rules:
+                matched_rules.append(rule)
+
+    # 4. If no specific token/digit matched, check CP-wide general rules
+    if not matched_rules and clean_cp:
+        for rule in cp_rules:
+            rule_body = rule.split(":", 1)[1] if ":" in rule else rule
+            if not re.search(r"\d", rule_body):
+                if rule not in matched_rules:
+                    matched_rules.append(rule)
+
+    # 5. If still no match and there are rules for this CP, use the first CP rule
+    if not matched_rules and clean_cp and cp_rules:
+        matched_rules.append(cp_rules[0])
+
+    if matched_rules:
+        matched_rules.sort(key=lambda r: (("&" in r or "or" in r), ("=" in r), len(r)), reverse=True)
+        return matched_rules[0]
+
+    return ""
+
 
 def sanitize_fragment_filename(name: str) -> str:
     """Sanitize a layout or strip name into a safe filename stem."""
@@ -302,7 +458,7 @@ def _parse_text_labels(data: bytes, start_offset: int) -> List[Dict[str, Any]]:
         px, py, pw, ph = struct.unpack("<HHHH", data[off + 128 : off + 136])
         if not txt or len(txt) < 2:
             continue
-        if "=" in txt or "&" in txt:
+        if ("=" in txt or "&" in txt) and not (txt.startswith("C:") or txt.startswith("K:")):
             continue
         if any(f in txt for f in ("Courier", "Arial", "Verdana", "Times", "Sans MS", "ntLogo")):
             continue
@@ -458,6 +614,16 @@ def _merge_collinear_tracks(elem_dicts: List[dict]) -> List[dict]:
         head["x"] = int(round((float(head["x"]) + float(tail["x"])) / 2.0))
         head["y"] = int(round((float(head["y"]) + float(tail["y"])) / 2.0))
         head["length_miles"] = round(sum(float(item.get("length_miles", 0.5)) for item in run), 2)
+        if not head.get("ctc_rules"):
+            for item in run[1:]:
+                if item.get("ctc_rules"):
+                    head["ctc_rules"] = item["ctc_rules"]
+                    break
+        if not head.get("ctc_id"):
+            for item in run[1:]:
+                if item.get("ctc_id"):
+                    head["ctc_id"] = item["ctc_id"]
+                    break
 
         # Preserve outer boundary neighbors
         outer_next = [nid for nid in tail.get("neighbors", {}).get(d_next, []) if nid != head["id"]]
@@ -504,6 +670,466 @@ def _merge_collinear_tracks(elem_dicts: List[dict]) -> List[dict]:
         kept.append(el)
 
     return kept
+
+
+def _align_track_transitions(all_elements: List[dict]):
+    """
+    Aligns track endpoints at transitions between horizontal (E-W) tracks and diagonal
+    (NE-SW, NW-SE) tracks so track ends meet seamlessly with zero gap.
+    Moves and resizes both the diagonal and horizontal segments to share the exact
+    45-degree ray intersection point at the horizontal track's Y coordinate.
+    """
+    by_id = {e["id"]: e for e in all_elements}
+
+    def _track_endpoints(e: dict) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        cx, cy = float(e["x"]), float(e["y"])
+        l = float(e.get("length_miles", 0.5) or 0.5)
+        hs = max(0.4, l * 2.0)
+        o = e.get("orientation", "E-W")
+        if o == "N-S":
+            return (cx, cy - hs), (cx, cy + hs)
+        elif o == "NE-SW":
+            d = hs * 0.70710678
+            return (cx - d, cy + d), (cx + d, cy - d)
+        elif o == "NW-SE":
+            d = hs * 0.70710678
+            return (cx - d, cy - d), (cx + d, cy + d)
+        else:
+            return (cx - hs, cy), (cx + hs, cy)
+
+    track_ends: Dict[str, List[Tuple[float, float]]] = {
+        e["id"]: list(_track_endpoints(e))
+        for e in all_elements
+        if e.get("elem_type") == "track"
+    }
+
+    pairs: List[Tuple[dict, dict]] = []
+    seen = set()
+    for e in all_elements:
+        if e.get("elem_type") != "track":
+            continue
+        for d, nlist in e.get("neighbors", {}).items():
+            for nid in nlist:
+                nb = by_id.get(nid)
+                if not nb or nb.get("elem_type") != "track":
+                    continue
+                pair = tuple(sorted([e["id"], nb["id"]]))
+                if pair in seen:
+                    continue
+                o1, o2 = e.get("orientation"), nb.get("orientation")
+                if (o1 == "E-W" and o2 in ("NE-SW", "NW-SE")) or (o2 == "E-W" and o1 in ("NE-SW", "NW-SE")):
+                    seen.add(pair)
+                    h_el = e if o1 == "E-W" else nb
+                    d_el = nb if o1 == "E-W" else e
+                    pairs.append((h_el, d_el))
+
+    for h, d in pairs:
+        h_ends = track_ends[h["id"]]
+        d_ends = track_ends[d["id"]]
+        y_h = float(h["y"])
+
+        best_d_idx, best_h_idx = 0, 0
+        min_dist = float("inf")
+        for di, pd in enumerate(d_ends):
+            for hi, ph in enumerate(h_ends):
+                dist = math.hypot(pd[0] - ph[0], pd[1] - ph[1])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_d_idx = di
+                    best_h_idx = hi
+
+        d_other_idx = 1 - best_d_idx
+        x_d0, y_d0 = d_ends[d_other_idx]
+
+        d_orient = d.get("orientation")
+        dy = y_h - y_d0
+        if d_orient == "NE-SW":
+            x_trans = x_d0 - dy
+        else:  # NW-SE
+            x_trans = x_d0 + dy
+
+        d_ends[best_d_idx] = (x_trans, y_h)
+        h_ends[best_h_idx] = (x_trans, y_h)
+
+    for eid, ends in track_ends.items():
+        el = by_id[eid]
+        p0, p1 = ends
+        cx = (p0[0] + p1[0]) / 2.0
+        cy = (p0[1] + p1[1]) / 2.0
+        seg_len = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        l_mi = round(seg_len / 4.0, 3)
+        if l_mi < 0.1:
+            l_mi = 0.25
+        el["x"] = round(cx, 2)
+        el["y"] = round(cy, 2)
+        el["length_miles"] = l_mi
+
+
+def _link_track_neighbors_by_radius(all_elements: List[dict], radius: float = 1.75):
+    """
+    Connects track endpoints that are missing neighbors by searching in a small radius
+    (+-1.75 grid squares) around track ends for nearby compatible track ends or turnouts.
+    """
+    by_id = {e["id"]: e for e in all_elements}
+    tracks = [e for e in all_elements if e.get("elem_type") == "track"]
+    turnouts = [e for e in all_elements if e.get("elem_type") == "turnout"]
+
+    dir_vec = {
+        "E": (1.0, 0.0), "W": (-1.0, 0.0), "N": (0.0, -1.0), "S": (0.0, 1.0),
+        "NE": (0.70710678, -0.70710678), "SW": (-0.70710678, 0.70710678),
+        "NW": (-0.70710678, -0.70710678), "SE": (0.70710678, 0.70710678),
+    }
+
+    def _dirs_compatible(d1: str, d2: str) -> bool:
+        v1 = dir_vec.get(d1, (0.0, 0.0))
+        v2 = dir_vec.get(d2, (0.0, 0.0))
+        return (v1[0] * v2[0] + v1[1] * v2[1]) <= 0.1
+
+    def _track_endpoints(e: dict) -> List[Tuple[str, Tuple[float, float]]]:
+        cx, cy = float(e["x"]), float(e["y"])
+        l = float(e.get("length_miles", 0.5) or 0.5)
+        hs = max(0.4, l * 2.0)
+        o = e.get("orientation", "E-W")
+        if o == "N-S":
+            return [("N", (cx, cy - hs)), ("S", (cx, cy + hs))]
+        elif o == "NE-SW":
+            d = hs * 0.70710678
+            return [("SW", (cx - d, cy + d)), ("NE", (cx + d, cy - d))]
+        elif o == "NW-SE":
+            d = hs * 0.70710678
+            return [("NW", (cx - d, cy - d)), ("SE", (cx + d, cy + d))]
+        else:
+            return [("W", (cx - hs, cy)), ("E", (cx + hs, cy))]
+
+    OPP = {"E": "W", "W": "E", "N": "S", "S": "N", "NE": "SW", "SW": "NE", "NW": "SE", "SE": "NW"}
+
+    all_ends: List[Tuple[str, str, Tuple[float, float]]] = []
+    for t in tracks:
+        for d, pt in _track_endpoints(t):
+            all_ends.append((t["id"], d, pt))
+
+    for t in tracks:
+        nbrs = t.setdefault("neighbors", {})
+        existing_nbr_ids: Set[str] = set()
+        for nlist in nbrs.values():
+            existing_nbr_ids.update(nlist)
+
+        for out_dir, pt in _track_endpoints(t):
+            has_nbr = any(
+                d in nbrs and nbrs[d]
+                for d in [out_dir, out_dir[0] if len(out_dir) == 2 else out_dir]
+            )
+            if has_nbr:
+                continue
+
+            best_cand, best_dist = None, radius
+            v_out = dir_vec.get(out_dir, (0.0, 0.0))
+
+            for o_id, in_dir, o_pt in all_ends:
+                if o_id == t["id"] or o_id in existing_nbr_ids:
+                    continue
+                if not _dirs_compatible(out_dir, in_dir):
+                    continue
+                o_el = by_id.get(o_id)
+                if o_el:
+                    o_nbrs = o_el.get("neighbors", {})
+                    if any(d in o_nbrs and o_nbrs[d] for d in [in_dir, in_dir[0] if len(in_dir) == 2 else in_dir]):
+                        continue
+
+                dist = math.hypot(pt[0] - o_pt[0], pt[1] - o_pt[1])
+                if dist <= best_dist:
+                    best_dist = dist
+                    best_cand = (o_id, out_dir, in_dir)
+
+            for to in turnouts:
+                if to["id"] in existing_nbr_ids:
+                    continue
+                has_free_leg = any(not to.get(leg) for leg in ("common_neighbor", "normal_neighbor", "reverse_neighbor"))
+                if not has_free_leg:
+                    continue
+                dx_to = to["x"] - pt[0]
+                dy_to = to["y"] - pt[1]
+                if (dx_to * v_out[0] + dy_to * v_out[1]) < -0.1:
+                    continue
+                dist = math.hypot(dx_to, dy_to)
+                if dist <= best_dist:
+                    best_dist = dist
+                    best_cand = (to["id"], out_dir, None)
+
+            if best_cand:
+                nb_id, d_out, d_in = best_cand
+                if nb_id not in nbrs.setdefault(d_out, []):
+                    nbrs[d_out].append(nb_id)
+                    existing_nbr_ids.add(nb_id)
+                    if nb_id in by_id and by_id[nb_id].get("elem_type") == "track":
+                        recip_dir = d_in if d_in else OPP.get(d_out, "W")
+                        by_id[nb_id].setdefault("neighbors", {}).setdefault(recip_dir, [])
+                        if t["id"] not in by_id[nb_id]["neighbors"][recip_dir]:
+                            by_id[nb_id]["neighbors"][recip_dir].append(t["id"])
+                    elif nb_id in by_id and by_id[nb_id].get("elem_type") == "turnout":
+                        to_el = by_id[nb_id]
+                        for leg in ("common_neighbor", "normal_neighbor", "reverse_neighbor"):
+                            if not to_el.get(leg):
+                                to_el[leg] = t["id"]
+                                break
+
+
+def _optimize_imported_tracks(all_elements: List[dict]) -> List[dict]:
+    """
+    Post-import layout optimization:
+    1. Removes non-connected tracks that are not protected by nor rear to a signal.
+    2. Merges track segments that are neighbors on the same path but are not protected
+       by a signal nor are rear to any signal into the nearest track that is protected by a signal.
+    """
+    by_id = {e["id"]: e for e in all_elements}
+    signals = [e for e in all_elements if e.get("elem_type") == "signal"]
+    protected_ids = {s.get("protects_element") for s in signals if s.get("protects_element")}
+    rear_ids = {s.get("rear_element") for s in signals if s.get("rear_element")}
+    sig_critical_ids = protected_ids | rear_ids
+
+    # Step 1: Remove non-connected tracks not in sig_critical_ids
+    referenced_ids: Set[str] = set()
+    for el in all_elements:
+        if el.get("elem_type") == "track":
+            for nlist in el.get("neighbors", {}).values():
+                referenced_ids.update(nlist)
+        elif el.get("elem_type") == "turnout":
+            for leg in ("common_neighbor", "normal_neighbor", "reverse_neighbor"):
+                val = el.get(leg)
+                if val:
+                    referenced_ids.add(val)
+
+    removed_orphans: Set[str] = set()
+    for el in all_elements:
+        if el.get("elem_type") == "track":
+            eid = el["id"]
+            if eid in sig_critical_ids:
+                continue
+            nbrs = el.get("neighbors", {})
+            has_no_neighbors = not any(nbrs.values())
+            is_not_referenced = (eid not in referenced_ids)
+            if has_no_neighbors and is_not_referenced:
+                removed_orphans.add(eid)
+
+    if removed_orphans:
+        all_elements = [e for e in all_elements if e["id"] not in removed_orphans]
+        by_id = {e["id"]: e for e in all_elements}
+
+    # Step 2: Merge un-signaled tracks on same path into nearest protected track
+    axis_pairs = {
+        "E-W": ("W", "E"),
+        "N-S": ("N", "S"),
+        "NE-SW": ("SW", "NE"),
+        "NW-SE": ("NW", "SE"),
+    }
+
+    def _are_collinear(t1: dict, t2: dict, orient: str) -> bool:
+        if orient == "E-W":
+            return abs(float(t1["y"]) - float(t2["y"])) < 0.5
+        elif orient == "N-S":
+            return abs(float(t1["x"]) - float(t2["x"])) < 0.5
+        elif orient == "NE-SW":
+            return abs((float(t2["x"]) - float(t1["x"])) + (float(t2["y"]) - float(t1["y"]))) < 0.5
+        elif orient == "NW-SE":
+            return abs((float(t2["x"]) - float(t1["x"])) - (float(t2["y"]) - float(t1["y"]))) < 0.5
+        return False
+
+    visited_chains: Set[Tuple[str, ...]] = set()
+    removed_tracks: Set[str] = set()
+    id_remap: Dict[str, str] = {}
+
+    for orient, (d_neg, d_pos) in axis_pairs.items():
+        tracks_orient = [e for e in all_elements if e.get("elem_type") == "track" and e.get("orientation") == orient]
+        for t in tracks_orient:
+            if t["id"] in removed_tracks:
+                continue
+            pos_list = t.get("neighbors", {}).get(d_pos, [])
+            if len(pos_list) != 1:
+                continue
+            nbr_id = pos_list[0]
+            if nbr_id in removed_tracks:
+                continue
+            nbr = by_id.get(nbr_id)
+            if not nbr or nbr.get("elem_type") != "track" or nbr.get("orientation") != orient:
+                continue
+            if not _are_collinear(t, nbr, orient):
+                continue
+            rev_list = nbr.get("neighbors", {}).get(d_neg, [])
+            if len(rev_list) != 1 or rev_list[0] != t["id"]:
+                continue
+
+            # Find chain start
+            chain_start = t
+            while True:
+                neg_list = chain_start.get("neighbors", {}).get(d_neg, [])
+                if len(neg_list) != 1:
+                    break
+                prev_id = neg_list[0]
+                if prev_id in removed_tracks:
+                    break
+                prev_el = by_id.get(prev_id)
+                if not prev_el or prev_el.get("elem_type") != "track" or prev_el.get("orientation") != orient:
+                    break
+                if not _are_collinear(prev_el, chain_start, orient):
+                    break
+                rev = prev_el.get("neighbors", {}).get(d_pos, [])
+                if len(rev) != 1 or rev[0] != chain_start["id"]:
+                    break
+                chain_start = prev_el
+
+            # Collect full chain
+            chain = [chain_start]
+            curr = chain_start
+            while True:
+                pos_l = curr.get("neighbors", {}).get(d_pos, [])
+                if len(pos_l) != 1:
+                    break
+                next_i = pos_l[0]
+                if next_i in removed_tracks:
+                    break
+                next_e = by_id.get(next_i)
+                if not next_e or next_e.get("elem_type") != "track" or next_e.get("orientation") != orient:
+                    break
+                if not _are_collinear(curr, next_e, orient):
+                    break
+                rev = next_e.get("neighbors", {}).get(d_neg, [])
+                if len(rev) != 1 or rev[0] != curr["id"]:
+                    break
+                if next_e["id"] in [c["id"] for c in chain]:
+                    break
+                chain.append(next_e)
+                curr = next_e
+
+            if len(chain) <= 1:
+                continue
+            chain_ids = tuple(c["id"] for c in chain)
+            if chain_ids in visited_chains:
+                continue
+            visited_chains.add(chain_ids)
+
+            prot_indices = [idx for idx, c in enumerate(chain) if c["id"] in protected_ids]
+            if not prot_indices:
+                continue
+
+            absorptions: Dict[int, List[int]] = {p_idx: [] for p_idx in prot_indices}
+            for idx, c in enumerate(chain):
+                cid = c["id"]
+                if cid in sig_critical_ids:
+                    continue
+                best_p_idx = None
+                best_dist = float("inf")
+                for p_idx in prot_indices:
+                    dist = math.hypot(float(c["x"]) - float(chain[p_idx]["x"]), float(c["y"]) - float(chain[p_idx]["y"]))
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_p_idx = p_idx
+                if best_p_idx is not None:
+                    step = 1 if idx > best_p_idx else -1
+                    blocked = False
+                    for step_idx in range(best_p_idx + step, idx, step):
+                        if chain[step_idx]["id"] in rear_ids:
+                            blocked = True
+                            break
+                    if not blocked:
+                        absorptions[best_p_idx].append(idx)
+
+            for p_idx, abs_indices in absorptions.items():
+                if not abs_indices:
+                    continue
+                p_el = chain[p_idx]
+                absorbed_elements = [chain[i] for i in abs_indices]
+                run = [p_el] + absorbed_elements
+
+                if orient == "E-W":
+                    min_x = min(float(e["x"]) - float(e.get("length_miles", 0.5) or 0.5) * 2.0 for e in run)
+                    max_x = max(float(e["x"]) + float(e.get("length_miles", 0.5) or 0.5) * 2.0 for e in run)
+                    p_el["x"] = round((min_x + max_x) / 2.0, 2)
+                    l_new = (max_x - min_x) / 4.0
+                    p_el["length_miles"] = max(0.25, round(l_new * 4.0) / 4.0)
+                elif orient == "N-S":
+                    min_y = min(float(e["y"]) - float(e.get("length_miles", 0.5) or 0.5) * 2.0 for e in run)
+                    max_y = max(float(e["y"]) + float(e.get("length_miles", 0.5) or 0.5) * 2.0 for e in run)
+                    p_el["y"] = round((min_y + max_y) / 2.0, 2)
+                    l_new = (max_y - min_y) / 4.0
+                    p_el["length_miles"] = max(0.25, round(l_new * 4.0) / 4.0)
+                else:  # diagonal
+                    pts = []
+                    for e in run:
+                        cx, cy = float(e["x"]), float(e["y"])
+                        hs = float(e.get("length_miles", 0.5) or 0.5) * 2.0 * 0.70710678
+                        pts.extend([(cx - hs, cy - hs), (cx + hs, cy + hs)] if orient == "NW-SE" else [(cx - hs, cy + hs), (cx + hs, cy - hs)])
+                    min_x = min(pt[0] for pt in pts)
+                    max_x = max(pt[0] for pt in pts)
+                    min_y = min(pt[1] for pt in pts)
+                    max_y = max(pt[1] for pt in pts)
+                    p_el["x"] = round((min_x + max_x) / 2.0, 2)
+                    p_el["y"] = round((min_y + max_y) / 2.0, 2)
+                    l_new = math.hypot(max_x - min_x, max_y - min_y) / 4.0
+                    p_el["length_miles"] = max(0.25, round(l_new, 3))
+
+                # Update p_el's outer neighbors
+                pos_abs = [i for i in abs_indices if i > p_idx]
+                if pos_abs:
+                    pos_tail = chain[max(pos_abs)]
+                    p_el.setdefault("neighbors", {})[d_pos] = pos_tail.get("neighbors", {}).get(d_pos, [])
+                neg_abs = [i for i in abs_indices if i < p_idx]
+                if neg_abs:
+                    neg_tail = chain[min(neg_abs)]
+                    p_el.setdefault("neighbors", {})[d_neg] = neg_tail.get("neighbors", {}).get(d_neg, [])
+
+                for abs_el in absorbed_elements:
+                    removed_tracks.add(abs_el["id"])
+                    id_remap[abs_el["id"]] = p_el["id"]
+                    if not p_el.get("ctc_rules") and abs_el.get("ctc_rules"):
+                        p_el["ctc_rules"] = abs_el["ctc_rules"]
+                    if not p_el.get("ctc_id") and abs_el.get("ctc_id"):
+                        p_el["ctc_id"] = abs_el["ctc_id"]
+
+    # Remap neighbor references across all kept elements
+    kept_elements: List[dict] = []
+    for el in all_elements:
+        if el["id"] in removed_tracks:
+            continue
+        etype = el.get("elem_type")
+        if etype == "track":
+            nbrs = el.get("neighbors", {})
+            for d_key, nlist in list(nbrs.items()):
+                new_nlist = []
+                for nid in nlist:
+                    mapped = id_remap.get(nid, nid)
+                    if mapped != el["id"] and mapped not in new_nlist and mapped not in removed_tracks:
+                        new_nlist.append(mapped)
+                if new_nlist:
+                    nbrs[d_key] = new_nlist
+                else:
+                    nbrs.pop(d_key, None)
+        elif etype == "turnout":
+            for leg in ("common_neighbor", "normal_neighbor", "reverse_neighbor"):
+                val = el.get(leg)
+                if val in id_remap:
+                    el[leg] = id_remap[val]
+        kept_elements.append(el)
+
+    return kept_elements
+
+
+def _snap_elements_to_grid(all_elements: List[dict], snap_step: float = 0.5):
+    """
+    Snaps all layout elements to the grid (multiples of snap_step, e.g. 0.5 logical units),
+    discarding original floating-point drift and re-aligning elements nicely on the new grid.
+    """
+    for el in all_elements:
+        if "x" in el and el["x"] is not None:
+            nx = round(float(el["x"]) / snap_step) * snap_step
+            el["x"] = int(nx) if nx.is_integer() else nx
+        if "y" in el and el["y"] is not None:
+            ny = round(float(el["y"]) / snap_step) * snap_step
+            el["y"] = int(ny) if ny.is_integer() else ny
+        if el.get("elem_type") == "track" and "length_miles" in el:
+            orient = el.get("orientation", "E-W")
+            if orient in ("E-W", "N-S"):
+                lm = float(el.get("length_miles") or 0.5)
+                el["length_miles"] = max(0.25, round(lm * 4.0) / 4.0)
 
 
 def _deoverlap_labels(elem_dicts: List[dict]):
@@ -562,6 +1188,22 @@ def convert_atcs_data(
     elements_meta = _parse_element_records(data, grid_end, addr_table_start)
     equations = _parse_indication_equations(data, addr_table_start)
     raw_labels = _parse_text_labels(data, addr_table_start)
+    rrdata = _load_rrdata()
+
+    candidate_rules: List[str] = []
+    for eq in equations:
+        r = eq.get("raw", "")
+        if r.startswith(("C:", "K:")) and r not in candidate_rules:
+            candidate_rules.append(r)
+    for lbl in raw_labels:
+        t = lbl.get("text", "")
+        if t.startswith(("C:", "K:")) and t not in candidate_rules:
+            candidate_rules.append(t)
+    for rec in elements_meta.values():
+        n = rec.get("name", "")
+        if n.startswith(("C:", "K:")) and n not in candidate_rules:
+            if any(x in n for x in ["=", "&", "WA", "EA", "RA", "LA", "NW", "RW"]):
+                candidate_rules.append(n)
 
     # Read 2-layer grid:
     # Column-major storage in TrackBuilder 3:
@@ -668,6 +1310,8 @@ def convert_atcs_data(
                 "has_occ_bit": False,
                 "occ_bit_offset": None,
                 "guarded_by_signals": [],
+                "ctc_id": compute_ctc_id_from_device_id(wiu_id, rrdata),
+                "ctc_rules": _resolve_ctc_rule(meta_name, cp_key, candidate_rules),
                 "_atcs_shape": shape,
                 "_atcs_gx": gx_t,
                 "_atcs_gy": gy_t,
@@ -682,10 +1326,10 @@ def convert_atcs_data(
         ):
             if shape in DIAGONAL_NESW_SHAPES:
                 orient = "NE-SW"
-                length_mi = 1.41
+                length_mi = 0.7071
             elif shape in DIAGONAL_NWSE_SHAPES:
                 orient = "NW-SE"
-                length_mi = 1.41
+                length_mi = 0.7071
             elif shape in VERTICAL_TRACK_SHAPES:
                 orient = "N-S"
                 length_mi = 0.5
@@ -709,6 +1353,8 @@ def convert_atcs_data(
                 "parallel_track_id": None,
                 "has_occ_bit": False,
                 "occ_bit_offset": None,
+                "ctc_id": compute_ctc_id_from_device_id(wiu_id, rrdata),
+                "ctc_rules": _resolve_ctc_rule(meta_name, cp_key, candidate_rules),
                 "_atcs_shape": shape,
                 "_atcs_gx": gx_t,
                 "_atcs_gy": gy_t,
@@ -717,7 +1363,10 @@ def convert_atcs_data(
             }
             tile_elements[(gx_t, gy_t)] = el
 
-    # Pass 2: Instantiate Signals (shapes 19=Westbound above track, 20=Eastbound below track)
+    # Pass 2: Instantiate Signals (both shape 19/20 tiles and Layer 2 bound signals)
+    covered_hosts: Set[Tuple[Tuple[int, int], str]] = set()
+    covered_names: Set[str] = set()
+
     for (gx_t, gy_t), shape in sorted(shape_grid.items()):
         if shape not in SIGNAL_SHAPES:
             continue
@@ -807,9 +1456,184 @@ def convert_atcs_data(
             "sig_bit_offset": sig_bit if sig_bit is not None else 0,
             "has_occ_bit": False,
             "occ_bit_offset": None,
+            "ctc_id": compute_ctc_id_from_device_id(wiu_id, rrdata),
+            "ctc_rules": _resolve_ctc_rule(meta_name, cp_key, candidate_rules),
             "_atcs_host": host_coord,
         }
         signals_list.append(sig_el)
+        if host_coord in tile_elements:
+            covered_hosts.add((host_coord, sig_dir))
+        if meta_name:
+            covered_names.add(meta_name)
+
+    # 2B: Bound signals from bind_grid (TrackBuilder Layer 2 bindings matching signal naming conventions)
+    SIG_RE = re.compile(
+        r"(?:^|:)(?:\d+)?(?:[EWNSLR][AG]|SIG|DEAD|[EWNSLR]DEAD|HA|[EWNS][Hh][Dd]|[1-9][EWNSLR][AG])$",
+        re.IGNORECASE,
+    )
+    bound_sig_cells: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
+    for (gx_t, gy_t), bd in bind_grid.items():
+        if (gx_t, gy_t) in shape_grid and shape_grid[(gx_t, gy_t)] in SIGNAL_SHAPES:
+            continue
+        rec = elements_meta.get(bd % 1000)
+        if not rec:
+            continue
+        name = rec.get("name", "")
+        if not SIG_RE.search(name):
+            continue
+        cp_key = rec.get("cp_key", "")
+        bound_sig_cells.setdefault((name, cp_key), []).append((gx_t, gy_t))
+
+    for (meta_name, cp_key), cells in sorted(bound_sig_cells.items()):
+        clusters: List[List[Tuple[int, int]]] = []
+        for cell in sorted(cells):
+            placed = False
+            for cl in clusters:
+                if any(abs(cell[0] - c[0]) <= 5 and abs(cell[1] - c[1]) <= 3 for c in cl):
+                    cl.append(cell)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([cell])
+
+        clean_n = meta_name.split(":")[-1] if ":" in meta_name else meta_name
+        is_west = any(w in clean_n for w in ("W", "L"))
+        is_east = any(e in clean_n for e in ("E", "R"))
+
+        for cl in clusters:
+            host_coord = None
+            chosen_cell = cl[0]
+            for c in cl:
+                if c in tile_elements:
+                    host_coord = c
+                    chosen_cell = c
+                    break
+            if not host_coord:
+                for c in cl:
+                    for dy in (1, -1, 2, -2):
+                        adj = (c[0], c[1] + dy)
+                        if adj in tile_elements:
+                            host_coord = adj
+                            chosen_cell = c
+                            break
+                    if host_coord:
+                        break
+                    for dx in (1, -1, 2, -2):
+                        adj = (c[0] + dx, c[1])
+                        if adj in tile_elements:
+                            host_coord = adj
+                            chosen_cell = c
+                            break
+                    if host_coord:
+                        break
+
+            if not host_coord or host_coord not in tile_elements:
+                continue
+
+            host_orient = tile_elements[host_coord].get("orientation", "E-W")
+            if is_west:
+                sig_dir = "W"
+            elif is_east:
+                sig_dir = "E"
+            elif "N" in clean_n:
+                sig_dir = "N" if host_orient == "N-S" else ("E" if chosen_cell[0] <= host_coord[0] else "W")
+            elif "S" in clean_n:
+                sig_dir = "S" if host_orient == "N-S" else ("W" if chosen_cell[0] >= host_coord[0] else "E")
+            else:
+                sig_dir = "W"
+
+            if (host_coord, sig_dir) in covered_hosts and meta_name in covered_names:
+                continue
+
+            sig_pos = "top" if chosen_cell[1] <= host_coord[1] else "bottom"
+            ax = chosen_cell[0] * GRID_SCALE
+            ay = (host_coord[1] * GRID_SCALE) - 1 if sig_pos == "top" else (host_coord[1] * GRID_SCALE) + 1
+
+            wiu_id = cp_to_wiu.get(cp_key)
+            if wiu_id is None and host_coord in tile_elements:
+                wiu_id = tile_elements[host_coord].get("wiu_id")
+            if wiu_id is None:
+                _, _, n_wiu = _find_nearest_wiu(chosen_cell[0], chosen_cell[1])
+                wiu_id = n_wiu
+
+            hx, hy = host_coord
+            fwd_dx = 1 if sig_dir in ("E", "S") else -1
+            fwd_el = tile_elements.get((hx + fwd_dx, hy))
+            if not fwd_el:
+                fwd_el = tile_elements.get((hx + fwd_dx * 2, hy))
+            rear_el = tile_elements.get((hx - fwd_dx, hy))
+            if not rear_el:
+                rear_el = tile_elements.get((hx - fwd_dx * 2, hy))
+            host_el = tile_elements[host_coord]
+
+            protects_id = fwd_el["id"] if fwd_el else host_el["id"]
+            rear_id = host_el["id"] if fwd_el else (rear_el["id"] if rear_el else None)
+
+            if rear_id is None or protects_id == rear_id:
+                for dist in (1, 2, 3):
+                    for dy in range(-dist, dist + 1):
+                        for dx in range(-dist, dist + 1):
+                            adj_el = tile_elements.get((hx + dx, hy + dy))
+                            if adj_el and adj_el["id"] != protects_id:
+                                rear_id = adj_el["id"]
+                                break
+                        if rear_id and rear_id != protects_id:
+                            break
+                    if rear_id and rear_id != protects_id:
+                        break
+
+            if protects_id is None or rear_id is None or protects_id == rear_id:
+                continue
+
+            existing_positions = {
+                s["position"]
+                for s in signals_list
+                if s.get("rear_element") == rear_id and s.get("protects_element") == protects_id
+            }
+            if sig_pos in existing_positions:
+                for alt_pos in ("middle", "bottom", "top"):
+                    if alt_pos not in existing_positions:
+                        sig_pos = alt_pos
+                        break
+                else:
+                    continue
+
+            pref = _parse_preferred_index(meta_name)
+            sig_bit = _allocate_wiu_bit(used_wiu_bits, wiu_id, width=5, preferred=(pref * 5 if pref is not None else None))
+
+            existing_sig_ids = {s["id"] for s in signals_list}
+            sig_id = f"SIG_{chosen_cell[0]}_{chosen_cell[1]}_{sig_dir}"
+            if sig_id in existing_sig_ids:
+                idx_s = 2
+                while f"{sig_id}_{idx_s}" in existing_sig_ids:
+                    idx_s += 1
+                sig_id = f"{sig_id}_{idx_s}"
+
+            sig_el = {
+                "id": sig_id,
+                "elem_type": "signal",
+                "x": ax,
+                "y": ay,
+                "label": meta_name,
+                "label_pos": "top" if sig_pos == "top" else "bottom",
+                "wiu_id": wiu_id,
+                "gps": None,
+                "mile_marker": None,
+                "position": sig_pos,
+                "direction": sig_dir,
+                "protects_element": protects_id,
+                "rear_element": rear_id,
+                "governed_route": None,
+                "sig_bit_offset": sig_bit if sig_bit is not None else 0,
+                "has_occ_bit": False,
+                "occ_bit_offset": None,
+                "ctc_id": compute_ctc_id_from_device_id(wiu_id, rrdata),
+                "ctc_rules": _resolve_ctc_rule(meta_name, cp_key, candidate_rules),
+                "_atcs_host": host_coord,
+            }
+            signals_list.append(sig_el)
+            covered_hosts.add((host_coord, sig_dir))
+            covered_names.add(meta_name)
 
     # Pass 3: Wire Turnout 3-leg topology and Track neighbors on the grid
     def _add_nb(el_dict: dict, d_key: str, nb_id: str):
@@ -878,6 +1702,8 @@ def convert_atcs_data(
                         "parallel_track_id": None,
                         "has_occ_bit": False,
                         "occ_bit_offset": None,
+                        "ctc_id": "",
+                        "ctc_rules": "",
                         "_atcs_shape": 4 if spur_orient == "NE-SW" else 5,
                     }
                     el[attr] = spur_id
@@ -907,14 +1733,31 @@ def convert_atcs_data(
                 nb = tile_elements.get((gx_t + dx, gy_t + dy))
                 if nb:
                     d_key = DELTA_TO_DIR[(dx, dy)]
-                    _add_nb(el, d_key, nb["id"])
+                    back_dir = OPPOSITE_DIR[d_key]
                     if nb["elem_type"] == "track":
-                        _add_nb(nb, OPPOSITE_DIR[d_key], el["id"])
+                        nb_shape = nb.get("_atcs_shape")
+                        if nb_shape in TRACK_VALID_DIRS and back_dir not in TRACK_VALID_DIRS[nb_shape]:
+                            continue
+                        _add_nb(el, d_key, nb["id"])
+                        _add_nb(nb, back_dir, el["id"])
+                    elif nb["elem_type"] == "turnout":
+                        _add_nb(el, d_key, nb["id"])
 
     # Pass 4: Merge consecutive collinear horizontal/vertical tracks that share the same
     # WIU/binding and are not split by a signal or turnout, keeping the layout crisp.
     all_elements: List[dict] = list(tile_elements.values()) + spur_stubs + signals_list
     all_elements = _merge_collinear_tracks(all_elements)
+
+    # Pass 4b: Wire track neighbors within a small radius (+-1.75 grid squares) around track ends
+    _link_track_neighbors_by_radius(all_elements, radius=1.75)
+
+    # Pass 4c: Align track transitions between horizontal and diagonal segments
+    _align_track_transitions(all_elements)
+
+    # Pass 4d: Post-import layout optimization:
+    # 1. Merge un-signaled tracks on same path into nearest protected track
+    # 2. Remove non-connected tracks not protected by nor rear to a signal
+    all_elements = _optimize_imported_tracks(all_elements)
 
     # Pass 5: Assign non-conflicting occupancy bits to merged track blocks that have a WIU ID
     for el in all_elements:
@@ -932,6 +1775,9 @@ def convert_atcs_data(
     y_scale = float(cols * GRID_SCALE) / float(max(max_py, 1))
 
     for idx, lbl in enumerate(raw_labels):
+        txt = lbl["text"]
+        if txt.startswith(("C:", "K:")) or txt in candidate_rules:
+            continue
         lx = int(round(lbl["px"] * x_scale))
         ly = int(round(lbl["py"] * y_scale))
         all_elements.append(
@@ -940,17 +1786,22 @@ def convert_atcs_data(
                 "elem_type": "label",
                 "x": lx,
                 "y": ly,
-                "label": lbl["text"],
+                "label": txt,
                 "label_pos": "top",
                 "wiu_id": None,
                 "gps": None,
                 "mile_marker": None,
                 "extra_info": "",
+                "ctc_id": "",
+                "ctc_rules": "",
             }
         )
 
     # De-overlap standalone labels so text never stacks on top of another label
     _deoverlap_labels(all_elements)
+
+    # Snap all layout elements cleanly to 0.5 grid multiples
+    _snap_elements_to_grid(all_elements, snap_step=0.5)
 
     # Strip internal temporary conversion keys
     clean_elements: List[dict] = []
