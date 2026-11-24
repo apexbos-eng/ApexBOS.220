@@ -1,5 +1,5 @@
 {
-  "version": "v26.1123.03",
+  "version": "v26.1123.05",
   "common": {
     "deployment_mode": "local",
     "packet_source": "flux",
@@ -12,7 +12,7 @@
       "ui_port": 23010,
       "auth_secret": "",
       "encryption_key": "",
-      "identity": "ApexNode_163f9c57",
+      "identity": "ApexNode_6da8322a",
       "banc_initial_history_sec": 60
     },
     "multicast": {
@@ -77,6 +77,9 @@
     "sdr_mode": "auto",
     "rtl_sdr_bin": null,
     "rtl_tcp_bin": null,
+    "rsp_tcp_bin": null,
+    "rsp_extended": false,
+    "soapy_args": null,
     "rtlsdr_dll_dir": null,
     "rtl_tcp_host": "127.0.0.1",
     "rtl_tcp_port": 1234,
@@ -135,7 +138,7 @@
       "banc_port": "none",
       "auth_secret": "",
       "encryption_key": "",
-      "identity": "ApexNode_163f9c57",
+      "identity": "ApexNode_6da8322a",
       "banc_initial_history_sec": 60
     }
   },
@@ -150,7 +153,7 @@
     "banc_port": 23009,
     "auth_secret": "",
     "encryption_key": "",
-    "identity": "ApexNode_163f9c57"
+    "identity": "ApexNode_6da8322a"
   },
   "creator": {
     "db_path": "wius.db",
@@ -159,7 +162,7 @@
     "banc_port": 23009,
     "auth_secret": "",
     "encryption_key": "",
-    "identity": "ApexNode_163f9c57"
+    "identity": "ApexNode_6da8322a"
   },
   "banc": {
     "port": 23009,

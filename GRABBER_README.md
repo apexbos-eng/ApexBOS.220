@@ -27,7 +27,7 @@ The dashboard is structured into six functional zones:
 
 ## Operating Modes & SDR Ingestion
 
-ApexBOSGrabber supports four input architectures, selectable via CLI flags or automatically discovered at launch:
+ApexBOSGrabber supports six input architectures—covering RTL-SDR dongles, **SDRplay RSP receivers (RSP1B, RSP1A, RSPdx, RSPduo)**, and generic **SoapySDR** hardware (Airspy, HackRF, LimeSDR, PlutoSDR)—selectable via CLI flags or automatically discovered at launch:
 
 ```mermaid
 flowchart TD
@@ -35,13 +35,15 @@ flowchart TD
         S1["RTL-SDR Subprocess Pipe (--pipe)"]
         S2["RTL-TCP Network Client (--rtl-tcp)"]
         S3["Direct Python rtlsdr (--rtlsdr)"]
-        S4["Standard Input Stream (--stdin)"]
+        S4["SDRplay RSP-TCP (--rsp-tcp / -E 16-bit)"]
+        S5["SoapySDR CS16 (--soapy / SoapySDRPlay3)"]
+        S6["Standard Input Stream (--stdin)"]
     end
 
     subgraph Core["ApexBOSGrabber Reader Process"]
-        R1["Reader Thread / Ingestion Buffer"]
+        R1["Reader Thread / Ingestion Buffer (u8 & s16)"]
         R2["Hardware Auto-Tuner & AFC Engine"]
-        R3["Dynamic Channel Allocator"]
+        R3["Dynamic Channel Allocator + Chroma XPUB Tap"]
     end
 
     subgraph Workers["Worker Demodulator Processes"]
@@ -52,15 +54,17 @@ flowchart TD
     end
 
     subgraph Outputs["Network Outputs"]
-        ZMQ["ZeroMQ PUB (Ports 5555, 5556...)"]
+        ZMQ["ZeroMQ PUB (Ports 18071..18131)"]
         UDP["UDP Broadcast / Multicast"]
-        ENG["ApexBOS Dispatcher Engine"]
+        ENG["ApexBOS Dispatcher Engine / Chroma"]
     end
 
     S1 --> R1
     S2 --> R1
     S3 --> R1
     S4 --> R1
+    S5 --> R1
+    S6 --> R1
 
     R1 --> R2
     R1 --> R3
@@ -93,19 +97,43 @@ Connects over TCP (`127.0.0.1:1234` by default) to an active `rtl_tcp` server. E
 ### 3. Direct RTLSDR Mode (`--rtlsdr`)
 Communicates directly with the USB dongle inside the Python process using `pyrtlsdr` (`ctypes` binding to `librtlsdr`). Operates on Linux, macOS, and Windows (with `rtlsdr.dll` and WinUSB driver). Employs 16 KB USB bulk-transfer alignment.
 
-### 4. Stdin Mode (`--stdin`)
-Reads raw 8-bit unsigned interleaved I/Q samples from standard input, enabling playback of pre-recorded RF captures or piping from tools like `gqrx`, `hackrf_transfer`, or `airspy_rx`:
+### 4. SDRplay RSP-TCP Mode (`--rsp-tcp`, `--sdr-mode rsptcp`)
+Connects to SDRplay's official **`rsp_tcp`** server (`SDRplay/RSPTCPServer`) for **RSP1B, RSP1A, RSPdx, and RSPduo** receivers (requires official **SDRplay API v3.15+** for RSP1B):
+- **Standard 8-bit Mode** (`--rsp-tcp`): Compatible with any standard `rsp_tcp` instance (`rsp_tcp -a 127.0.0.1 -p 1234 -T`). Automatically enforces SDRplay native ADC sample rates $\ge 2.112\text{ MS/s}$ (multiples of $192\text{ kS/s}$, e.g. `2.304 MS/s` for full Ch 97–176 coverage).
+- **Extended 16-bit Mode** (`--rsp-tcp --rsp-16bit`): Auto-detects the 45-byte `RSP0` extended capability handshake from `rsp_tcp -E -b 16`, streams full **14-bit ADC dynamic range** over signed 16-bit `CS16` (`s16`) samples with zero impact on RTL-SDR performance, and maps Grabber gain, AGC, LNA state (`--rsp-lna-state`), 4.7 V Bias-T (`0x25`), antenna port (`--rsp-antenna`), and broadcast notch filters (`--rsp-notch`) to native `rsp_tcp` extended commands (`0x1F`–`0x25`).
+- **Auto-Launch**: If no `rsp_tcp` server is listening locally on `127.0.0.1`, Grabber can automatically launch `rsp_tcp` (from `--rsp-tcp-bin`, `PATH`, or standard SDRplay install folders) and stop it cleanly on exit:
 ```bash
-rtl_sdr -f 220487500 -s 960000 - | python ApexBOSGrabber.py --stdin
+python ApexBOSGrabber.py --rsp-tcp --rsp-16bit --rate 2304000 --chans 101,102
 ```
 
-### 5. Automatic Source Detection
+### 5. SoapySDR Mode (`--soapy`, `--sdr-mode soapy`)
+Native direct-USB 16-bit `CS16` (`s16`) streaming via Python **SoapySDR** bindings—unlocking **SDRplay RSP1B / RSP1A / RSPdx / RSPduo** (via `SoapySDRPlay3` + SDRplay API v3.15+), **Airspy R2 / Mini**, **HackRF One**, **LimeSDR**, **PlutoSDR**, and **RTL-SDR** without any external helper server:
+```bash
+# SDRplay RSP1B via SoapySDRPlay3:
+python ApexBOSGrabber.py --soapy --soapy-args "driver=sdrplay" --rate 2304000 --chans 101,102
+
+# RTL-SDR or Airspy via SoapySDR:
+python ApexBOSGrabber.py --soapy --soapy-args "driver=rtlsdr" --chans 101,102
+```
+*Note for Windows users*: Because PyPI does not publish official Windows `SoapySDR` wheels for Python 3.12–3.14, `--soapy` is easiest on Linux, macOS, or Windows Conda-Forge/PothosSDR environments; Windows users running standard Python should prefer **`--rsp-tcp`**.
+
+### 6. Stdin Mode (`--stdin`)
+Reads raw interleaved I/Q samples (`--sample-format u8` 8-bit unsigned by default, or `--sample-format s16` 16-bit signed `CS16`) from standard input, enabling playback of pre-recorded RTL-SDR or RSP1B RF captures or piping from tools like `gqrx`, `hackrf_transfer`, or `airspy_rx`:
+```bash
+rtl_sdr -f 220487500 -s 960000 - | python ApexBOSGrabber.py --stdin
+# Replay a 16-bit CS16 SDRplay recording:
+python ApexBOSGrabber.py --stdin --sample-format s16 --rate 2304000 < rsp1b_221mhz.cs16
+```
+
+### 7. Automatic Source Detection
 When launched without explicit mode flags, Grabber automatically probes available interfaces:
 1. Checks if `rtl_sdr` executable is in `PATH` (uses `--pipe` if found).
-2. Checks if an `rtl_tcp` server is listening on port `1234` (engages `--rtl-tcp` if active).
+2. Checks if an `rtl_tcp` / `rsp_tcp` server is listening on port `1234` (engages TCP mode if active).
 3. Checks if `pyrtlsdr` is installed and operational (engages `--rtlsdr`).
 4. Checks if `rtl_tcp` binary is installed in `PATH`.
-5. If no source is found, prints a comprehensive setup guide and exits gracefully.
+5. Checks if SDRplay `rsp_tcp` binary is installed (engages `--rsp-tcp`).
+6. Checks if `SoapySDR` Python bindings are installed (engages `--soapy`).
+7. If no source is found, prints a comprehensive setup guide and exits gracefully.
 
 ---
 
@@ -348,12 +376,22 @@ python ApexBOSGrabber.py [OPTIONS]
 | :--- | :--- | :--- |
 | `--pipe` | Read I/Q from native `rtl_sdr` binary pipe | `True` |
 | `--rtl-tcp` | Connect to an RTL-TCP server socket | `False` |
+| `--rsp-tcp`, `--rsptcp` | Connect to SDRplay `rsp_tcp` server (RSP1B / RSP1A / RSPdx / RSPduo) | `False` |
+| `--rsp-tcp-bin <path>` | Path to SDRplay `rsp_tcp` executable for local auto-launch | `None` |
+| `--rsp-16bit`, `--rsp-extended` | Enable SDRplay `rsp_tcp` Extended Mode (`-E`) with 14/16-bit `CS16` I/Q | `False` |
+| `--rsp-lna-state <0..9>` | SDRplay LNA state (`0` = max sensitivity) | `0` |
+| `--rsp-antenna <port>` | Optional SDRplay / SoapySDR antenna port selection | `None` |
+| `--rsp-notch <mask>` | Optional SDRplay `rsp_tcp` broadcast notch filter bitmask | `None` |
+| `--soapy`, `--soapysdr` | Native 16-bit `CS16` direct-USB streaming via `SoapySDR` | `False` |
+| `--soapy-args <str>` | SoapySDR device selector (e.g. `"driver=sdrplay"`, `"driver=rtlsdr"`) | `None` |
+| `--sample-format <fmt>` | Raw IQ sample format override: `auto`, `u8` (8-bit), or `s16` (16-bit `CS16`) | `auto` |
 | `--rtlsdr`, `--pyrtlsdr` | Direct in-process access via `pyrtlsdr` package | `False` |
-| `--stdin` | Read raw 8-bit unsigned I/Q from standard input | `False` |
+| `--sdr-mode <mode>` | Explicit interface: `auto`, `pipe`, `tcp`, `rtlsdr`, `rsptcp`, `soapy`, `stdin` | `auto` |
+| `--stdin` | Read raw interleaved I/Q from standard input (`u8` or `s16`) | `False` |
 | `--auto` | Automatically probe and select available SDR source | `False` |
-| `--host <ip>` | RTL-TCP host address | `127.0.0.1` |
-| `--port <port>` | RTL-TCP port | `1234` |
-| `--device <idx>` | RTL-SDR USB device index | `0` |
+| `--host <ip>` | RTL-TCP / RSP-TCP host address | `127.0.0.1` |
+| `--port <port>` | RTL-TCP / RSP-TCP port | `1234` |
+| `--device <idx>` | SDR USB device index | `0` |
 | `--rate <sps>` | SDR sampling rate in S/s | `192000` |
 | `--gain <dB>` | Tuner gain in dB or tenths (or `0` for AGC) | `0` (AGC) |
 | `-b`, `--bias-tee <0\|1>`| Power inline antenna LNA via bias-tee | `1` (ON) |
@@ -415,8 +453,8 @@ It automatically discovers active Positive Train Control (PTC) and ACSES channel
    - Tunes the SDR sequentially across ITC channels 97 to 176 (220.0125 MHz to 221.9875 MHz).
    - Offsets the local oscillator (LO) by 50 kHz below each target channel to isolate the signal from tuner zero-IF DC center spikes.
    - Observes baseband I/Q for the specified dwell duration (default: `2.0` seconds; configurable with `--dwell <sec>`) to catch periodic beacons and status reports, probing for the 64-bit $\pi/4$-DQPSK PTC sync word signature (`PTC_SYNC_BIT_STRING`).
-2. **Phase 2: PPM Sweep & Optimization ($\pm 4$ PPM)**
-   - For every active channel detected in Phase 1, sweeps the master frequency correction from $\text{base\_ppm} - 4$ to $\text{base\_ppm} + 4$ in 9 discrete steps.
+2. **Phase 2: PPM Sweep & Optimization (±4 PPM)**
+   - For every active channel detected in Phase 1, sweeps the master frequency correction from `base_ppm - 4` to `base_ppm + 4` in 9 discrete steps.
    - Observes each candidate PPM for 5.0 seconds (or custom `--opt-dwell <sec>`), recording sync signature hits, CRC-good packets, average burst RSSI (dBFS), and signal-to-noise ratio (SNR).
    - Identifies the per-channel optimal PPM that maximizes sync signatures and CRC integrity.
 3. **Phase 3: Consensus Master PPM Determination**

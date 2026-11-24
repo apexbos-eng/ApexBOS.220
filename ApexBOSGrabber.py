@@ -551,14 +551,26 @@ class ContinuousChannelizer:
         self.decimators_fr.clear()
         self.decimators_hr.clear()
 
-    def channelize(self, raw_iq_bytes: bytes, center_hz: int, target_ch: int, ch_freq_offset_hz: float = 0.0):
+    def channelize(
+        self,
+        raw_iq_bytes: bytes,
+        center_hz: int,
+        target_ch: int,
+        ch_freq_offset_hz: float = 0.0,
+        sample_format: str = "u8",
+    ):
         """
         Mixes raw I/Q bytes to channel baseband with optional per-channel frequency offset compensation.
+        Supports both 8-bit unsigned RTL-SDR ('u8') and 16-bit signed CS16 ('s16', e.g. SDRplay RSP1B / SoapySDR)
+        with zero overhead on the default 'u8' path.
         Produces:
         - y_fr: 192,000 S/s baseband (sps = 12 for Full-Rate 16 kbaud)
         - y_hr: 96,000 S/s baseband (sps = 12 for Half-Rate 8 kbaud)
         """
-        arr = np.frombuffer(raw_iq_bytes, dtype=np.uint8).astype(np.float32) - 127.5
+        if sample_format == "s16":
+            arr = np.frombuffer(raw_iq_bytes, dtype="<i2").astype(np.float32) * (127.5 / 32768.0)
+        else:
+            arr = np.frombuffer(raw_iq_bytes, dtype=np.uint8).astype(np.float32) - 127.5
         n_samples = len(arr) // 2
         iq = arr[0::2] + 1j * arr[1::2]
 
@@ -580,10 +592,13 @@ class ContinuousChannelizer:
 # ---------------------------------------------------------------------------
 # Power & RSSI Measurements
 # ---------------------------------------------------------------------------
-def compute_signal_power_dbfs(raw_or_complex) -> float:
-    """Calculates RMS signal power in dBFS."""
+def compute_signal_power_dbfs(raw_or_complex, sample_format: str = "u8") -> float:
+    """Calculates RMS signal power in dBFS (supports 'u8' RTL-SDR and 's16' CS16 SDRplay/SoapySDR)."""
     if isinstance(raw_or_complex, (bytes, bytearray)):
-        arr = np.frombuffer(raw_or_complex, dtype=np.uint8).astype(np.float32) - 127.5
+        if sample_format == "s16":
+            arr = np.frombuffer(raw_or_complex, dtype="<i2").astype(np.float32) * (127.5 / 32768.0)
+        else:
+            arr = np.frombuffer(raw_or_complex, dtype=np.uint8).astype(np.float32) - 127.5
         if len(arr) < 2:
             return -100.0
         p_mean = np.mean(arr[0::2] ** 2 + arr[1::2] ** 2)
@@ -1332,6 +1347,77 @@ def is_rtl_tcp_available() -> bool:
     return detect_rtl_tcp_executable() is not None
 
 
+def detect_rsp_tcp_executable(custom_path=None) -> Optional[str]:
+    """Finds SDRplay rsp_tcp executable in custom path, PATH, workspace, or standard SDRplay install dirs."""
+    if custom_path and os.path.isfile(str(custom_path)):
+        return str(custom_path)
+    bin_name = "rsp_tcp.exe" if os.name == "nt" else "rsp_tcp"
+    found = shutil.which(bin_name)
+    if found:
+        return found
+    candidates = [
+        bin_name,
+        os.path.join(PROJECT_ROOT, bin_name),
+        "/opt/homebrew/bin/rsp_tcp",
+        "/opt/local/bin/rsp_tcp",
+        "/usr/local/bin/rsp_tcp",
+        "/usr/bin/rsp_tcp",
+        "/Library/SDRplayAPI/bin/rsp_tcp",
+    ]
+    if os.name == "nt":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        candidates.extend([
+            os.path.join(pf, "SDRplay", "rsp_tcp", "rsp_tcp.exe"),
+            os.path.join(pf86, "SDRplay", "rsp_tcp", "rsp_tcp.exe"),
+            os.path.join(pf, "SDRplay", "API", "x64", "rsp_tcp.exe"),
+            os.path.join(pf, "SDRplay", "SDRconnect", "rsp_tcp.exe"),
+            os.path.join(pf, "PothosSDR", "bin", "rsp_tcp.exe"),
+        ])
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def is_rsp_tcp_available(custom_path=None) -> bool:
+    """Checks if an rsp_tcp executable is available."""
+    return detect_rsp_tcp_executable(custom_path) is not None
+
+
+def is_soapysdr_available() -> Tuple[bool, Optional[str]]:
+    """Checks if the SoapySDR Python module is installed and importable (auto-registering standard DLL dirs)."""
+    soapy_lib_dir = None
+    try:
+        import config_loader as _cl
+        soapy_lib_dir = _cl.apply_soapy_dll_dirs(PROJECT_ROOT)
+    except Exception:
+        pass
+    try:
+        import SoapySDR  # noqa: F401
+        return True, None
+    except ImportError:
+        if soapy_lib_dir:
+            py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+            return False, (
+                f"SoapySDR library found in {soapy_lib_dir}, but Python {py_ver} 'SoapySDR' bindings are missing "
+                f"(install matching Python/Conda-Forge bindings or use --rsp-tcp)"
+            )
+        return False, "Python 'SoapySDR' module is not installed (install via system packages, Conda-Forge, or PothosSDR)"
+    except Exception as e:
+        return False, f"Error importing 'SoapySDR': {e}"
+
+
+def rsp_gain_db_to_ifgr(gain_db: float) -> int:
+    """
+    Maps Grabber's intuitive forward gain_db (0..50 dB, higher = louder)
+    onto SDRplay's IF Gain Reduction (gRdB: 59 dB = minimum gain, 20 dB = maximum gain).
+    """
+    g = max(0.0, min(50.0, float(gain_db)))
+    ifgr = int(round(59.0 - (g / 50.0) * 39.0))
+    return max(20, min(59, ifgr))
+
+
 _DLL_DIR_HANDLES: list = []
 
 
@@ -1363,8 +1449,18 @@ apply_rtlsdr_dll_dir(os.environ.get("APEXBOS_RTLSDR_DLL_DIR"))
 def is_rtlsdr_package_available() -> Tuple[bool, Optional[str]]:
     """
     Checks if rtlsdr (pyrtlsdr) package is installed and can load the underlying librtlsdr.
+    Auto-discovers standard platform DLL/library paths if no explicit folder was set.
     Returns (True, None) on success, or (False, error_reason).
     """
+    if not os.environ.get("APEXBOS_RTLSDR_DLL_DIR"):
+        try:
+            import config_loader as _cl
+            found_dir = _cl.auto_discover_rtlsdr_dll_dir(PROJECT_ROOT)
+            if found_dir:
+                apply_rtlsdr_dll_dir(found_dir)
+        except Exception:
+            pass
+
     try:
         import rtlsdr
     except ImportError:
@@ -1408,7 +1504,17 @@ def print_sdr_setup_guide():
     print("                        current folder, plus WinUSB driver installed via Zadig.")
     print("   * Launch Grabber:    python ApexBOSGrabber.py --rtlsdr\n")
 
-    print("4. STDIN STREAM MODE (Pipe raw I/Q from external tool or file):")
+    print("4. SDRPLAY RSP-TCP MODE (SDRplay RSP1B / RSP1A / RSPdx / RSPduo):")
+    print("   Connects to SDRplay's official rsp_tcp server (standard 8-bit or -E 16-bit):")
+    print("   * Prerequisite:      Install SDRplay API v3.15+ (required for RSP1B)")
+    print("   * Start the server:  rsp_tcp -a 127.0.0.1 -p 1234 -E -T")
+    print("   * Launch Grabber:    python ApexBOSGrabber.py --rsp-tcp --rate 2304000\n")
+
+    print("5. SOAPYSDR MODE (SDRplay RSP1B via SoapySDRPlay3, Airspy, HackRF, RTL-SDR):")
+    print("   Native direct-USB 16-bit CS16 streaming via SoapySDR Python bindings:")
+    print("   * Launch Grabber:    python ApexBOSGrabber.py --soapy --soapy-args \"driver=sdrplay\"\n")
+
+    print("6. STDIN STREAM MODE (Pipe raw I/Q from external tool or file):")
     print("   * Run:               rtl_sdr -f 220712500 -s 192000 - | python ApexBOSGrabber.py --stdin")
     print("=" * 78 + "\n")
 
@@ -1424,6 +1530,10 @@ def resolve_sdr_stream_kind(cli_args) -> str:
     # 1. Explicit user selections
     if getattr(cli_args, "stdin", False):
         return "stdin"
+    if getattr(cli_args, "rsp_tcp", False):
+        return "rsptcp"
+    if getattr(cli_args, "soapy", False):
+        return "soapy"
     if getattr(cli_args, "rtl_tcp", False):
         return "tcp"
     if getattr(cli_args, "rtlsdr", False):
@@ -1431,7 +1541,7 @@ def resolve_sdr_stream_kind(cli_args) -> str:
     if getattr(cli_args, "pipe", False):
         return "pipe"
     cfg_mode = str(getattr(cli_args, "sdr_mode", None) or "auto").strip().lower()
-    if cfg_mode in ("stdin", "tcp", "rtlsdr", "pipe"):
+    if cfg_mode in ("stdin", "tcp", "rtlsdr", "pipe", "rsptcp", "soapy"):
         return cfg_mode
 
     # 2. Default: prefer pipe if rtl_sdr executable is actually present
@@ -1457,6 +1567,17 @@ def resolve_sdr_stream_kind(cli_args) -> str:
     if is_rtl_tcp_available():
         print("[*] Auto-detected 'rtl_tcp' executable in system PATH -> selecting TCP mode")
         return "tcp"
+
+    # 3d. Check if SDRplay rsp_tcp executable is available
+    if is_rsp_tcp_available(getattr(cli_args, "rsp_tcp_bin", None)):
+        print("[*] Auto-detected 'rsp_tcp' executable -> selecting SDRplay RSP-TCP mode")
+        return "rsptcp"
+
+    # 3e. Check if SoapySDR Python bindings are installed
+    soapy_ok, _ = is_soapysdr_available()
+    if soapy_ok:
+        print("[*] Auto-detected installed 'SoapySDR' package -> selecting SoapySDR mode")
+        return "soapy"
 
     # If none are available, default to pipe so that when run() is called,
     # the setup guide is displayed.
@@ -1892,6 +2013,492 @@ class DirectRtlSdrSource:
         self._buffer.clear()
 
 
+class DirectRspTcpSource:
+    """
+    Connects to SDRplay's official rsp_tcp server (RSPTCPServer) for RSP1B / RSP1A / RSPdx / RSPduo.
+    - Supports both standard 8-bit rtl_tcp compatibility mode ('u8') and
+      Extended Mode (-E, 'RSP0' 45-byte capability header, 16-bit signed CS16 's16').
+    - Automatically enforces SDRplay native ADC rates >= 2.112 MS/s (multiples of 192 kS/s).
+    - Maps Grabber gain, AGC, Bias-T, LNA state, antenna, and broadcast notch filters to
+      rsp_tcp extended command IDs (0x1F..0x25) when extended mode is detected.
+    """
+    RSP_MIN_RATE = 2112000  # 11 * 192 kS/s (safely above RSP1B 2.0 MS/s native ADC floor)
+
+    # SDRplay RSPTCPServer extended command IDs (rsp_tcp_api.h)
+    CMD_RSP_ANTENNA = 0x1F
+    CMD_RSP_LNA_STATE = 0x20
+    CMD_RSP_IFGR = 0x21
+    CMD_RSP_AGC = 0x22
+    CMD_RSP_AGC_SETPOINT = 0x23
+    CMD_RSP_NOTCH = 0x24
+    CMD_RSP_BIAS_T = 0x25
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        center_freq: int,
+        sample_rate: int,
+        gain,
+        ppm: int,
+        bias_tee: bool = True,
+        extended_16bit: bool = False,
+        lna_state: int = 0,
+        antenna: Optional[int] = None,
+        notch: Optional[int] = None,
+        sample_format_override: str = "auto",
+    ):
+        self.host = host
+        self.port = int(port)
+        self.center_freq = int(center_freq)
+        self.sample_rate = self._align_rsp_rate(int(sample_rate))
+        self.gain_db, self.gain_tenths = parse_gain_value(gain)
+        self.ppm = int(ppm)
+        self.bias_tee = bool(bias_tee)
+        self.extended_16bit_requested = bool(extended_16bit)
+        self.lna_state = max(0, min(9, int(lna_state or 0)))
+        self.antenna = antenna
+        self.notch = notch
+        self.sample_format_override = str(sample_format_override or "auto").strip().lower()
+
+        self.extended_mode = False
+        self.rsp_caps_raw = b""
+        self.sample_format = "s16" if (self.sample_format_override == "s16" or self.extended_16bit_requested) else "u8"
+        self.bytes_per_sample = 4 if self.sample_format == "s16" else 2
+        self._prefetched = bytearray()
+        self.sock = None
+        self._connect()
+
+    @classmethod
+    def _align_rsp_rate(cls, rate: int) -> int:
+        r = int(rate)
+        if r < cls.RSP_MIN_RATE:
+            r = cls.RSP_MIN_RATE
+        elif r % 192000 != 0:
+            r = int(math.ceil(r / 192000.0) * 192000)
+        return r
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _connect(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        except Exception:
+            pass
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
+        self.sock.settimeout(5.0)
+        self.sock.connect((self.host, self.port))
+
+        # 1. Read standard 12-byte RTL0 compatibility greeting
+        hdr = self._recv_exact(12)
+        if len(hdr) < 12:
+            raise ConnectionError("RSP-TCP closed during RTL0 handshake")
+
+        # 2. Peek for optional 45-byte RSP0 extended capability header (sent when rsp_tcp -E is active)
+        self.sock.settimeout(0.18)
+        try:
+            probe = self.sock.recv(4)
+            if probe == b"RSP0":
+                rest = self._recv_exact(41)
+                self.rsp_caps_raw = probe + rest
+                self.extended_mode = True
+                if self.sample_format_override == "auto":
+                    # rsp_tcp -E streams 16-bit signed CS16 IQ by default (or 8-bit if explicitly forced)
+                    self.sample_format = "s16"
+            elif probe:
+                # Standard 8-bit stream started immediately; preserve bytes so zero IQ alignment is lost
+                self._prefetched.extend(probe)
+        except (socket.timeout, BlockingIOError):
+            pass
+        self.sock.settimeout(2.0)
+
+        if self.sample_format_override in ("u8", "s16"):
+            self.sample_format = self.sample_format_override
+        elif self.extended_16bit_requested:
+            self.sample_format = "s16"
+        self.bytes_per_sample = 4 if self.sample_format == "s16" else 2
+
+        # 3. Apply initial hardware parameters
+        self._send_command(0x02, self.sample_rate)
+        self._send_command(0x01, self.center_freq)
+        self._send_command(0x05, self.ppm, signed=True)
+        self._apply_gain_commands()
+        self._apply_bias_tee_command()
+        if self.extended_mode:
+            if self.antenna is not None:
+                self._send_command(self.CMD_RSP_ANTENNA, int(self.antenna))
+            if self.notch is not None:
+                self._send_command(self.CMD_RSP_NOTCH, int(self.notch))
+
+        # Drain any stale pre-tune samples (aligned to bytes_per_sample)
+        time.sleep(0.05)
+        self._prefetched.clear()
+        self.sock.setblocking(False)
+        try:
+            while True:
+                drain = self.sock.recv(65536)
+                if not drain:
+                    break
+        except (BlockingIOError, socket.error):
+            pass
+        self.sock.setblocking(True)
+        self.sock.settimeout(2.0)
+
+    def _send_command(self, cmd_id: int, arg_val: int, signed: bool = False):
+        if not self.sock:
+            return
+        if signed:
+            msg = bytes([cmd_id]) + struct.pack(">i", int(arg_val))
+        else:
+            msg = bytes([cmd_id]) + struct.pack(">I", int(arg_val) & 0xFFFFFFFF)
+        self.sock.sendall(msg)
+
+    def _apply_gain_commands(self):
+        if self.extended_mode:
+            if self.gain_tenths == 0:
+                self._send_command(self.CMD_RSP_AGC, 1)
+                self._send_command(self.CMD_RSP_LNA_STATE, self.lna_state)
+            else:
+                self._send_command(self.CMD_RSP_AGC, 0)
+                self._send_command(self.CMD_RSP_LNA_STATE, self.lna_state)
+                self._send_command(self.CMD_RSP_IFGR, rsp_gain_db_to_ifgr(self.gain_db))
+        else:
+            if self.gain_tenths == 0:
+                self._send_command(0x03, 0)
+                self._send_command(0x08, 1)
+            else:
+                self._send_command(0x03, 1)
+                self._send_command(0x04, self.gain_tenths)
+
+    def _apply_bias_tee_command(self):
+        try:
+            if self.extended_mode:
+                self._send_command(self.CMD_RSP_BIAS_T, 1 if self.bias_tee else 0)
+            else:
+                self._send_command(0x0E, 1 if self.bias_tee else 0)
+        except Exception:
+            pass
+
+    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
+        if rate is not None:
+            aligned = self._align_rsp_rate(int(rate))
+            if aligned != self.sample_rate:
+                self.sample_rate = aligned
+                self._send_command(0x02, self.sample_rate)
+        if freq is not None and int(freq) != self.center_freq:
+            self.center_freq = int(freq)
+            self._send_command(0x01, self.center_freq)
+        if gain is not None:
+            self.gain_db, self.gain_tenths = parse_gain_value(gain)
+            self._apply_gain_commands()
+        if ppm is not None and int(ppm) != self.ppm:
+            self.ppm = int(ppm)
+            self._send_command(0x05, self.ppm, signed=True)
+        if bias_tee is not None and bool(bias_tee) != self.bias_tee:
+            self.bias_tee = bool(bias_tee)
+            self._apply_bias_tee_command()
+
+    def read_exact_bytes(self, byte_count: int) -> bytes:
+        if not self.sock:
+            return b""
+        buf = bytearray(byte_count)
+        view = memoryview(buf)
+        pos = 0
+        if self._prefetched:
+            take = min(len(self._prefetched), byte_count)
+            view[:take] = self._prefetched[:take]
+            del self._prefetched[:take]
+            pos = take
+        while pos < byte_count:
+            try:
+                chunk = self.sock.recv(byte_count - pos)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            view[pos:pos + len(chunk)] = chunk
+            pos += len(chunk)
+        return bytes(buf[:pos])
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        self._prefetched.clear()
+
+
+class DirectSoapySdrSource:
+    """
+    Generic SoapySDR hardware interface streaming native 16-bit signed CS16 I/Q ('s16').
+    Supports SDRplay RSP1B / RSP1A / RSPdx / RSPduo (via SoapySDRPlay3),
+    Airspy R2 / Mini, HackRF One, LimeSDR, PlutoSDR, and RTL-SDR.
+    """
+
+    def __init__(
+        self,
+        center_freq: int,
+        sample_rate: int,
+        gain,
+        ppm: int,
+        device_idx: int = 0,
+        bias_tee: bool = True,
+        soapy_args: Optional[str] = None,
+        lna_state: Optional[int] = None,
+        antenna: Optional[str] = None,
+        soapy_module=None,
+        soapy_device=None,
+    ):
+        self.device_idx = int(device_idx)
+        self.center_freq = int(center_freq)
+        self.soapy_args_str = str(soapy_args or "").strip()
+        self.gain_db, self.gain_tenths = parse_gain_value(gain)
+        self.ppm = int(ppm)
+        self.bias_tee = bool(bias_tee)
+        self.lna_state = lna_state
+        self.antenna = antenna
+        self.sample_format = "s16"
+        self.bytes_per_sample = 4
+
+        self._soapy = soapy_module
+        self.sdr = soapy_device
+        self.rx_stream = None
+        self.driver_key = ""
+        self._buffer = bytearray()
+        self._rx_buf = np.empty(32768 * 2, dtype=np.int16)
+
+        self.is_sdrplay = "sdrplay" in self.soapy_args_str.lower()
+        self.sample_rate = self._align_rate(int(sample_rate))
+        self._init_device()
+
+    def _align_rate(self, rate: int) -> int:
+        min_r = DirectRspTcpSource.RSP_MIN_RATE if self.is_sdrplay else 960000
+        r = int(rate)
+        if r < min_r:
+            r = min_r
+        elif r % 192000 != 0:
+            r = int(math.ceil(r / 192000.0) * 192000)
+        return r
+
+    @staticmethod
+    def _parse_soapy_args(args_str: str) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        if not args_str:
+            return out
+        for tok in str(args_str).split(","):
+            tok = tok.strip()
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                out[k.strip()] = v.strip()
+            elif tok:
+                out["driver"] = tok
+        return out
+
+    def _init_device(self):
+        if self._soapy is None:
+            try:
+                import config_loader as _cl
+                _cl.apply_soapy_dll_dirs(PROJECT_ROOT)
+            except Exception:
+                pass
+            try:
+                import SoapySDR
+                self._soapy = SoapySDR
+            except ImportError as e:
+                raise RuntimeError(
+                    f"Python 'SoapySDR' module is not installed: {e}\n"
+                    f"Install SoapySDR (and SoapySDRPlay3 for SDRplay RSP1B) or use --rsp-tcp mode."
+                )
+
+        soapy = self._soapy
+        if self.sdr is None:
+            args_dict = self._parse_soapy_args(self.soapy_args_str)
+            try:
+                if args_dict:
+                    self.sdr = soapy.Device(args_dict)
+                else:
+                    devs = soapy.Device.enumerate()
+                    if not devs:
+                        raise RuntimeError("No SoapySDR devices found")
+                    idx = min(max(0, self.device_idx), len(devs) - 1)
+                    self.sdr = soapy.Device(devs[idx])
+            except Exception as e:
+                raise RuntimeError(f"Failed to open SoapySDR device ({self.soapy_args_str or f'index {self.device_idx}'}): {e}")
+
+        try:
+            self.driver_key = str(self.sdr.getDriverKey() or "").lower()
+            if "sdrplay" in self.driver_key:
+                self.is_sdrplay = True
+                self.sample_rate = self._align_rate(self.sample_rate)
+        except Exception:
+            pass
+
+        rx_dir = getattr(soapy, "SOAPY_SDR_RX", 1)
+        cs16_fmt = getattr(soapy, "SOAPY_SDR_CS16", "CS16")
+
+        self.sdr.setSampleRate(rx_dir, 0, float(self.sample_rate))
+        self.sdr.setFrequency(rx_dir, 0, float(self.center_freq))
+        self._apply_ppm()
+        self._apply_gain()
+        self._apply_bias_tee()
+        if self.antenna:
+            try:
+                self.sdr.setAntenna(rx_dir, 0, str(self.antenna))
+            except Exception:
+                pass
+
+        self.rx_stream = self.sdr.setupStream(rx_dir, cs16_fmt, [0])
+        self.sdr.activateStream(self.rx_stream)
+
+    def _apply_ppm(self):
+        if not self.sdr or not self._soapy:
+            return
+        rx_dir = getattr(self._soapy, "SOAPY_SDR_RX", 1)
+        try:
+            self.sdr.setFrequency(rx_dir, 0, "CORR", float(self.ppm))
+        except Exception:
+            try:
+                self.sdr.setFrequencyCorrection(rx_dir, 0, float(self.ppm))
+            except Exception:
+                pass
+
+    def _apply_gain(self):
+        if not self.sdr or not self._soapy:
+            return
+        rx_dir = getattr(self._soapy, "SOAPY_SDR_RX", 1)
+        try:
+            if self.gain_tenths == 0:
+                self.sdr.setGainMode(rx_dir, 0, True)
+            else:
+                self.sdr.setGainMode(rx_dir, 0, False)
+                if self.is_sdrplay:
+                    gains = []
+                    try:
+                        gains = list(self.sdr.listGains(rx_dir, 0) or [])
+                    except Exception:
+                        pass
+                    if "IFGR" in gains:
+                        self.sdr.setGain(rx_dir, 0, "IFGR", float(rsp_gain_db_to_ifgr(self.gain_db)))
+                        if self.lna_state is not None and "RFGR" in gains:
+                            self.sdr.setGain(rx_dir, 0, "RFGR", float(self.lna_state))
+                    else:
+                        self.sdr.setGain(rx_dir, 0, float(self.gain_db))
+                else:
+                    self.sdr.setGain(rx_dir, 0, float(self.gain_db))
+        except Exception:
+            pass
+
+    def _apply_bias_tee(self):
+        if not self.sdr:
+            return
+        val_str = "true" if self.bias_tee else "false"
+        for key in ("biasT_ctrl", "biasT", "biastee"):
+            try:
+                self.sdr.writeSetting(key, val_str)
+                return
+            except Exception:
+                continue
+
+    def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
+        if not self.sdr or not self._soapy:
+            return
+        rx_dir = getattr(self._soapy, "SOAPY_SDR_RX", 1)
+        if rate is not None:
+            new_r = self._align_rate(int(rate))
+            if new_r != self.sample_rate:
+                self.sample_rate = new_r
+                try:
+                    if self.rx_stream is not None:
+                        self.sdr.deactivateStream(self.rx_stream)
+                    self.sdr.setSampleRate(rx_dir, 0, float(self.sample_rate))
+                    self._buffer.clear()
+                    if self.rx_stream is not None:
+                        self.sdr.activateStream(self.rx_stream)
+                except Exception:
+                    pass
+        if freq is not None and int(freq) != self.center_freq:
+            self.center_freq = int(freq)
+            try:
+                self.sdr.setFrequency(rx_dir, 0, float(self.center_freq))
+            except Exception:
+                pass
+        if gain is not None:
+            g_db, g_tenths = parse_gain_value(gain)
+            if (g_db, g_tenths) != (self.gain_db, self.gain_tenths):
+                self.gain_db, self.gain_tenths = g_db, g_tenths
+                self._apply_gain()
+        if ppm is not None and int(ppm) != self.ppm:
+            self.ppm = int(ppm)
+            self._apply_ppm()
+        if bias_tee is not None and bool(bias_tee) != self.bias_tee:
+            self.bias_tee = bool(bias_tee)
+            self._apply_bias_tee()
+
+    def read_exact_bytes(self, byte_count: int) -> bytes:
+        if not self.sdr or self.rx_stream is None:
+            return b""
+        n_samps_req = max(1024, len(self._rx_buf) // 2)
+        retries = 0
+        while len(self._buffer) < byte_count:
+            try:
+                sr = self.sdr.readStream(self.rx_stream, [self._rx_buf], n_samps_req, timeoutUs=500000)
+                ret = int(getattr(sr, "ret", sr))
+            except Exception:
+                break
+            if ret > 0:
+                retries = 0
+                self._buffer.extend(self._rx_buf[:ret * 2].tobytes())
+            elif ret == 0 or ret == -1:  # timeout / retry
+                retries += 1
+                if retries > 6:
+                    break
+            else:
+                retries += 1
+                if retries > 3:
+                    break
+        if len(self._buffer) < byte_count:
+            res = bytes(self._buffer)
+            self._buffer.clear()
+            return res
+        res = bytes(self._buffer[:byte_count])
+        del self._buffer[:byte_count]
+        return res
+
+    def close(self):
+        if self.sdr:
+            if self.rx_stream is not None:
+                try:
+                    self.sdr.deactivateStream(self.rx_stream)
+                except Exception:
+                    pass
+                try:
+                    self.sdr.closeStream(self.rx_stream)
+                except Exception:
+                    pass
+                self.rx_stream = None
+            try:
+                if hasattr(self.sdr, "close"):
+                    self.sdr.close()
+            except Exception:
+                pass
+            self.sdr = None
+        self._buffer.clear()
+
+
 # ---------------------------------------------------------------------------
 # Cross-Platform Queue Utilities
 # ---------------------------------------------------------------------------
@@ -2065,28 +2672,38 @@ def native_demod_worker(
             except queue.Empty:
                 continue
 
-            if len(bank_item) >= 4:
+            if len(bank_item) >= 5:
+                raw_bank, bank_rssi, chunk_rate, chunk_center, sample_format = (
+                    bank_item[0], bank_item[1], int(bank_item[2]), int(bank_item[3]), str(bank_item[4] or "u8")
+                )
+            elif len(bank_item) >= 4:
                 raw_bank, bank_rssi, chunk_rate, chunk_center = (
                     bank_item[0], bank_item[1], int(bank_item[2]), int(bank_item[3])
                 )
-                if chunk_rate != channelizer.input_rate:
-                    channelizer = ContinuousChannelizer(chunk_rate)
-                    channel_buffers_fr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
-                    channel_buffers_hr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
-                if chunk_center != current_center_freq:
-                    current_center_freq = chunk_center
-                    channelizer.reset()
+                sample_format = "u8"
             else:
                 raw_bank, bank_rssi = bank_item[0], bank_item[1]
+                chunk_rate, chunk_center, sample_format = channelizer.input_rate, current_center_freq, "u8"
 
-            total_samples_proc += len(raw_bank) // 2
+            if chunk_rate != channelizer.input_rate:
+                channelizer = ContinuousChannelizer(chunk_rate)
+                channel_buffers_fr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
+                channel_buffers_hr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
+            if chunk_center != current_center_freq:
+                current_center_freq = chunk_center
+                channelizer.reset()
+
+            bps = 4 if sample_format == "s16" else 2
+            total_samples_proc += len(raw_bank) // bps
             total_banks_proc += 1
             queue_backlog = safe_queue_size(data_queue, 0)
 
             # 3. Channelize and demodulate across assigned channels with per-channel frequency offset compensation
             for ch in active_channels:
                 ch_df = channel_freq_offsets.get(ch, 0.0) if afc_enabled else 0.0
-                y_fr, y_hr = channelizer.channelize(raw_bank, current_center_freq, ch, ch_freq_offset_hz=ch_df)
+                y_fr, y_hr = channelizer.channelize(
+                    raw_bank, current_center_freq, ch, ch_freq_offset_hz=ch_df, sample_format=sample_format
+                )
 
                 # Maintain rolling buffer (expanded to 500ms FR / 600ms HR to capture long bursts up to 350+ bytes across chunks)
                 full_fr = np.concatenate([channel_buffers_fr.get(ch, np.zeros(0, dtype=np.complex64)), y_fr])
@@ -2397,10 +3014,12 @@ def sdr_stream_reader_worker(
     bias_tee: bool = True,
     chroma_port: int = 18099,
     initial_meta: Optional[dict] = None,
+    sdr_opts: Optional[dict] = None,
 ):
     """
     Dedicated SDR reader process:
-    Acquires sample chunks from rtl_sdr pipe, stdin, or rtl_tcp and fans them out.
+    Acquires sample chunks from rtl_sdr pipe, stdin, rtl_tcp, pyrtlsdr, SDRplay rsp_tcp,
+    or SoapySDR (8-bit u8 or 16-bit s16) and fans them out.
     Optionally publishes gated, non-blocking I/Q snapshots to ApexBOSChroma via ZMQ XPUB
     (zero overhead when no Chroma subscriber is connected).
     """
@@ -2409,6 +3028,7 @@ def sdr_stream_reader_worker(
     except (ValueError, AttributeError):
         pass
 
+    opts = dict(sdr_opts or {})
     stream = None
     center_freq = int(initial_center_freq)
     cur_sample_rate = int(sample_rate)
@@ -2416,7 +3036,11 @@ def sdr_stream_reader_worker(
     ppm = int(ppm_correction)
     bias = bool(bias_tee)
     base_chunk_sec = float(chunk_samples) / float(max(192000, cur_sample_rate))
-    bytes_per_chunk = chunk_samples * 2
+    sample_format = str(opts.get("sample_format") or "auto").strip().lower()
+    if sample_format not in ("u8", "s16"):
+        sample_format = "u8"
+    bytes_per_sample = 4 if sample_format == "s16" else 2
+    bytes_per_chunk = chunk_samples * bytes_per_sample
 
     total_iq_samples = 0
     total_iq_bytes = 0
@@ -2453,6 +3077,41 @@ def sdr_stream_reader_worker(
             stream = DirectRtlTcpSource(host_addr, tcp_port, center_freq, cur_sample_rate, gain, ppm, bias_tee=bias)
         elif stream_kind == "rtlsdr":
             stream = DirectRtlSdrSource(center_freq, cur_sample_rate, gain, ppm, device_num, bias_tee=bias)
+        elif stream_kind == "rsptcp":
+            stream = DirectRspTcpSource(
+                host_addr,
+                tcp_port,
+                center_freq,
+                cur_sample_rate,
+                gain,
+                ppm,
+                bias_tee=bias,
+                extended_16bit=bool(opts.get("rsp_extended", False)),
+                lna_state=int(opts.get("rsp_lna_state", 0) or 0),
+                antenna=opts.get("rsp_antenna"),
+                notch=opts.get("rsp_notch"),
+                sample_format_override=str(opts.get("sample_format") or "auto"),
+            )
+            cur_sample_rate = int(stream.sample_rate)
+            sample_format = stream.sample_format
+            bytes_per_sample = stream.bytes_per_sample
+            bytes_per_chunk = chunk_samples * bytes_per_sample
+        elif stream_kind == "soapy":
+            stream = DirectSoapySdrSource(
+                center_freq,
+                cur_sample_rate,
+                gain,
+                ppm,
+                device_num,
+                bias_tee=bias,
+                soapy_args=opts.get("soapy_args"),
+                lna_state=opts.get("rsp_lna_state"),
+                antenna=opts.get("rsp_antenna"),
+            )
+            cur_sample_rate = int(stream.sample_rate)
+            sample_format = stream.sample_format
+            bytes_per_sample = stream.bytes_per_sample
+            bytes_per_chunk = chunk_samples * bytes_per_sample
     except Exception as e:
         metrics_queue.put({
             "type": "error",
@@ -2468,6 +3127,7 @@ def sdr_stream_reader_worker(
         "stream": stream_kind,
         "center_freq": center_freq,
         "sample_rate": cur_sample_rate,
+        "sample_format": sample_format,
         "gain_db": g_db,
         "gain": g_tenths,
         "ppm": ppm,
@@ -2495,7 +3155,7 @@ def sdr_stream_reader_worker(
                         target_samps = max(16384, int(round(cur_sample_rate * base_chunk_sec)))
                         align = max(256, dec_f * 256)
                         target_samps = ((target_samps + align - 1) // align) * align
-                        bytes_per_chunk = target_samps * 2
+                        bytes_per_chunk = target_samps * bytes_per_sample
                         if stream:
                             stream.update_hardware_params(freq=center_freq, rate=cur_sample_rate)
                     elif cmd == "set_gain":
@@ -2544,13 +3204,13 @@ def sdr_stream_reader_worker(
 
             chunk_len = len(raw_chunk)
             total_iq_bytes += chunk_len
-            total_iq_samples += chunk_len // 2
+            total_iq_samples += chunk_len // bytes_per_sample
             total_chunks += 1
 
-            bank_rssi = compute_signal_power_dbfs(raw_chunk)
+            bank_rssi = compute_signal_power_dbfs(raw_chunk, sample_format=sample_format)
 
-            # Fan out to worker queues with automatic backlog drain (tagged with rate & center_freq)
-            tagged_bank = (raw_chunk, bank_rssi, cur_sample_rate, center_freq)
+            # Fan out to worker queues with automatic backlog drain (tagged with rate, center_freq, sample_format)
+            tagged_bank = (raw_chunk, bank_rssi, cur_sample_rate, center_freq, sample_format)
             for q in worker_queues:
                 try:
                     if q.qsize() > 6:
@@ -2583,13 +3243,15 @@ def sdr_stream_reader_worker(
             if chroma_xpub is not None and chroma_subs > 0 and (now_t - last_chroma_send) >= 0.036:
                 last_chroma_send = now_t
                 try:
-                    # Send up to 65536 IQ samples (131072 bytes) for low-variance multi-segment Welch FFT
-                    iq_slice = raw_chunk[-131072:] if chunk_len > 131072 else raw_chunk
+                    # Send up to 65536 IQ samples (131072 B for u8, 262144 B for s16) for low-variance Welch FFT
+                    max_tap_bytes = 65536 * bytes_per_sample
+                    iq_slice = raw_chunk[-max_tap_bytes:] if chunk_len > max_tap_bytes else raw_chunk
                     tap_meta = dict(chroma_meta) if chroma_meta else {}
                     # Authoritative reader-thread hardware state always wins over cached meta
                     tap_meta.update({
                         "center_freq": center_freq,
                         "sample_rate": cur_sample_rate,
+                        "sample_format": sample_format,
                         "ppm": ppm,
                         "gain_db": g_db,
                         "bias_tee": bias,
@@ -3155,10 +3817,15 @@ class ApexBOSGrabberApplication:
         else:
             self.rate_auto_scaled = False
 
-        # Ensure sample rate is hardware-compliant for RTL-SDR sources (pipe, tcp, and direct rtlsdr)
-        # RTL2832U chip physical ADC limit: valid rates are >= 900,000 S/s.
-        if self.stream_kind in ("pipe", "tcp", "rtlsdr"):
-            min_hardware_rate = 960000
+        # Ensure sample rate is hardware-compliant for active SDR source
+        # - RTL2832U (pipe, tcp, rtlsdr): >= 960,000 S/s (multiple of 192,000)
+        # - SDRplay RSP1B/RSP1A/RSPdx/RSPduo (rsptcp, soapy driver=sdrplay): >= 2,112,000 S/s (native 2-10 MS/s ADC)
+        self.soapy_args = str(getattr(cli_args, "soapy_args", None) or "").strip()
+        is_sdrplay_hw = (self.stream_kind == "rsptcp") or (
+            self.stream_kind == "soapy" and "sdrplay" in self.soapy_args.lower()
+        )
+        if self.stream_kind in ("pipe", "tcp", "rtlsdr", "rsptcp", "soapy"):
+            min_hardware_rate = DirectRspTcpSource.RSP_MIN_RATE if is_sdrplay_hw else 960000
             if self.sample_rate < min_hardware_rate:
                 self.sample_rate = min_hardware_rate
                 self.rate_auto_scaled = True
@@ -3949,7 +4616,14 @@ class ApexBOSGrabberApplication:
                 freqs = [itc_channel_frequency(c) for c in self.channels]
                 span = max(freqs) - min(freqs)
                 needed = int(math.ceil((span + 50000) / 192000.0) * 192000)
-                min_hw = 960000 if self.stream_kind in ("pipe", "tcp", "rtlsdr") else DEFAULT_SAMPLE_RATE
+                if self.stream_kind == "rsptcp" or (
+                    self.stream_kind == "soapy" and "sdrplay" in str(getattr(self, "soapy_args", "")).lower()
+                ):
+                    min_hw = DirectRspTcpSource.RSP_MIN_RATE
+                elif self.stream_kind in ("pipe", "tcp", "rtlsdr", "soapy"):
+                    min_hw = 960000
+                else:
+                    min_hw = DEFAULT_SAMPLE_RATE
                 target_rate = max(int(self.base_sample_rate), needed, min_hw)
             else:
                 target_rate = int(self.base_sample_rate)
@@ -4251,6 +4925,54 @@ class ApexBOSGrabberApplication:
                 return
             time.sleep(0.2)
 
+    def _maybe_start_rsp_tcp_server(self):
+        """
+        In RSP-TCP mode (SDRplay RSP1B/RSP1A/RSPdx/RSPduo), if no rsp_tcp server is listening
+        on a local host:port, launch rsp_tcp (user-specified --rsp-tcp-bin, else PATH/SDRplay dir).
+        """
+        host = str(getattr(self.args, "host", "127.0.0.1") or "127.0.0.1")
+        port = int(getattr(self.args, "port", 1234) or 1234)
+        if check_rtl_tcp_running(host, port):
+            return
+        if host.strip("[]").lower() not in ("127.0.0.1", "localhost", "::1"):
+            return
+        exe = getattr(self.args, "rsp_tcp_bin", None)
+        if exe and not os.path.isfile(exe):
+            print(f"[!] Configured rsp_tcp executable not found: {exe}")
+            exe = None
+        exe = exe or detect_rsp_tcp_executable()
+        if not exe:
+            print(f"[!] No rsp_tcp server on {host}:{port} and no rsp_tcp executable found "
+                  f"(install SDRplay API v3.15+ & rsp_tcp, or specify --rsp-tcp-bin).")
+            return
+        exe_dir = os.path.dirname(os.path.abspath(exe))
+        env = os.environ.copy()
+        env["PATH"] = exe_dir + os.pathsep + env.get("PATH", "")
+        cmd = [exe, "-a", host.strip("[]"), "-p", str(port), "-d", str(self.device), "-s", str(self.sample_rate)]
+        if bool(getattr(self.args, "rsp_extended", False)):
+            cmd.extend(["-E", "-b", "16"])
+        if self.bias_tee:
+            cmd.append("-T")
+        flags = 0x08000000 if os.name == "nt" else 0
+        try:
+            self._rtl_tcp_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env, cwd=exe_dir, creationflags=flags,
+            )
+        except Exception as exc:
+            print(f"[!] Failed to start rsp_tcp ({exe}): {exc}")
+            return
+        for _ in range(35):
+            if check_rtl_tcp_running(host, port):
+                mode_s = "extended 16-bit (-E)" if getattr(self.args, "rsp_extended", False) else "standard 8-bit"
+                print(f"[*] Started rsp_tcp ({exe}) on {host}:{port} [{mode_s}], device #{self.device}")
+                return
+            if self._rtl_tcp_proc.poll() is not None:
+                print(f"[!] rsp_tcp exited immediately (check SDRplay API v3.15+ service & device #{self.device})")
+                self._rtl_tcp_proc = None
+                return
+            time.sleep(0.2)
+
     def _stop_rtl_tcp_server(self):
         proc = getattr(self, "_rtl_tcp_proc", None)
         if proc is None:
@@ -4284,9 +5006,24 @@ class ApexBOSGrabberApplication:
         # 0. Check SDR availability before spawning worker processes
         if self.stream_kind == "tcp":
             self._maybe_start_rtl_tcp_server()
+        elif self.stream_kind == "rsptcp":
+            self._maybe_start_rsp_tcp_server()
         if self.stream_kind == "pipe" and not is_rtl_sdr_available(self.sdr_binary):
             print_sdr_setup_guide()
             sys.exit(1)
+        elif self.stream_kind == "soapy":
+            ok, err = is_soapysdr_available()
+            if not ok:
+                print("\n" + "=" * 76)
+                print(" [!] ApexBOSGrabber: SoapySDR Mode Error")
+                print("=" * 76)
+                print(f"Details: {err}\n")
+                print("For SDRplay RSP1B via SoapySDR:")
+                print("  1. Install official SDRplay API v3.15+.")
+                print("  2. Install SoapySDR + SoapySDRPlay3 (Linux/Conda-Forge/PothosSDR).")
+                print("  Or use SDRplay's official rsp_tcp with: --rsp-tcp --rate 2304000\n")
+                print("=" * 76 + "\n")
+                sys.exit(1)
         elif self.stream_kind == "rtlsdr":
             ok, err = is_rtlsdr_package_available()
             if not ok:
@@ -4334,6 +5071,14 @@ class ApexBOSGrabberApplication:
             workers.append(p)
 
         # 2. Spawn SDR Reader Process
+        sdr_opts = {
+            "rsp_extended": bool(getattr(self.args, "rsp_extended", False)),
+            "rsp_lna_state": int(getattr(self.args, "rsp_lna_state", 0) or 0),
+            "rsp_antenna": getattr(self.args, "rsp_antenna", None),
+            "rsp_notch": getattr(self.args, "rsp_notch", None),
+            "soapy_args": str(getattr(self.args, "soapy_args", None) or "").strip(),
+            "sample_format": str(getattr(self.args, "sample_format", "auto") or "auto").strip().lower(),
+        }
         reader_proc = multiprocessing.Process(
             target=sdr_stream_reader_worker,
             args=(
@@ -4354,6 +5099,7 @@ class ApexBOSGrabberApplication:
                 self.bias_tee,
                 self.chroma_port,
                 self._chroma_meta_snapshot(),
+                sdr_opts,
             ),
             daemon=True,
         )
@@ -5041,6 +5787,38 @@ def build_cli_parser():
     parser.add_argument("--rtl-sdr-bin", default=None, help="Custom path to rtl_sdr executable")
     parser.add_argument("--rtl-tcp", action="store_true", help="Connect directly to an RTL-TCP server")
     parser.add_argument(
+        "--rsp-tcp", "--rsptcp",
+        dest="rsp_tcp",
+        action="store_true",
+        default=False,
+        help="Connect to SDRplay's rsp_tcp server (RSP1B / RSP1A / RSPdx / RSPduo; supports standard 8-bit & -E 16-bit)",
+    )
+    parser.add_argument("--rsp-tcp-bin", default=None, help="Path to the SDRplay rsp_tcp executable (auto-launched locally when in rsptcp mode)")
+    parser.add_argument(
+        "--rsp-16bit", "--rsp-extended",
+        dest="rsp_extended",
+        action="store_true",
+        default=False,
+        help="Enable SDRplay rsp_tcp Extended Mode (-E) with full 14/16-bit CS16 IQ resolution",
+    )
+    parser.add_argument("--rsp-lna-state", type=int, default=0, help="SDRplay LNA state 0..9 (0 = max sensitivity, default: 0)")
+    parser.add_argument("--rsp-antenna", default=None, help="Optional SDRplay/SoapySDR antenna port selection")
+    parser.add_argument("--rsp-notch", type=int, default=None, help="Optional SDRplay rsp_tcp broadcast notch filter bitmask")
+    parser.add_argument(
+        "--soapy", "--soapysdr",
+        dest="soapy",
+        action="store_true",
+        default=False,
+        help="Read native 16-bit CS16 I/Q directly via SoapySDR (SDRplay RSP1B via SoapySDRPlay3, Airspy, HackRF, RTL-SDR)",
+    )
+    parser.add_argument("--soapy-args", default=None, help="SoapySDR device selector string (e.g. 'driver=sdrplay' or 'driver=rtlsdr')")
+    parser.add_argument(
+        "--sample-format",
+        default="auto",
+        choices=["auto", "u8", "s16"],
+        help="Raw IQ sample format override: 'u8' (8-bit unsigned RTL-SDR) or 's16' (16-bit signed CS16 SDRplay/SoapySDR, default: auto)",
+    )
+    parser.add_argument(
         "--rtlsdr", "--pyrtlsdr",
         dest="rtlsdr",
         action="store_true",
@@ -5052,14 +5830,19 @@ def build_cli_parser():
         dest="auto_mode",
         action="store_true",
         default=False,
-        help="Automatically probe and select available SDR source (rtl_sdr, rtl_tcp, or pyrtlsdr)",
+        help="Automatically probe and select available SDR source (rtl_sdr, rtl_tcp, pyrtlsdr, rsp_tcp, or SoapySDR)",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="RTL-TCP server host (default: 127.0.0.1)")
-    parser.add_argument("--port", "--rtl-port", dest="port", type=int, default=1234, help="RTL-TCP port (default: 1234)")
-    parser.add_argument("--device", type=int, default=0, help="RTL-SDR device index (default: 0)")
+    parser.add_argument("--host", default="127.0.0.1", help="RTL-TCP / RSP-TCP server host (default: 127.0.0.1)")
+    parser.add_argument("--port", "--rtl-port", dest="port", type=int, default=1234, help="RTL-TCP / RSP-TCP port (default: 1234)")
+    parser.add_argument("--device", type=int, default=0, help="SDR device index (default: 0)")
     parser.add_argument("--rtl-tcp-bin", default=None, help="Path to the rtl_tcp executable (started automatically in TCP mode when no server is listening locally)")
     parser.add_argument("--rtlsdr-dll-dir", default=None, help="Folder containing rtlsdr.dll / libusb-1.0.dll (or librtlsdr) for direct and TCP modes")
-    parser.add_argument("--sdr-mode", default="auto", choices=["auto", "pipe", "tcp", "rtlsdr", "stdin"], help="SDR interface to use (default: auto-detect)")
+    parser.add_argument(
+        "--sdr-mode",
+        default="auto",
+        choices=["auto", "pipe", "tcp", "rtlsdr", "rsptcp", "soapy", "stdin"],
+        help="SDR interface to use (default: auto-detect)",
+    )
 
     # RF & Baseband Parameters
     parser.add_argument("--rate", type=int, default=DEFAULT_SAMPLE_RATE, help="SDR sample rate in S/s (default: 192000, auto-scaled if channels span wider bandwidth)")

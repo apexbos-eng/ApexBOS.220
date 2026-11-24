@@ -502,9 +502,9 @@ python View_ApexBOS.220.py --engine-port 5018 --mcast-port 5017
 ## Hardware Requirements & SDR Tuning
 
 ### Recommended SDR Hardware
-- **RTL-SDR Blog V3 / V4**: High-stability TCXO ($\le 1\text{ PPM}$), SMA connector, software-controllable bias-tee. Excellent value for 220 MHz reception.
-- **Airspy R2 / Mini**: High dynamic range and wide bandwidth, ideal for multi-channel reception across the full 220–222 MHz band.
-- **HackRF One**: Wideband transceiver for multi-MHz spectrum capture.
+- **RTL-SDR Blog V3 / V4**: High-stability TCXO ($\le 1\text{ PPM}$), SMA connector, software-controllable bias-tee. Excellent value for 220 MHz reception (supported via `--pipe`, `--rtl-tcp`, `--rtlsdr`, and `--soapy`).
+- **SDRplay RSP1B / RSP1A / RSPdx / RSPduo**: 14-bit ADC (~84 dB dynamic range), 0.5 PPM TCXO, built-in 4.7 V Bias-T, and strong adjacent-band/pager immunity. Supported in Grabber and Chroma via **SDRplay `rsp_tcp`** (`--rsp-tcp`, including Extended 16-bit `--rsp-16bit` mode) and **SoapySDR** (`--soapy --soapy-args "driver=sdrplay"` via `SoapySDRPlay3`). Requires the official **SDRplay API v3.15+** installed for RSP1B.
+- **Airspy R2 / Mini & HackRF One**: Supported via **SoapySDR** (`--soapy`) for native 16-bit `CS16` multi-MHz spectrum capture.
 
 ### Antennas & RF Filtering
 - **Tuned 220 MHz Ground Plane or Yagi**: A vertical whip cut to approximately 12.8 inches (quarter-wave) or a tuned directional Yagi provides strong signal gain.

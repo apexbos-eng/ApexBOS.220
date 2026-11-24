@@ -240,11 +240,12 @@ class ChromaSpectrumEngine:
         now_mono: Optional[float] = None,
         paused: bool = False,
         agc_stabilize: bool = False,
+        sample_format: str = "u8",
     ) -> Optional[np.ndarray]:
         """
-        Computes vectorized multi-segment adaptive Welch FFT across raw uint8
-        interleaved I/Q bytes and updates EMA spectrum, fading RSSI peak-hold,
-        max-hold, and waterfall ring buffer.
+        Computes vectorized multi-segment adaptive Welch FFT across raw uint8 ('u8')
+        or signed 16-bit CS16 ('s16', e.g. SDRplay RSP1B / SoapySDR) interleaved I/Q bytes
+        and updates EMA spectrum, fading RSSI peak-hold, max-hold, and waterfall ring buffer.
         When agc_stabilize=True (hardware AGC active), tracks the 25th-percentile
         noise floor to cancel R820T AGC gain-pumping zebra stripes.
         Returns latest dBFS array or None if input is too short.
@@ -253,15 +254,23 @@ class ChromaSpectrumEngine:
             return None
         now_m = time.monotonic() if now_mono is None else float(now_mono)
 
-        raw_u8 = np.frombuffer(raw_iq, dtype=np.uint8)
-        if len(raw_u8) < 2:
-            return None
+        if sample_format == "s16":
+            n_i16 = len(raw_iq) // 2
+            if n_i16 < 2:
+                return None
+            raw_i16 = np.frombuffer(raw_iq[:n_i16 * 2], dtype="<i2")
+            clip_count = int(np.count_nonzero((raw_i16 >= 32700) | (raw_i16 <= -32700)))
+            self.clip_ratio = clip_count / float(len(raw_i16))
+            arr = raw_i16.astype(np.float32) * (127.5 / 32768.0)
+        else:
+            raw_u8 = np.frombuffer(raw_iq, dtype=np.uint8)
+            if len(raw_u8) < 2:
+                return None
+            # ADC Clipping check (0 or 255 saturation)
+            clip_count = int(np.count_nonzero((raw_u8 == 0) | (raw_u8 == 255)))
+            self.clip_ratio = clip_count / float(len(raw_u8))
+            arr = raw_u8.astype(np.float32) - 127.5
 
-        # ADC Clipping check (0 or 255 saturation)
-        clip_count = int(np.count_nonzero((raw_u8 == 0) | (raw_u8 == 255)))
-        self.clip_ratio = clip_count / float(len(raw_u8))
-
-        arr = raw_u8.astype(np.float32) - 127.5
         n_samps = len(arr) // 2
         iq = arr[0:n_samps * 2:2] + 1j * arr[1:n_samps * 2:2]
         # Remove DC spike (RTL-SDR zero-IF DC offset)
@@ -989,6 +998,7 @@ class StandaloneSDRThread:
         bias_tee: bool = True,
         use_mock: bool = False,
         blip_sub: Optional[PacketBlipSubscriber] = None,
+        sdr_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.center_freq = int(center_freq)
         self.sample_rate = int(sample_rate)
@@ -998,6 +1008,7 @@ class StandaloneSDRThread:
         self.bias_tee = bool(bias_tee)
         self.use_mock = bool(use_mock)
         self.blip_sub = blip_sub
+        self.sdr_cfg = dict(sdr_cfg or {})
 
         self._iq_queue: queue.Queue = queue.Queue(maxsize=2)
         self._cmd_queue: queue.Queue = queue.Queue()
@@ -1041,27 +1052,65 @@ class StandaloneSDRThread:
         stream = None
         try:
             import ApexBOSGrabber as grabber
+            cfg = self.sdr_cfg
             class _Args:
                 stdin = False
                 rtl_tcp = False
+                rsp_tcp = False
+                soapy = False
                 rtlsdr = False
                 pipe = False
-                sdr_mode = "auto"
-                rtl_sdr_bin = None
-                rtlsdr_dll_dir = None
-                host = "127.0.0.1"
-                port = 1234
+                sdr_mode = str(cfg.get("sdr_mode") or "auto")
+                rtl_sdr_bin = cfg.get("rtl_sdr_bin")
+                rsp_tcp_bin = cfg.get("rsp_tcp_bin")
+                rtlsdr_dll_dir = cfg.get("rtlsdr_dll_dir")
+                host = str(cfg.get("rtl_tcp_host") or "127.0.0.1")
+                port = int(cfg.get("rtl_tcp_port") or 1234)
             kind = grabber.resolve_sdr_stream_kind(_Args())
+            sample_fmt = "u8"
+            bps = 2
             if kind == "rtlsdr":
                 stream = grabber.DirectRtlSdrSource(
                     self.center_freq, self.sample_rate, self.gain, self.ppm, self.device_idx, bias_tee=self.bias_tee
                 )
             elif kind == "tcp":
                 stream = grabber.DirectRtlTcpSource(
-                    "127.0.0.1", 1234, self.center_freq, self.sample_rate, self.gain, self.ppm, bias_tee=self.bias_tee
+                    _Args.host, _Args.port, self.center_freq, self.sample_rate, self.gain, self.ppm, bias_tee=self.bias_tee
                 )
+            elif kind == "rsptcp":
+                stream = grabber.DirectRspTcpSource(
+                    _Args.host,
+                    _Args.port,
+                    self.center_freq,
+                    self.sample_rate,
+                    self.gain,
+                    self.ppm,
+                    bias_tee=self.bias_tee,
+                    extended_16bit=bool(cfg.get("rsp_extended", False)),
+                    lna_state=int(cfg.get("rsp_lna_state", 0) or 0),
+                    antenna=cfg.get("rsp_antenna"),
+                    notch=cfg.get("rsp_notch"),
+                )
+                sample_fmt = stream.sample_format
+                bps = stream.bytes_per_sample
+                self.sample_rate = int(stream.sample_rate)
+            elif kind == "soapy":
+                stream = grabber.DirectSoapySdrSource(
+                    self.center_freq,
+                    self.sample_rate,
+                    self.gain,
+                    self.ppm,
+                    self.device_idx,
+                    bias_tee=self.bias_tee,
+                    soapy_args=cfg.get("soapy_args"),
+                    lna_state=cfg.get("rsp_lna_state"),
+                    antenna=cfg.get("rsp_antenna"),
+                )
+                sample_fmt = stream.sample_format
+                bps = stream.bytes_per_sample
+                self.sample_rate = int(stream.sample_rate)
             elif kind == "pipe":
-                bin_p = grabber.detect_rtl_sdr_executable()
+                bin_p = grabber.detect_rtl_sdr_executable(_Args.rtl_sdr_bin)
                 stream = grabber.SubprocessPipeSource(
                     bin_p, self.center_freq, self.sample_rate, self.gain, self.ppm, self.device_idx, bias_tee=self.bias_tee
                 )
@@ -1069,7 +1118,7 @@ class StandaloneSDRThread:
                 raise RuntimeError(f"Unsupported standalone SDR mode '{kind}'")
 
             self.active = True
-            read_bytes = 32768 * 2
+            read_bytes = 32768 * bps
             while not self._stop_ev.is_set():
                 while not self._cmd_queue.empty():
                     try:
@@ -1089,6 +1138,7 @@ class StandaloneSDRThread:
                 meta = {
                     "center_freq": self.center_freq,
                     "sample_rate": self.sample_rate,
+                    "sample_format": sample_fmt,
                     "ppm": self.ppm,
                     "gain_db": float(self.gain) if str(self.gain).replace(".", "", 1).isdigit() else 0.0,
                     "bias_tee": self.bias_tee,
@@ -1358,6 +1408,7 @@ class ApexBOSChromaApp:
                 device_idx=self.device_idx,
                 bias_tee=self.bias_tee,
                 use_mock=False,
+                sdr_cfg=self.config.get("grabber") or {},
             )
             self.standalone_sdr.start()
             self.wideband_active = True
@@ -1592,6 +1643,7 @@ class ApexBOSChromaApp:
             device_idx=self.device_idx,
             bias_tee=self.bias_tee,
             use_mock=False,
+            sdr_cfg=self.config.get("grabber") or {},
         )
         self.standalone_sdr.start()
         self.wideband_active = True
@@ -1640,6 +1692,7 @@ class ApexBOSChromaApp:
             self._sync_state_from_dict(meta, sync_engine_rf=False)
             c_freq = int(meta.get("center_freq") or self.engine.center_freq)
             s_rate = int(meta.get("sample_rate") or self.engine.sample_rate)
+            s_fmt = str(meta.get("sample_format") or "u8")
             agc_active = (self.gain_db <= 0.0) and (self.mode != "mock")
             prev_ts = self.engine.last_update_ts
             self.engine.process_iq_bytes(
@@ -1649,6 +1702,7 @@ class ApexBOSChromaApp:
                 now_mono=now_m,
                 paused=self.paused,
                 agc_stabilize=agc_active,
+                sample_format=s_fmt,
             )
             if prev_ts > 0 and (now_m - prev_ts) > 0.005 and not self.paused:
                 inst_rate = 1.0 / (now_m - prev_ts)

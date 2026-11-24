@@ -1163,36 +1163,39 @@ def run_cli_wizard(
 
         existing_sdr = config_loader._sdr_from_cfg(ex_grab)
         default_sdr_mode = str(ex_grab.get("sdr_mode") or existing_sdr.get("mode") or "auto").strip().lower()
-        if default_sdr_mode not in ("auto", "pipe", "tcp", "rtlsdr", "stdin"):
+        if default_sdr_mode not in ("auto", "pipe", "tcp", "rtlsdr", "rsptcp", "soapy", "stdin"):
             default_sdr_mode = "auto"
 
-        print("  Select RTL-SDR hardware access mode:")
-        print("    [1] auto    (probe and auto-detect available interface: pipe, tcp, rtlsdr)")
+        print("  Select SDR hardware access mode:")
+        print("    [1] auto    (probe and auto-detect available interface)")
         print("    [2] pipe    (read raw I/Q from rtl_sdr subprocess pipe)")
         print("    [3] tcp     (connect to rtl_tcp server locally or over network)")
         print("    [4] rtlsdr  (read raw I/Q directly using Python rtlsdr package)")
-        print("    [5] stdin   (read raw I/Q from standard input)")
+        print("    [5] rsptcp  (SDRplay RSP1B/RSP1A/RSPdx via rsp_tcp server)")
+        print("    [6] soapy   (SDRplay/Airspy/HackRF/RTL-SDR via SoapySDR CS16)")
+        print("    [7] stdin   (read raw I/Q from standard input)")
 
         if auto_defaults:
             sdr_mode_choice = default_sdr_mode
         else:
-            mode_in = input(f"[?] RTL-SDR access mode [auto/pipe/tcp/rtlsdr/stdin] (default: {default_sdr_mode}): ").strip().lower()
-            mode_map = {"1": "auto", "2": "pipe", "3": "tcp", "4": "rtlsdr", "5": "stdin"}
+            mode_in = input(f"[?] SDR access mode [auto/pipe/tcp/rtlsdr/rsptcp/soapy/stdin] (default: {default_sdr_mode}): ").strip().lower()
+            mode_map = {"1": "auto", "2": "pipe", "3": "tcp", "4": "rtlsdr", "5": "rsptcp", "6": "soapy", "7": "stdin"}
             sdr_mode_choice = mode_map.get(mode_in, mode_in) if mode_in else default_sdr_mode
-            if sdr_mode_choice not in ("auto", "pipe", "tcp", "rtlsdr", "stdin"):
+            if sdr_mode_choice not in ("auto", "pipe", "tcp", "rtlsdr", "rsptcp", "soapy", "stdin"):
                 sdr_mode_choice = default_sdr_mode
 
         default_tcp_host = str(ex_grab.get("rtl_tcp_host") or existing_sdr.get("rtl_tcp_host") or "127.0.0.1").strip()
         default_tcp_port = int(ex_grab.get("rtl_tcp_port") or existing_sdr.get("rtl_tcp_port") or 1234)
 
-        if sdr_mode_choice == "tcp":
+        if sdr_mode_choice in ("tcp", "rsptcp"):
+            srv_lbl = "RSP-TCP" if sdr_mode_choice == "rsptcp" else "RTL-TCP"
             if auto_defaults:
                 tcp_host_val = default_tcp_host
                 tcp_port_val = default_tcp_port
             else:
-                host_in = input(f"[?] RTL-TCP server host/IP (default: {default_tcp_host}): ").strip()
+                host_in = input(f"[?] {srv_lbl} server host/IP (default: {default_tcp_host}): ").strip()
                 tcp_host_val = host_in if host_in else default_tcp_host
-                port_in = input(f"[?] RTL-TCP server port (default: {default_tcp_port}): ").strip()
+                port_in = input(f"[?] {srv_lbl} server port (default: {default_tcp_port}): ").strip()
                 try:
                     tcp_port_val = int(port_in) if port_in else default_tcp_port
                 except ValueError:
@@ -1201,11 +1204,24 @@ def run_cli_wizard(
             tcp_host_val = default_tcp_host
             tcp_port_val = default_tcp_port
 
-        has_existing_paths = any(existing_sdr.get(k) for k in ("rtl_sdr_bin", "rtl_tcp_bin", "rtlsdr_dll_dir"))
+        has_existing_paths = any(existing_sdr.get(k) for k in ("rtl_sdr_bin", "rtl_tcp_bin", "rsp_tcp_bin", "rtlsdr_dll_dir"))
         env = config_loader.detect_sdr_environment(existing_sdr.get("rtlsdr_dll_dir"))
-        print(f"  rtl_sdr  on PATH : {env['rtl_sdr_on_path'] or 'not found'}")
-        print(f"  rtl_tcp  on PATH : {env['rtl_tcp_on_path'] or 'not found'}")
-        print(f"  pyrtlsdr library : {'OK' if env['pyrtlsdr_ok'] else 'not available (' + str(env['pyrtlsdr_error']) + ')'}")
+        print(f"  rtl_sdr  (pipe)  : {env['rtl_sdr_on_path'] or 'not found'}")
+        print(f"  rtl_tcp  (TCP)   : {env['rtl_tcp_on_path'] or 'not found'}")
+        rtlsdr_desc = "OK" + (f" ({env['auto_rtlsdr_dll_dir']})" if env.get("auto_rtlsdr_dll_dir") else "")
+        print(f"  pyrtlsdr library : {rtlsdr_desc if env['pyrtlsdr_ok'] else 'not available (' + str(env['pyrtlsdr_error']) + ')'}")
+        rsp_desc = env.get("rsp_tcp_bin") or ("API detected (install rsp_tcp)" if env.get("sdrplay_api_ok") else "not found")
+        print(f"  SDRplay rsp_tcp  : {rsp_desc}")
+        soapy_desc = "OK" if env.get("soapysdr_ok") else f"not available ({env.get('soapysdr_error')})"
+        print(f"  SoapySDR library : {soapy_desc}")
+
+        auto_ready = (
+            (sdr_mode_choice == "rsptcp" and bool(env.get("rsp_tcp_bin")))
+            or (sdr_mode_choice == "soapy" and bool(env.get("soapysdr_ok")))
+            or (sdr_mode_choice == "rtlsdr" and bool(env.get("pyrtlsdr_ok")))
+            or (sdr_mode_choice == "pipe" and bool(env.get("rtl_sdr_on_path")))
+            or (sdr_mode_choice in ("auto", "tcp") and bool(env.get("rtl_tcp_on_path") or env.get("rtl_sdr_on_path") or env.get("pyrtlsdr_ok")))
+        )
 
         sdr: Dict[str, Any]
         if sdr_path:
@@ -1215,11 +1231,15 @@ def run_cli_wizard(
         elif has_existing_paths:
             sdr = dict(existing_sdr)
             print(f"  Keeping previously configured SDR paths: {_describe_sdr(sdr, dev)}")
-        elif env["rtl_tcp_on_path"] or auto_defaults:
+        elif auto_ready or auto_defaults:
             sdr = config_loader.build_sdr_settings(None, env)
         else:
-            print("  rtl_tcp was not found on PATH. Enter the path to the rtl_tcp executable (or rtl_sdr),")
-            print("  or to the folder containing them / rtlsdr.dll + libusb-1.0.dll (Windows).")
+            print("  No SDR tools/libraries were auto-detected in PATH or standard install folders.")
+            if sys.platform == "win32":
+                print("  Note: Zadig only installs the WinUSB kernel driver; drop rtlsdr.dll + libusb-1.0.dll")
+                print("  into the ApexBOS folder, or enter the folder path below.")
+            else:
+                print("  Enter the path to rtl_tcp / rtl_sdr / rsp_tcp, or the folder containing them.")
             sdr = config_loader.build_sdr_settings(None, env)
             while True:
                 p_in = input("[?] SDR tools path (Enter to skip): ").strip()
@@ -1460,7 +1480,7 @@ class PygameSetupWizard:
         self.device_index = int(ex_grab.get("device", 0)) if str(ex_grab.get("device", 0)).isdigit() else 0
         self.existing_sdr = config_loader._sdr_from_cfg(ex_grab)
         self.sdr_mode = str(ex_grab.get("sdr_mode") or self.existing_sdr.get("mode") or "auto").strip().lower()
-        if self.sdr_mode not in ("auto", "pipe", "tcp", "rtlsdr", "stdin"):
+        if self.sdr_mode not in ("auto", "pipe", "tcp", "rtlsdr", "rsptcp", "soapy", "stdin"):
             self.sdr_mode = "auto"
         self.fields["rtl_tcp_host"] = str(ex_grab.get("rtl_tcp_host") or self.existing_sdr.get("rtl_tcp_host") or "127.0.0.1")
         self.fields["rtl_tcp_port"] = str(ex_grab.get("rtl_tcp_port") or self.existing_sdr.get("rtl_tcp_port") or "1234")
@@ -1533,11 +1553,13 @@ class PygameSetupWizard:
             "dev_plus": (170, 140, 40, 36),
             "sdr_gain": (260, 140, 230, 36),
             "sdr_ppm": (530, 140, 260, 36),
-            "sdr_mode_auto": (50, 205, 140, 32),
-            "sdr_mode_pipe": (198, 205, 140, 32),
-            "sdr_mode_tcp": (346, 205, 140, 32),
-            "sdr_mode_rtlsdr": (494, 205, 140, 32),
-            "sdr_mode_stdin": (642, 205, 148, 32),
+            "sdr_mode_auto": (50, 205, 100, 32),
+            "sdr_mode_pipe": (156, 205, 100, 32),
+            "sdr_mode_tcp": (262, 205, 100, 32),
+            "sdr_mode_rtlsdr": (368, 205, 100, 32),
+            "sdr_mode_rsptcp": (474, 205, 100, 32),
+            "sdr_mode_soapy": (580, 205, 100, 32),
+            "sdr_mode_stdin": (686, 205, 104, 32),
             "rtl_tcp_host": (185, 246, 320, 32),
             "rtl_tcp_port": (565, 246, 120, 32),
             "sdr_path": (50, 372, 745, 36),
@@ -1545,7 +1567,7 @@ class PygameSetupWizard:
             "firewall_copy": (55, 272, 250, 34),
             "firewall_apply": (320, 272, 210, 34),
         }
-        if getattr(self, "step", None) == 6 and getattr(self, "sdr_mode", "auto") == "tcp":
+        if getattr(self, "step", None) == 6 and getattr(self, "sdr_mode", "auto") in ("tcp", "rsptcp"):
             layout["sdr_path"] = (50, 392, 745, 34)
         if getattr(self, "deployment_mode", None) == "engines_viewers" and getattr(self, "step", None) == 3 and getattr(self, "packet_source", None) == "banc":
             layout["banc_host"] = (50, 230, 480, 36)
@@ -2274,13 +2296,19 @@ class PygameSetupWizard:
             elif self._rect("sdr_mode_rtlsdr").collidepoint(pos):
                 self.sdr_mode = "rtlsdr"
                 self._set_active(None)
+            elif self._rect("sdr_mode_rsptcp").collidepoint(pos):
+                self.sdr_mode = "rsptcp"
+                self._set_active(None)
+            elif self._rect("sdr_mode_soapy").collidepoint(pos):
+                self.sdr_mode = "soapy"
+                self._set_active(None)
             elif self._rect("sdr_mode_stdin").collidepoint(pos):
                 self.sdr_mode = "stdin"
                 self._set_active(None)
-            elif getattr(self, "sdr_mode", "auto") == "tcp" and self._rect("rtl_tcp_host").collidepoint(pos):
+            elif getattr(self, "sdr_mode", "auto") in ("tcp", "rsptcp") and self._rect("rtl_tcp_host").collidepoint(pos):
                 self._set_active("rtl_tcp_host")
                 self.cursor_pos = self._calc_cursor_pos("rtl_tcp_host", pos[0])
-            elif getattr(self, "sdr_mode", "auto") == "tcp" and self._rect("rtl_tcp_port").collidepoint(pos):
+            elif getattr(self, "sdr_mode", "auto") in ("tcp", "rsptcp") and self._rect("rtl_tcp_port").collidepoint(pos):
                 self._set_active("rtl_tcp_port")
                 self.cursor_pos = self._calc_cursor_pos("rtl_tcp_port", pos[0])
             elif self._rect("sdr_path").collidepoint(pos):
@@ -3230,14 +3258,16 @@ class PygameSetupWizard:
         self._draw_field("sdr_ppm", placeholder="e.g. 0")
 
         # RTL-SDR Access Mode selector
-        l_mode = self.font_h2.render("RTL-SDR Access Mode (--sdr-mode):", True, COLOR_TEXT)
+        l_mode = self.font_h2.render("SDR Access Mode (--sdr-mode):", True, COLOR_TEXT)
         self.screen.blit(l_mode, (50, 182))
         modes = [
-            ("sdr_mode_auto", "auto", "Auto (Detect)"),
-            ("sdr_mode_pipe", "pipe", "Pipe (rtl_sdr)"),
-            ("sdr_mode_tcp", "tcp", "TCP (rtl_tcp)"),
-            ("sdr_mode_rtlsdr", "rtlsdr", "Direct (rtlsdr)"),
-            ("sdr_mode_stdin", "stdin", "Stdin (Raw I/Q)"),
+            ("sdr_mode_auto", "auto", "Auto"),
+            ("sdr_mode_pipe", "pipe", "Pipe"),
+            ("sdr_mode_tcp", "tcp", "RTL-TCP"),
+            ("sdr_mode_rtlsdr", "rtlsdr", "RTLSDR"),
+            ("sdr_mode_rsptcp", "rsptcp", "RSP-TCP"),
+            ("sdr_mode_soapy", "soapy", "SoapySDR"),
+            ("sdr_mode_stdin", "stdin", "Stdin"),
         ]
         cur_mode = getattr(self, "sdr_mode", "auto")
         for btn_key, mode_val, mode_label in modes:
@@ -3246,39 +3276,60 @@ class PygameSetupWizard:
             fg = (10, 10, 10) if is_sel else COLOR_TEXT
             self._draw_button(btn_key, mode_label, bg, fg)
 
-        if cur_mode == "tcp":
-            l_thost = self.font_body.render("RTL-TCP Host / IP:", True, COLOR_TEXT)
+        if cur_mode in ("tcp", "rsptcp"):
+            l_thost = self.font_body.render("RSP-TCP Host / IP:" if cur_mode == "rsptcp" else "RTL-TCP Host / IP:", True, COLOR_TEXT)
             self.screen.blit(l_thost, (50, 252))
             self._draw_field("rtl_tcp_host", placeholder="e.g. 127.0.0.1")
             l_tport = self.font_body.render("Port:", True, COLOR_TEXT)
             self.screen.blit(l_tport, (520, 252))
             self._draw_field("rtl_tcp_port", placeholder="1234")
-            card_y = 288
-            card_h = 76
-            path_lbl_y = 370
+            card_y = 286
+            card_h = 80
+            path_lbl_y = 372
         else:
-            card_y = 248
-            card_h = 92
+            card_y = 246
+            card_h = 96
             path_lbl_y = 348
 
         card = pygame.Rect(35, card_y, 790, card_h)
         pygame.draw.rect(self.screen, COLOR_CARD, card, border_radius=4)
         pygame.draw.rect(self.screen, COLOR_BORDER, card, 1, border_radius=4)
+        py_ok_lbl = (
+            f"OK ({env['auto_rtlsdr_dll_dir']})" if (env.get("pyrtlsdr_ok") and env.get("auto_rtlsdr_dll_dir"))
+            else ("OK" if env.get("pyrtlsdr_ok") else None)
+        )
+        rsp_soapy_parts = []
+        if env.get("rsp_tcp_bin"):
+            rsp_soapy_parts.append(f"rsp_tcp: {env['rsp_tcp_bin']}")
+        elif env.get("sdrplay_api_ok"):
+            rsp_soapy_parts.append("SDRplay API OK")
+        if env.get("soapysdr_ok"):
+            rsp_soapy_parts.append("SoapySDR OK")
+        elif env.get("soapysdr_lib_dir"):
+            rsp_soapy_parts.append("SoapySDR lib (Py ABI mismatch)")
+        rsp_soapy_val = " | ".join(rsp_soapy_parts) if rsp_soapy_parts else None
         rows = [
             ("rtl_sdr  (pipe mode)", env.get("rtl_sdr_on_path")),
             ("rtl_tcp  (TCP mode)", env.get("rtl_tcp_on_path")),
-            ("pyrtlsdr (direct mode)", "OK" if env.get("pyrtlsdr_ok") else None),
+            ("pyrtlsdr (direct)", py_ok_lbl),
+            ("SDRplay / SoapySDR", rsp_soapy_val),
         ]
-        row_y = card_y + 8
-        row_spacing = 22 if cur_mode == "tcp" else 26
+        row_y = card_y + 5
+        row_spacing = 18 if cur_mode in ("tcp", "rsptcp") else 22
         for name, found in rows:
-            n_lbl = self.font_body.render(name, True, COLOR_TEXT)
-            s_lbl = self.font_body.render(str(found)[:70] if found else "not found on PATH", True, COLOR_GREEN if found else COLOR_RED)
+            n_lbl = self.font_sm.render(name, True, COLOR_TEXT)
+            s_txt = str(found)[:72] if found else "not auto-detected"
+            s_lbl = self.font_sm.render(s_txt, True, COLOR_GREEN if found else COLOR_TEXT_DIM)
             self.screen.blit(n_lbl, (50, row_y))
-            self.screen.blit(s_lbl, (260, row_y))
+            self.screen.blit(s_lbl, (230, row_y))
             row_y += row_spacing
 
-        l2 = self.font_h2.render("Path to rtl_tcp / rtl_sdr executable, or folder with rtlsdr.dll + libusb DLLs:", True, COLOR_TEXT)
+        l2_txt = (
+            "Path to rtl_tcp / rtl_sdr / rsp_tcp, or rtlsdr.dll folder (Zadig installs WinUSB only):"
+            if sys.platform == "win32"
+            else "Path to rtl_tcp / rtl_sdr / rsp_tcp executable, or librtlsdr library folder:"
+        )
+        l2 = self.font_sm.render(l2_txt, True, COLOR_TEXT)
         self.screen.blit(l2, (50, path_lbl_y))
         self._draw_field("sdr_path", placeholder="(optional) path ...")
 
@@ -3288,17 +3339,17 @@ class PygameSetupWizard:
             self.screen.blit(e, (50, y))
             y += 20
         else:
-            for k, label in (("rtl_tcp_bin", "rtl_tcp"), ("rtl_sdr_bin", "rtl_sdr"), ("rtlsdr_dll_dir", "DLL folder")):
+            for k, label in (("rtl_tcp_bin", "rtl_tcp"), ("rtl_sdr_bin", "rtl_sdr"), ("rsp_tcp_bin", "rsp_tcp"), ("rtlsdr_dll_dir", "DLL folder")):
                 if self.sdr.get(k):
                     t = self.font_sm.render(f"{label}: {self.sdr[k]}"[:110], True, COLOR_GREEN)
                     self.screen.blit(t, (50, y))
                     y += 18
         gain_disp = self.fields.get("sdr_gain", "auto")
         ppm_disp = self.fields.get("sdr_ppm", "0")
-        if cur_mode == "tcp":
+        if cur_mode in ("tcp", "rsptcp"):
             thost_disp = self.fields.get("rtl_tcp_host", "127.0.0.1").strip() or "127.0.0.1"
             tport_disp = self.fields.get("rtl_tcp_port", "1234").strip() or "1234"
-            mode_desc = f"mode = tcp ({thost_disp}:{tport_disp})"
+            mode_desc = f"mode = {cur_mode} ({thost_disp}:{tport_disp})"
         else:
             mode_desc = f"mode = {cur_mode}"
         mode_lbl = self.font_h2.render(f"Grabber will use: {mode_desc}, dev = {self.device_index}, gain = {gain_disp}, ppm = {ppm_disp}", True, COLOR_ACCENT)

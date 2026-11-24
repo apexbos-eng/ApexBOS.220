@@ -370,19 +370,168 @@ def _canonical_secrets(cfg: Dict[str, Any]) -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 SDR_LIBRARY_NAMES = ("rtlsdr.dll", "librtlsdr.so", "librtlsdr.so.0", "librtlsdr.dylib", "librtlsdr.0.dylib")
+SOAPY_LIBRARY_NAMES = (
+    "SoapySDR.dll", "libSoapySDR.so", "libSoapySDR.so.0.8", "libSoapySDR.so.0.7",
+    "libSoapySDR.dylib", "libSoapySDR.0.8.dylib",
+)
+SDRPLAY_API_NAMES = (
+    "sdrplay_api.dll", "libsdrplay_api.so", "libsdrplay_api.so.3",
+    "libsdrplay_api.dylib", "libsdrplay_api.3.dylib",
+)
 
 
 def _exe_name(base: str) -> str:
     return base + (".exe" if os.name == "nt" else "")
 
 
+def _dedup_existing_dirs(candidates: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for raw in candidates:
+        if not raw:
+            continue
+        try:
+            p = os.path.abspath(os.path.expandvars(os.path.expanduser(str(raw))))
+        except Exception:
+            continue
+        key = p.lower() if os.name == "nt" else p
+        if key not in seen and os.path.isdir(p):
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def get_standard_sdr_search_dirs(base_dir: Optional[str] = None) -> Dict[str, List[str]]:
+    """
+    Returns cross-platform standard installation directories to probe for:
+      - 'rtlsdr'  : rtl_sdr / rtl_tcp binaries & rtlsdr.dll / librtlsdr shared libraries
+      - 'sdrplay' : SDRplay API (v3.15+) shared library & rsp_tcp binary
+      - 'soapy'   : SoapySDR shared library & modules (PothosSDR, Conda, Homebrew, Linux/RPi OS)
+    Backwards-compatible and safe across Windows, Linux, macOS (Intel/Apple Silicon), and Raspberry Pi OS.
+    """
+    app_dir = os.path.abspath(base_dir or os.path.dirname(os.path.abspath(__file__)))
+    soapy_root = os.environ.get("SOAPY_SDR_ROOT", "").strip()
+
+    rtlsdr_dirs: List[str] = [app_dir, os.path.join(app_dir, "x64"), os.path.join(app_dir, "bin")]
+    sdrplay_dirs: List[str] = [app_dir, os.path.join(app_dir, "x64"), os.path.join(app_dir, "bin")]
+    soapy_dirs: List[str] = [app_dir]
+
+    if soapy_root:
+        soapy_dirs.extend([os.path.join(soapy_root, "bin"), os.path.join(soapy_root, "lib"), soapy_root])
+        rtlsdr_dirs.extend([os.path.join(soapy_root, "bin"), soapy_root])
+
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        conda_bin = os.path.join(sys.prefix, "Library", "bin")
+
+        pothos_bins = [
+            os.path.join(pf, "PothosSDR", "bin"),
+            os.path.join(pf86, "PothosSDR", "bin"),
+        ]
+        soapy_dirs.extend(pothos_bins + [conda_bin])
+        rtlsdr_dirs.extend(
+            pothos_bins + [
+                conda_bin,
+                r"C:\rtl-sdr", r"C:\rtl-sdr\x64",
+                r"C:\rtlsdr", r"C:\rtlsdr\x64",
+                r"C:\Tools\rtl-sdr", r"C:\Tools\rtl-sdr\x64",
+                os.path.join(sys_root, "System32"),
+            ]
+        )
+        sdrplay_dirs.extend([
+            os.path.join(pf, "SDRplay", "API", "x64"),
+            os.path.join(pf, "SDRplay", "API", "x86"),
+            os.path.join(pf, "SDRplay", "rsp_tcp"),
+            os.path.join(pf86, "SDRplay", "rsp_tcp"),
+            os.path.join(pf, "SDRplay", "SDRconnect"),
+        ] + pothos_bins)
+    elif sys.platform == "darwin":
+        mac_bins = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+        mac_libs = [
+            "/opt/homebrew/lib", "/usr/local/lib", "/opt/local/lib",
+            os.path.join(sys.prefix, "lib"),
+        ]
+        rtlsdr_dirs.extend(mac_bins + mac_libs)
+        sdrplay_dirs.extend(mac_bins + mac_libs + ["/Library/SDRplayAPI/lib", "/Library/SDRplayAPI/bin"])
+        soapy_dirs.extend(mac_libs)
+    else:
+        # Linux & Raspberry Pi OS (x86_64, aarch64, armhf)
+        lin_bins = ["/usr/local/bin", "/usr/bin"]
+        lin_libs = [
+            "/usr/local/lib",
+            "/usr/lib",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/usr/lib/arm-linux-gnueabihf",
+            os.path.join(sys.prefix, "lib"),
+        ]
+        rtlsdr_dirs.extend(lin_bins + lin_libs)
+        sdrplay_dirs.extend(lin_bins + lin_libs)
+        soapy_dirs.extend(lin_libs)
+
+    return {
+        "rtlsdr": _dedup_existing_dirs(rtlsdr_dirs),
+        "sdrplay": _dedup_existing_dirs(sdrplay_dirs),
+        "soapy": _dedup_existing_dirs(soapy_dirs),
+    }
+
+
+def _find_first_file_in_dirs(dirs: List[str], names: Tuple[str, ...]) -> Optional[str]:
+    for d in dirs:
+        for n in names:
+            cand = os.path.join(d, n)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def apply_soapy_dll_dirs(base_dir: Optional[str] = None) -> Optional[str]:
+    """
+    On Windows (Python 3.8+) and Unix, registers standard SoapySDR library directories
+    (SOAPY_SDR_ROOT, PothosSDR\\bin, Conda Library\\bin, Homebrew, Linux/RPi lib dirs)
+    before `import SoapySDR` so native DLLs resolve without manual PATH editing.
+    Returns the directory containing the SoapySDR shared library if found, else None.
+    """
+    soapy_dirs = get_standard_sdr_search_dirs(base_dir).get("soapy", [])
+    lib_path = _find_first_file_in_dirs(soapy_dirs, SOAPY_LIBRARY_NAMES)
+    if lib_path:
+        lib_dir = os.path.dirname(lib_path)
+        apply_rtlsdr_dll_dir(lib_dir)
+        # If installed under <root>/bin (e.g. C:\Program Files\PothosSDR\bin), expose SOAPY_SDR_ROOT
+        if not os.environ.get("SOAPY_SDR_ROOT"):
+            parent = os.path.dirname(lib_dir)
+            if os.path.basename(lib_dir).lower() in ("bin", "lib") and os.path.isdir(os.path.join(parent, "lib", "SoapySDR")):
+                os.environ["SOAPY_SDR_ROOT"] = parent
+        return lib_dir
+    return None
+
+
+def auto_discover_rtlsdr_dll_dir(base_dir: Optional[str] = None) -> Optional[str]:
+    """Searches standard platform folders for rtlsdr.dll / librtlsdr and registers it if found."""
+    dirs = get_standard_sdr_search_dirs(base_dir).get("rtlsdr", [])
+    lib_path = _find_first_file_in_dirs(dirs, SDR_LIBRARY_NAMES)
+    if lib_path:
+        lib_dir = os.path.dirname(lib_path)
+        apply_rtlsdr_dll_dir(lib_dir)
+        return lib_dir
+    return None
+
+
 def inspect_sdr_path(path: Any) -> Dict[str, Any]:
     """
-    Interprets a user-supplied path: an rtl_tcp / rtl_sdr executable, an rtlsdr library file,
+    Interprets a user-supplied path: an rtl_tcp / rtl_sdr / rsp_tcp executable, an rtlsdr library file,
     or a folder containing any of them (also scans its 'x64' and 'bin' sub-folders).
-    Returns {"rtl_tcp_bin", "rtl_sdr_bin", "rtlsdr_dll_dir", "error"}.
+    Returns {"rtl_tcp_bin", "rtl_sdr_bin", "rsp_tcp_bin", "rtlsdr_dll_dir", "error"}.
     """
-    res: Dict[str, Any] = {"rtl_tcp_bin": None, "rtl_sdr_bin": None, "rtlsdr_dll_dir": None, "error": None}
+    res: Dict[str, Any] = {
+        "rtl_tcp_bin": None,
+        "rtl_sdr_bin": None,
+        "rsp_tcp_bin": None,
+        "rtlsdr_dll_dir": None,
+        "error": None,
+    }
     raw = str(path or "").strip().strip('"').strip("'")
     if not raw:
         res["error"] = "No path entered."
@@ -399,10 +548,12 @@ def inspect_sdr_path(path: Any) -> Dict[str, Any]:
             res["rtl_tcp_bin"] = p
         elif name.startswith("rtl_sdr"):
             res["rtl_sdr_bin"] = p
+        elif name.startswith("rsp_tcp"):
+            res["rsp_tcp_bin"] = p
         elif name.startswith(("rtlsdr", "librtlsdr")):
             res["rtlsdr_dll_dir"] = base_dir
         else:
-            res["error"] = f"'{os.path.basename(p)}' is not rtl_tcp, rtl_sdr or an rtlsdr library."
+            res["error"] = f"'{os.path.basename(p)}' is not rtl_tcp, rtl_sdr, rsp_tcp or an rtlsdr library."
             return res
         scan_dirs = [base_dir]
     else:
@@ -411,7 +562,7 @@ def inspect_sdr_path(path: Any) -> Dict[str, Any]:
     for d in scan_dirs:
         if not os.path.isdir(d):
             continue
-        for key, base in (("rtl_tcp_bin", "rtl_tcp"), ("rtl_sdr_bin", "rtl_sdr")):
+        for key, base in (("rtl_tcp_bin", "rtl_tcp"), ("rtl_sdr_bin", "rtl_sdr"), ("rsp_tcp_bin", "rsp_tcp")):
             if not res[key]:
                 cand = os.path.join(d, _exe_name(base))
                 if os.path.isfile(cand):
@@ -420,13 +571,13 @@ def inspect_sdr_path(path: Any) -> Dict[str, Any]:
             if any(os.path.isfile(os.path.join(d, lib)) for lib in SDR_LIBRARY_NAMES):
                 res["rtlsdr_dll_dir"] = d
 
-    if not (res["rtl_tcp_bin"] or res["rtl_sdr_bin"] or res["rtlsdr_dll_dir"]) and not res["error"]:
-        res["error"] = f"No rtl_tcp, rtl_sdr or rtlsdr library found in: {p}"
+    if not (res["rtl_tcp_bin"] or res["rtl_sdr_bin"] or res["rsp_tcp_bin"] or res["rtlsdr_dll_dir"]) and not res["error"]:
+        res["error"] = f"No rtl_tcp, rtl_sdr, rsp_tcp or rtlsdr library found in: {p}"
     return res
 
 
 def apply_rtlsdr_dll_dir(path: Optional[str]):
-    """Makes an rtlsdr / libusb library folder visible to this process (PATH + Windows DLL search)."""
+    """Makes an rtlsdr / libusb / SoapySDR library folder visible to this process (PATH + Windows DLL search)."""
     if not path or not os.path.isdir(path):
         return
     path = os.path.abspath(path)
@@ -443,15 +594,48 @@ def apply_rtlsdr_dll_dir(path: Optional[str]):
 _DLL_HANDLES: List[Any] = []
 
 
-def detect_sdr_environment(dll_dir: Optional[str] = None) -> Dict[str, Any]:
-    """Detects which SDR interfaces are available on this machine (PATH lookup + pyrtlsdr)."""
+def detect_sdr_environment(dll_dir: Optional[str] = None, base_dir: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Detects which SDR interfaces are available on this machine across Windows, Linux,
+    macOS, and Raspberry Pi OS (PATH lookup + standard install folders + pyrtlsdr +
+    SDRplay API/rsp_tcp + SoapySDR).
+    Preserves all legacy return keys for 100% backwards compatibility.
+    """
     apply_rtlsdr_dll_dir(dll_dir)
+    std_dirs = get_standard_sdr_search_dirs(base_dir)
+
+    # 1. RTL-SDR binaries & shared libraries (PATH first, then standard platform dirs)
+    rtl_sdr_bin = shutil.which(_exe_name("rtl_sdr")) or _find_first_file_in_dirs(std_dirs["rtlsdr"], (_exe_name("rtl_sdr"),))
+    rtl_tcp_bin = shutil.which(_exe_name("rtl_tcp")) or _find_first_file_in_dirs(std_dirs["rtlsdr"], (_exe_name("rtl_tcp"),))
+    auto_dll_dir = None
+    if not dll_dir:
+        lib_p = _find_first_file_in_dirs(std_dirs["rtlsdr"], SDR_LIBRARY_NAMES)
+        if lib_p:
+            auto_dll_dir = os.path.dirname(lib_p)
+            apply_rtlsdr_dll_dir(auto_dll_dir)
+
+    # 2. SDRplay API & rsp_tcp binary
+    rsp_tcp_bin = shutil.which(_exe_name("rsp_tcp")) or _find_first_file_in_dirs(std_dirs["sdrplay"], (_exe_name("rsp_tcp"),))
+    sdrplay_api_path = _find_first_file_in_dirs(std_dirs["sdrplay"], SDRPLAY_API_NAMES)
+    sdrplay_api_dir = os.path.dirname(sdrplay_api_path) if sdrplay_api_path else None
+
+    # 3. SoapySDR native library & Python bindings
+    soapy_lib_dir = apply_soapy_dll_dirs(base_dir)
+
     env: Dict[str, Any] = {
-        "rtl_sdr_on_path": shutil.which(_exe_name("rtl_sdr")),
-        "rtl_tcp_on_path": shutil.which(_exe_name("rtl_tcp")),
+        "rtl_sdr_on_path": rtl_sdr_bin,
+        "rtl_tcp_on_path": rtl_tcp_bin,
         "pyrtlsdr_ok": False,
         "pyrtlsdr_error": None,
+        "auto_rtlsdr_dll_dir": auto_dll_dir,
+        "rsp_tcp_bin": rsp_tcp_bin,
+        "sdrplay_api_ok": bool(sdrplay_api_dir),
+        "sdrplay_api_dir": sdrplay_api_dir,
+        "soapysdr_ok": False,
+        "soapysdr_lib_dir": soapy_lib_dir,
+        "soapysdr_error": None,
     }
+
     if importlib.util.find_spec("rtlsdr") is None:
         env["pyrtlsdr_error"] = "Python package 'pyrtlsdr' is not installed"
     else:
@@ -459,27 +643,65 @@ def detect_sdr_environment(dll_dir: Optional[str] = None) -> Dict[str, Any]:
             from rtlsdr import RtlSdr  # noqa: F401
             env["pyrtlsdr_ok"] = True
         except Exception as exc:
-            env["pyrtlsdr_error"] = f"rtlsdr library failed to load: {exc}"
+            if sys.platform == "win32":
+                env["pyrtlsdr_error"] = (
+                    f"rtlsdr library failed to load ({exc}); Zadig only installs WinUSB — "
+                    f"place rtlsdr.dll + libusb-1.0.dll in the ApexBOS folder or specify their folder"
+                )
+            else:
+                env["pyrtlsdr_error"] = f"rtlsdr library failed to load: {exc}"
+
+    if importlib.util.find_spec("SoapySDR") is None:
+        if soapy_lib_dir:
+            py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+            env["soapysdr_error"] = (
+                f"SoapySDR library found in {soapy_lib_dir}, but Python {py_ver} 'SoapySDR' bindings are missing "
+                f"(use matching Python/Conda-Forge or --rsp-tcp)"
+            )
+        else:
+            env["soapysdr_error"] = "Python 'SoapySDR' module is not installed"
+    else:
+        try:
+            import SoapySDR  # noqa: F401
+            env["soapysdr_ok"] = True
+        except Exception as exc:
+            env["soapysdr_error"] = f"SoapySDR failed to load: {exc}"
+
     return env
 
 
 def build_sdr_settings(user_path: Optional[str] = None, env: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Builds the Grabber SDR-interface settings from what the user specified (path to rtl_tcp/rtl_sdr
-    or a rtlsdr DLL folder) and what is auto-detected on PATH.
-    Returns {"mode", "rtl_sdr_bin", "rtl_tcp_bin", "rtlsdr_dll_dir", "error"}; only user-supplied
-    paths are stored (PATH-resolved tools are looked up at run time).
+    Builds the Grabber SDR-interface settings from what the user specified (path to rtl_tcp/rtl_sdr/rsp_tcp
+    or a rtlsdr DLL folder) and what is auto-detected on PATH / standard platform install folders.
+    Returns {"mode", "rtl_sdr_bin", "rtl_tcp_bin", "rsp_tcp_bin", "rtlsdr_dll_dir", "error"}; only
+    non-PATH / user-supplied paths are persisted when needed.
     """
-    sdr: Dict[str, Any] = {"mode": "auto", "rtl_sdr_bin": None, "rtl_tcp_bin": None, "rtlsdr_dll_dir": None, "error": None}
+    sdr: Dict[str, Any] = {
+        "mode": "auto",
+        "rtl_sdr_bin": None,
+        "rtl_tcp_bin": None,
+        "rsp_tcp_bin": None,
+        "rtlsdr_dll_dir": None,
+        "error": None,
+    }
     user: Dict[str, Any] = {}
     if user_path:
         user = inspect_sdr_path(user_path)
         sdr["error"] = user.get("error")
-        for k in ("rtl_sdr_bin", "rtl_tcp_bin", "rtlsdr_dll_dir"):
+        for k in ("rtl_sdr_bin", "rtl_tcp_bin", "rsp_tcp_bin", "rtlsdr_dll_dir"):
             sdr[k] = user.get(k)
     env = env if env is not None else detect_sdr_environment(sdr["rtlsdr_dll_dir"])
 
-    if user.get("rtl_tcp_bin"):
+    # Populate auto-discovered non-PATH paths when user did not supply an override
+    if not sdr["rtlsdr_dll_dir"] and env.get("auto_rtlsdr_dll_dir"):
+        sdr["rtlsdr_dll_dir"] = env["auto_rtlsdr_dll_dir"]
+    if not sdr["rsp_tcp_bin"] and env.get("rsp_tcp_bin"):
+        sdr["rsp_tcp_bin"] = env["rsp_tcp_bin"]
+
+    if user.get("rsp_tcp_bin"):
+        sdr["mode"] = "rsptcp"
+    elif user.get("rtl_tcp_bin"):
         sdr["mode"] = "tcp"
     elif user.get("rtlsdr_dll_dir"):
         sdr["mode"] = "rtlsdr"
@@ -491,6 +713,10 @@ def build_sdr_settings(user_path: Optional[str] = None, env: Optional[Dict[str, 
         sdr["mode"] = "tcp"
     elif env.get("pyrtlsdr_ok"):
         sdr["mode"] = "rtlsdr"
+    elif env.get("rsp_tcp_bin"):
+        sdr["mode"] = "rsptcp"
+    elif env.get("soapysdr_ok"):
+        sdr["mode"] = "soapy"
     return sdr
 
 
@@ -499,6 +725,9 @@ def _sdr_from_cfg(grabber_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "mode": grabber_cfg.get("sdr_mode", "auto") or "auto",
         "rtl_sdr_bin": grabber_cfg.get("rtl_sdr_bin"),
         "rtl_tcp_bin": grabber_cfg.get("rtl_tcp_bin"),
+        "rsp_tcp_bin": grabber_cfg.get("rsp_tcp_bin"),
+        "rsp_extended": bool(grabber_cfg.get("rsp_extended", False)),
+        "soapy_args": grabber_cfg.get("soapy_args"),
         "rtlsdr_dll_dir": grabber_cfg.get("rtlsdr_dll_dir"),
         "rtl_tcp_host": grabber_cfg.get("rtl_tcp_host", "127.0.0.1"),
         "rtl_tcp_port": int(grabber_cfg.get("rtl_tcp_port", 1234)),
@@ -680,6 +909,9 @@ def generate_unified_config(
             "sdr_mode": chosen_sdr_mode,
             "rtl_sdr_bin": sdr.get("rtl_sdr_bin"),
             "rtl_tcp_bin": sdr.get("rtl_tcp_bin"),
+            "rsp_tcp_bin": sdr.get("rsp_tcp_bin"),
+            "rsp_extended": bool(sdr.get("rsp_extended", False)),
+            "soapy_args": sdr.get("soapy_args"),
             "rtlsdr_dll_dir": sdr.get("rtlsdr_dll_dir"),
             "rtl_tcp_host": chosen_tcp_host,
             "rtl_tcp_port": chosen_tcp_port,
@@ -998,6 +1230,11 @@ def sync_legacy_configs(cfg: Dict[str, Any], target_dir: Optional[str] = None):
         "rtl_sdr_bin": grabber_cfg.get("rtl_sdr_bin", existing_grabber.get("rtl_sdr_bin", None)),
         "rtl_tcp": (sdr_mode == "tcp") if "sdr_mode" in grabber_cfg else existing_grabber.get("rtl_tcp", False),
         "rtl_tcp_bin": grabber_cfg.get("rtl_tcp_bin", existing_grabber.get("rtl_tcp_bin", None)),
+        "rsp_tcp": (sdr_mode == "rsptcp") if "sdr_mode" in grabber_cfg else existing_grabber.get("rsp_tcp", False),
+        "rsp_tcp_bin": grabber_cfg.get("rsp_tcp_bin", existing_grabber.get("rsp_tcp_bin", None)),
+        "rsp_extended": grabber_cfg.get("rsp_extended", existing_grabber.get("rsp_extended", False)),
+        "soapy": (sdr_mode == "soapy") if "sdr_mode" in grabber_cfg else existing_grabber.get("soapy", False),
+        "soapy_args": grabber_cfg.get("soapy_args", existing_grabber.get("soapy_args", None)),
         "rtlsdr": (sdr_mode == "rtlsdr") if "sdr_mode" in grabber_cfg else existing_grabber.get("rtlsdr", False),
         "rtlsdr_dll_dir": grabber_cfg.get("rtlsdr_dll_dir", existing_grabber.get("rtlsdr_dll_dir", None)),
         "sdr_mode": sdr_mode,

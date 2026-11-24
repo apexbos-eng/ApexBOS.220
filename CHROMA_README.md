@@ -169,7 +169,7 @@ python ApexBOSChroma.py --wideband
 ```bash
 python ApexBOSChroma.py --standalone
 ```
-Opens the RTL-SDR directly (supporting `pyrtlsdr`, `rtl_tcp`, or `rtl_sdr` pipe via Grabber's hardware drivers) at `2.304 MS/s` centered at `221.000 MHz`.
+Opens your configured SDR directly (supporting RTL-SDR via `pyrtlsdr` / `rtl_tcp` / `rtl_sdr` pipe, **SDRplay RSP1B/RSP1A/RSPdx/RSPduo** via `rsp_tcp` standard 8-bit or `-E` 16-bit `CS16`, and **SoapySDR** `CS16` devices via `config.json`'s `grabber.sdr_mode`) at `2.304 MS/s` centered at `221.000 MHz`. Both 8-bit (`u8`) and 16-bit signed (`s16`) IQ streams from Grabber or Standalone mode are decoded with calibrated dBFS scaling and ADC clipping detection.
 
 ### 4. Offline Mock PTC Mode (No Hardware Needed)
 ```bash

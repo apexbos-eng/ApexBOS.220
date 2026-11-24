@@ -633,6 +633,21 @@ class ProcessManager:
             tcp_host = str(grabber_cfg.get("rtl_tcp_host") or "127.0.0.1").strip()
             tcp_port = str(grabber_cfg.get("rtl_tcp_port") or 1234).strip()
             args.extend(["--host", tcp_host, "--rtl-port", tcp_port])
+        elif sdr_mode == "rsptcp":
+            if "--rsp-tcp" not in args:
+                args.append("--rsp-tcp")
+            tcp_host = str(grabber_cfg.get("rtl_tcp_host") or "127.0.0.1").strip()
+            tcp_port = str(grabber_cfg.get("rtl_tcp_port") or 1234).strip()
+            args.extend(["--host", tcp_host, "--rtl-port", tcp_port])
+            if grabber_cfg.get("rsp_extended"):
+                args.append("--rsp-16bit")
+            if grabber_cfg.get("rsp_tcp_bin"):
+                args.extend(["--rsp-tcp-bin", str(grabber_cfg["rsp_tcp_bin"])])
+        elif sdr_mode == "soapy":
+            if "--soapy" not in args:
+                args.append("--soapy")
+            if grabber_cfg.get("soapy_args"):
+                args.extend(["--soapy-args", str(grabber_cfg["soapy_args"])])
         else:
             if grabber_cfg.get("rtl_tcp_host"):
                 args.extend(["--host", str(grabber_cfg["rtl_tcp_host"])])
@@ -1141,6 +1156,21 @@ class ProcessManager:
                 tcp_host = str(grabber_cfg.get("rtl_tcp_host") or "127.0.0.1").strip()
                 tcp_port = str(grabber_cfg.get("rtl_tcp_port") or 1234).strip()
                 args.extend(["--host", tcp_host, "--rtl-port", tcp_port])
+            elif sdr_mode == "rsptcp":
+                if "--rsp-tcp" not in args:
+                    args.append("--rsp-tcp")
+                tcp_host = str(grabber_cfg.get("rtl_tcp_host") or "127.0.0.1").strip()
+                tcp_port = str(grabber_cfg.get("rtl_tcp_port") or 1234).strip()
+                args.extend(["--host", tcp_host, "--rtl-port", tcp_port])
+                if grabber_cfg.get("rsp_extended"):
+                    args.append("--rsp-16bit")
+                if grabber_cfg.get("rsp_tcp_bin"):
+                    args.extend(["--rsp-tcp-bin", str(grabber_cfg["rsp_tcp_bin"])])
+            elif sdr_mode == "soapy":
+                if "--soapy" not in args:
+                    args.append("--soapy")
+                if grabber_cfg.get("soapy_args"):
+                    args.extend(["--soapy-args", str(grabber_cfg["soapy_args"])])
             else:
                 if grabber_cfg.get("rtl_tcp_host"):
                     args.extend(["--host", str(grabber_cfg["rtl_tcp_host"])])
