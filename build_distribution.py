@@ -42,6 +42,8 @@ from version import VERSION
 
 CORE_SCRIPTS = [
     "ApexBOSGrabber.py",
+    "ApexBOSScanner.py",
+    "ApexBOSChroma.py",
     "ApexBOSFlux.py",
     "dispatcher_engine.py",
     "View_ApexBOS.220.py",
@@ -57,6 +59,7 @@ CORE_SCRIPTS = [
     "emp_decoder.py",
     "emp_phy.py",
     "itcvl_converter.py",
+    "atcs_converter.py",
     "version.py",
     "banc_coverage_modal.py",
     "config_loader.py",
@@ -86,6 +89,8 @@ DATA_FILES = [
     "ptc_status_parser.json",
     "README.md",
     "GRABBER_README.md",
+    "SCANNER_README.md",
+    "CHROMA_README.md",
     "BANC_README.md",
     "FLUX_README.md",
     "SPY_README.md",
@@ -132,6 +137,10 @@ FORBIDDEN_SECRET_STRINGS = (
 EXECUTABLE_SCRIPTS = {"setup.sh", "setup.command", "update.sh", "uninstall.sh", "start_banc.sh"}
 
 ALLOWED_NEW_DIST_FILES = {
+    "ApexBOSScanner.py",
+    "ApexBOSChroma.py",
+    "SCANNER_README.md",
+    "CHROMA_README.md",
     "install_utils.py",
     "update.py",
     "uninstall.py",
@@ -143,6 +152,7 @@ ALLOWED_NEW_DIST_FILES = {
     "enable_firewall.bat",
     "enable_firewall.ps1",
     "PRIVACY.md",
+    "atcs_converter.py",
 }
 
 GENERATED_DIST_FILES = {
@@ -216,8 +226,8 @@ def collect_package_files() -> List[str]:
         if base in EXCLUDED_EXACT_FILES or norm in EXCLUDED_EXACT_FILES:
             continue
 
-        # 2. Exclude ITCVL files and files inside frags/
-        if norm.endswith(".itcvl") or norm.startswith("frags/"):
+        # 2. Exclude ITCVL / ATCS .lay files and files inside frags/
+        if norm.endswith(".itcvl") or norm.endswith(".lay") or norm.startswith("frags/"):
             continue
 
         # 3. Exclude test files, temp files, pycache, and databases

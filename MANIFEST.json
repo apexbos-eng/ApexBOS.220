@@ -1,6 +1,6 @@
 {
-  "version": "v26.1123.05",
-  "generated_at": "2026-11-23T23:51:25.341774Z",
+  "version": "v26.1123.06",
+  "generated_at": "2026-11-24T06:13:19.952053Z",
   "files": {
     "ApexBOS.220.py": "faae9c3f7e5fdcd996f28730db36715efdcd60cdeb6f47fb7e370e28f7f3b00c",
     "ApexBOSBanc.py": "0cf3265d47588f64ccaa0e5b0c0b6bfd32f5cda90e08417a333854d5e6bc2968",
@@ -65,7 +65,7 @@
     "update.bat": "b58fbd50eafac3a81913e0b1a0f115bee2cda168461be5c7e1b145a22a03cf84",
     "update.py": "9540e67e165ec79136f718d5d1a2edd5deefa4d958f0ac2e53042d1ab29fd9c0",
     "update.sh": "e1ff22c79daed48d5204487012a19f7b1b34506bb2c7aa9312b39bcad014a76f",
-    "version.py": "89b703e4ea05761f1cf62493e1da726f34735b851c6b84ee1cfd055d00fabf1a",
-    "config.defaults.json": "4420a44527f6b33e0f75b0560315f2d2161fcde2255e6c3c2dc993f0f62f4c7c"
+    "version.py": "2ce3dbe61f63a868ac5b6f6f5d1ec065cd4a4aed48530acae7a9e95768d64b80",
+    "config.defaults.json": "084df9a9b9685c4717bdbbe6aa6a8a1bed8da5f72b1c9c957e088fbbdb0000f1"
   }
 }
