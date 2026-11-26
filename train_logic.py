@@ -22,10 +22,266 @@ Shared train tracking and inference logic used by DispatcherEngine and ApexBOSCr
     train resumes motion and reactivates. Otherwise deletes train when timeout expires.
 """
 
+import re
 from typing import Dict, List, Optional, Tuple, Any, Set
 import math
 import time
+from datetime import datetime
 from version import VERSION
+
+# Train source labels displayed in Engine, Viewer, Creator, and Train Scroller
+TRAIN_SOURCE_PTC = "PTC Inferred"
+TRAIN_SOURCE_EMP = "EMP"
+TRAIN_SOURCE_HOT_EOT = "HOT/EOT"
+TRAIN_SOURCE_DPU = "DPU"
+TRAIN_SOURCE_HOT_EOT_DPU = "HOT/EOT/DPU"
+
+# RF train lifecycle & correlation parameters
+RF_TRAIN_TIMEOUT_SEC = 420.0        # 7 minutes of inactivity -> delete EOT/HOT or DPU train
+RF_BOARD_MIN_PACKETS = 2            # Minimum confirmed valid packets before promoting HOT/EOT/DPU onto Train Board
+RF_CORRELATION_WINDOW_SEC = 12.0    # Max lag for DPU brake/pressure change -> EOT response
+RF_MOTION_CORR_WINDOW_SEC = 15.0    # Max lag for DPU traction/stop change -> EOT motion change
+RF_RSSI_WINDOW_SIZE = 10            # Sliding average RSSI sample window
+RF_RSSI_MAX_AGE_SEC = 180.0         # Drop RSSI samples older than 3 min from trend window
+RF_RSSI_TREND_THRESH_DB = 1.5       # +/- dB shift between older & newer half -> Towards / Away
+
+
+def compute_train_fade_factor(age_sec: float, max_age_sec: float = RF_TRAIN_TIMEOUT_SEC) -> float:
+    """
+    Returns a normalized fade factor in [0.0, 1.0]:
+      0.0 = brand-new packet (full brightness)
+      1.0 = reached inactivity expiration (fully faded)
+    """
+    if max_age_sec <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, float(age_sec) / float(max_age_sec)))
+
+
+def fade_rgb_by_age(
+    base_rgb: Tuple[int, int, int],
+    age_sec: float,
+    max_age_sec: float = RF_TRAIN_TIMEOUT_SEC,
+    target_rgb: Tuple[int, int, int] = (78, 84, 96),
+) -> Tuple[int, int, int]:
+    """Smoothly fades a base RGB color toward muted slate based on time since last packet."""
+    f = compute_train_fade_factor(age_sec, max_age_sec)
+    # Mild curve keeps freshly-active trains bright and smoothly dims them across minutes 1..7
+    w = f ** 0.85
+    return (
+        int(round(base_rgb[0] + (target_rgb[0] - base_rgb[0]) * w)),
+        int(round(base_rgb[1] + (target_rgb[1] - base_rgb[1]) * w)),
+        int(round(base_rgb[2] + (target_rgb[2] - base_rgb[2]) * w)),
+    )
+
+
+def _coerce_packet_ts(raw_ts: Any) -> float:
+    if isinstance(raw_ts, (int, float)) and float(raw_ts) > 0.0:
+        return float(raw_ts)
+    if isinstance(raw_ts, str) and raw_ts.strip():
+        try:
+            return float(raw_ts)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(raw_ts.strip().replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+    return time.time()
+
+
+def _format_dpu_short_power(power: Optional[str]) -> str:
+    p = str(power or "").strip().upper()
+    if not p:
+        return "---"
+    if p == "IDLE":
+        return "Idle"
+    if p == "IDLMD":
+        return "IdlMd"
+    if p == "SETOT":
+        return "SetOut"
+    if p == "BSTUP":
+        return "DBSet"
+    if p.startswith("B") and len(p) >= 2:
+        try:
+            return f"DB{float(p[1:]):.1f}"
+        except ValueError:
+            return p[:6]
+    return p[:6]
+
+
+TRAIN_BOARD_SORTABLE_COLS = ("source", "name", "spd_pwr", "dir", "sig", "trd", "recent")
+TRAIN_BOARD_DEFAULT_DESC: Dict[str, bool] = {
+    "source": False,
+    "name": False,
+    "spd_pwr": True,
+    "dir": False,
+    "sig": True,
+    "trd": True,
+    "recent": True,
+}
+
+
+def cycle_train_board_sort(
+    cur_col: Optional[str],
+    cur_desc: bool,
+    clicked_col: str,
+) -> Tuple[Optional[str], bool]:
+    """
+    Cycles Train Board sort state on click:
+      - Inactive column -> activate in natural direction (desc for SIG/TRD/SPD/Recent, asc for Source/Name/DIR)
+      - Same column (1st direction) -> reverse direction
+      - Same column (2nd direction) -> reset to None (pinned stable board_order)
+    """
+    col = str(clicked_col or "").strip().lower()
+    if col not in TRAIN_BOARD_SORTABLE_COLS:
+        return cur_col, cur_desc
+    default_desc = TRAIN_BOARD_DEFAULT_DESC.get(col, False)
+    if cur_col != col:
+        return col, default_desc
+    if bool(cur_desc) == default_desc:
+        return col, (not default_desc)
+    return None, False
+
+
+def _natural_sort_key(text: str) -> Tuple[Tuple[int, Any], ...]:
+    parts = re.split(r"(\d+)", str(text or ""))
+    out: List[Tuple[int, Any]] = []
+    for p in parts:
+        if not p:
+            continue
+        if p.isdigit():
+            out.append((0, int(p)))
+        else:
+            out.append((1, p.lower()))
+    return tuple(out)
+
+
+def _train_source_sort_badge(trn: dict) -> str:
+    src = str(trn.get("train_source") or TRAIN_SOURCE_PTC)
+    if src in (TRAIN_SOURCE_HOT_EOT_DPU, TRAIN_SOURCE_HOT_EOT, TRAIN_SOURCE_DPU, TRAIN_SOURCE_EMP):
+        return src
+    st = str(trn.get("status") or "Confirmed")
+    return "PTC Cnf" if st == "Confirmed" else "PTC Inf"
+
+
+def _train_spd_pwr_sort_value(trn: dict) -> Optional[Tuple[int, float]]:
+    spd_mph = trn.get("speed_mph")
+    if isinstance(spd_mph, (int, float)):
+        return (1, float(spd_mph))
+    raw = str(trn.get("speed_str") or trn.get("dpu_power") or "").strip().upper()
+    if not raw or raw in ("---", "UNK.", "UNK", "UNKNOWN", "N/A"):
+        return None
+    m_mph = re.match(r"^(-?\d+(?:\.\d+)?)\s*MPH$", raw)
+    if m_mph:
+        return (1, float(m_mph.group(1)))
+    if raw in ("IDLE", "IDLMD", "SETOT", "SETOUT"):
+        return (0, 0.0)
+    if raw in ("BSTUP", "DBSET"):
+        return (0, -0.001)
+    if raw.startswith("N") and raw[1:].isdigit():
+        return (0, float(int(raw[1:])))
+    if raw.startswith("DB") and len(raw) > 2:
+        try:
+            return (0, -max(0.01, float(raw[2:])))
+        except ValueError:
+            return None
+    if raw.startswith("B") and len(raw) > 1:
+        try:
+            return (0, -max(0.01, float(raw[1:])))
+        except ValueError:
+            return None
+    try:
+        return (1, float(raw))
+    except ValueError:
+        return None
+
+
+def sort_train_board_rows(
+    trains: List[dict],
+    sort_col: Optional[str] = None,
+    sort_desc: bool = False,
+) -> List[dict]:
+    """
+    Sorts Train Board rows by the selected column (`source`, `name`, `spd_pwr`, `dir`, `sig`, `trd`, `recent`)
+    or returns rows in pinned stable `board_order` when `sort_col` is None.
+    Rows with missing/unknown values for numeric/directional columns always stay at the bottom.
+    """
+    base = sorted(
+        list(trains or []),
+        key=lambda r: (int(r.get("board_order", 0)), float(r.get("created_ts", 0.0))),
+    )
+    if not sort_col or sort_col not in TRAIN_BOARD_SORTABLE_COLS:
+        return base
+
+    if sort_col == "recent":
+        return sorted(
+            base,
+            key=lambda r: float(r.get("last_packet_ts") or r.get("updated_ts") or r.get("created_ts") or 0.0),
+            reverse=bool(sort_desc),
+        )
+
+    if sort_col == "source":
+        return sorted(
+            base,
+            key=lambda r: _train_source_sort_badge(r).lower(),
+            reverse=bool(sort_desc),
+        )
+
+    if sort_col == "name":
+        def _disp_name(r: dict) -> str:
+            dn = str(r.get("assigned_name") or r.get("train_name") or "TRN")
+            if r.get("assigned_id"):
+                dn = f"{dn} (#{r['assigned_id']})"
+            return dn
+        return sorted(
+            base,
+            key=lambda r: _natural_sort_key(_disp_name(r)),
+            reverse=bool(sort_desc),
+        )
+
+    present: List[Tuple[Any, dict]] = []
+    missing: List[dict] = []
+
+    if sort_col == "spd_pwr":
+        for r in base:
+            v = _train_spd_pwr_sort_value(r)
+            if v is None:
+                missing.append(r)
+            else:
+                present.append((v, r))
+    elif sort_col == "dir":
+        for r in base:
+            d = str(r.get("direction") or "").strip().upper()
+            if not d or d in ("---", "NONE", "UNK", "UNKNOWN"):
+                missing.append(r)
+            else:
+                present.append((d, r))
+    elif sort_col == "sig":
+        for r in base:
+            sig = r.get("rssi_avg")
+            if sig is None:
+                sig = r.get("rssi_dbfs")
+            if sig is None:
+                missing.append(r)
+            else:
+                try:
+                    present.append((float(sig), r))
+                except (ValueError, TypeError):
+                    missing.append(r)
+    elif sort_col == "trd":
+        trend_rank = {"TOWARDS": 3, "STEADY": 2, "AWAY": 1}
+        for r in base:
+            tc = str(r.get("rssi_trend") or "NONE").strip().upper()
+            rk = trend_rank.get(tc)
+            if rk is None:
+                missing.append(r)
+            else:
+                delta = float(r.get("rssi_delta_db") or 0.0)
+                present.append(((rk, delta), r))
+    else:
+        return base
+
+    present.sort(key=lambda item: item[0], reverse=bool(sort_desc))
+    return [r for _, r in present] + missing
 
 OPPOSITE_DIR: Dict[str, str] = {
     "E": "W", "W": "E",
@@ -114,16 +370,28 @@ class TrainTracker:
     Maintains the list of active trains (Potential, Inferred, Confirmed)
     and user metadata assignments. Backward compatible with TrainScroller.
     """
-    def __init__(self, x: int = 86, y: int = 25, max_len: int = 10, width: int = 430, height: int = 150):
+    def __init__(self, x: int = 86, y: int = 25, max_len: int = 10, width: int = 680, height: int = 165, rf_min_packets: int = RF_BOARD_MIN_PACKETS):
         self.id = "SYS_TRAIN_SCROLLER"
         self.elem_type = "train_scroller"
         self.x = x
         self.y = y
         self.max_len = max_len
-        self.width = int(width) if width and int(width) > 0 else 430
-        self.height = int(height) if height and int(height) > 0 else 150
+        self.width = int(width) if width and int(width) > 0 else 680
+        self.height = int(height) if height and int(height) > 0 else 165
+        self.rf_min_packets: int = max(1, int(rf_min_packets))
         self.trains: Dict[str, dict] = {}
+        self._rf_pending: Dict[str, dict] = {}
         self._next_train_num: int = 101
+        self._next_board_order: int = 1
+        self._rssi_history: Dict[str, List[Tuple[float, float]]] = {}
+        self._rf_events: Dict[str, List[Tuple[float, str, Any]]] = {}
+        self._pair_corr_scores: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        self._consumed_corr_events: Set[Tuple[str, float, str, str, float, str]] = set()
+
+    def _alloc_board_order(self) -> int:
+        order = self._next_board_order
+        self._next_board_order += 1
+        return order
 
     @property
     def total_packets(self) -> int:
@@ -161,6 +429,9 @@ class TrainTracker:
         rec = {
             "train_key": train_key,
             "train_name": train_key,
+            "board_order": self._alloc_board_order(),
+            "train_source": TRAIN_SOURCE_PTC,
+            "is_rf_train": False,
             "assigned_id": None,
             "assigned_name": None,
             "status": "Potential",
@@ -182,7 +453,17 @@ class TrainTracker:
             "timeout_start_ts": None,
             "is_receiving_packets": False,
             "packets_received": 0,
-            "last_packet_ts": 0.0,
+            "last_packet_ts": timestamp,
+            "rssi_dbfs": None,
+            "rssi_avg": None,
+            "rssi_delta_db": 0.0,
+            "rssi_trend": "NONE",
+            "rssi_trend_label": "---",
+            "psi": None,
+            "motion": None,
+            "marker_light": None,
+            "light_str": "---",
+            "rf_protocols": [],
             "created_ts": timestamp,
             "updated_ts": timestamp,
             "time_str": time.strftime("%H:%M:%S", time.localtime(timestamp)),
@@ -238,28 +519,752 @@ class TrainTracker:
                 pass
         return matched
 
-    def check_packet(self, parsed_pkt: dict):
-        """
-        Rule 10: If a packet arrives with _node_id_ matching the assigned train ID,
-        display an indication that the train is receiving packets.
-        If '_speed_' is in the packet, update its estimated speed.
-        """
-        node_id = parsed_pkt.get("_node_id_")
-        if node_id is None:
+    def _update_rssi_stats(self, train_key: str, rec: dict, raw_rssi: Any, ts: float):
+        """Updates sliding-average RSSI and Towards/Away/Steady movement indicator."""
+        if raw_rssi is None:
             return
-        node_str = str(node_id).strip()
-        for trn in self.trains.values():
-            if trn.get("assigned_id") is not None and str(trn["assigned_id"]).strip() == node_str:
-                trn["is_receiving_packets"] = True
-                trn["packets_received"] = trn.get("packets_received", 0) + 1
-                trn["last_packet_ts"] = parsed_pkt.get("timestamp", time.time())
-                if "_speed_" in parsed_pkt:
+        try:
+            rssi_val = float(raw_rssi)
+        except (ValueError, TypeError):
+            return
+        if not math.isfinite(rssi_val) or rssi_val <= -140.0 or rssi_val >= 20.0:
+            return
+
+        hist = self._rssi_history.setdefault(train_key, [])
+        hist.append((ts, rssi_val))
+        cutoff = ts - RF_RSSI_MAX_AGE_SEC
+        hist = [(t, r) for (t, r) in hist if t >= cutoff][-RF_RSSI_WINDOW_SIZE:]
+        self._rssi_history[train_key] = hist
+
+        vals = [r for _, r in hist]
+        avg_window = vals[-6:]
+        avg_rssi = sum(avg_window) / float(len(avg_window))
+        delta = 0.0
+        trend = "NONE"
+        trend_label = "---"
+
+        if len(hist) >= 4:
+            # Compare the most recent sliding sub-window (up to 3 samples) against the
+            # immediately preceding sub-window so Towards -> Away flips cleanly right after peak passage.
+            half = min(3, len(hist) // 2)
+            tail_vals = vals[-(2 * half):]
+            old_avg = sum(tail_vals[:half]) / float(half)
+            new_avg = sum(tail_vals[half:]) / float(half)
+            delta = new_avg - old_avg
+            if delta >= RF_RSSI_TREND_THRESH_DB:
+                trend = "TOWARDS"
+                trend_label = "▲TWD"
+            elif delta <= -RF_RSSI_TREND_THRESH_DB:
+                trend = "AWAY"
+                trend_label = "▼AWY"
+            else:
+                trend = "STEADY"
+                trend_label = "─STD"
+        elif len(hist) == 3:
+            old_avg = vals[0]
+            new_avg = 0.5 * (vals[1] + vals[2])
+            delta = new_avg - old_avg
+            if delta >= RF_RSSI_TREND_THRESH_DB:
+                trend = "TOWARDS"
+                trend_label = "▲TWD"
+            elif delta <= -RF_RSSI_TREND_THRESH_DB:
+                trend = "AWAY"
+                trend_label = "▼AWY"
+            else:
+                trend = "STEADY"
+                trend_label = "─STD"
+        elif len(hist) == 2 and abs(hist[1][0] - hist[0][0]) >= 1.0:
+            delta = hist[1][1] - hist[0][1]
+            if delta >= RF_RSSI_TREND_THRESH_DB:
+                trend = "TOWARDS"
+                trend_label = "▲TWD"
+            elif delta <= -RF_RSSI_TREND_THRESH_DB:
+                trend = "AWAY"
+                trend_label = "▼AWY"
+            else:
+                trend = "STEADY"
+                trend_label = "─STD"
+
+        rec["rssi_dbfs"] = round(rssi_val, 1)
+        rec["rssi_avg"] = round(avg_rssi, 1)
+        rec["rssi_delta_db"] = round(delta, 1)
+        rec["rssi_trend"] = trend
+        rec["rssi_trend_label"] = trend_label
+
+    def _record_rf_event(self, train_key: str, ts: float, event_kind: str, val: Any = None):
+        ev_list = self._rf_events.setdefault(train_key, [])
+        ev_list.append((ts, event_kind, val))
+        # Retain recent 45s window of state-change events for correlation
+        cutoff = ts - 45.0
+        self._rf_events[train_key] = [e for e in ev_list if e[0] >= cutoff][-24:]
+
+    def _apply_rf_telemetry_to_record(self, train_key: str, rec: dict, parsed_pkt: dict, proto: str, ts: float):
+        """Enriches an existing train record (RF or PTC-linked) with HOT/EOT/DPU telemetry."""
+        prots = list(rec.get("rf_protocols") or [])
+        if proto and proto not in prots:
+            prots.append(proto)
+        rec["rf_protocols"] = prots
+
+        rssi_raw = parsed_pkt.get("rssi") if parsed_pkt.get("rssi") is not None else parsed_pkt.get("rssi_dbfs")
+        self._update_rssi_stats(train_key, rec, rssi_raw, ts)
+
+        rec["is_receiving_packets"] = True
+        rec["packets_received"] = int(rec.get("packets_received", 0)) + 1
+        rec["last_packet_ts"] = ts
+        rec["updated_ts"] = ts
+        rec["time_str"] = time.strftime("%H:%M:%S", time.localtime(ts))
+        rec["is_dimmed"] = False
+
+        if proto in ("eot", "hot"):
+            uid = parsed_pkt.get("unit_id")
+            if uid is None:
+                uid = parsed_pkt.get("_node_id_")
+            if uid is not None:
+                try:
+                    rec["eot_unit_id"] = int(uid)
+                except (ValueError, TypeError):
+                    pass
+            if proto == "hot":
+                rec["hot_seen"] = True
+                if parsed_pkt.get("emergency"):
+                    rec["hot_cmd"] = "EMERG"
+                elif parsed_pkt.get("armed"):
+                    rec["hot_cmd"] = "ARM"
+                else:
+                    rec["hot_cmd"] = "STAT"
+                if parsed_pkt.get("emergency"):
+                    rec["emergency"] = True
+            else:
+                rec["eot_seen"] = True
+                if parsed_pkt.get("pressure_psi") is not None:
                     try:
-                        s = float(parsed_pkt["_speed_"])
-                        trn["speed_mph"] = round(s, 1)
-                        trn["speed_str"] = f"{s:.1f} MPH"
+                        rec["psi"] = int(parsed_pkt["pressure_psi"])
+                        rec["_eot_psi_ts"] = ts
                     except (ValueError, TypeError):
                         pass
+                if parsed_pkt.get("motion") is not None:
+                    mov = bool(parsed_pkt["motion"])
+                    rec["motion"] = "MOV" if mov else "STOP"
+                    rec["_eot_motion_ts"] = ts
+                if parsed_pkt.get("marker_light") is not None:
+                    ml = bool(parsed_pkt["marker_light"])
+                    rec["marker_light"] = ml
+                    rec["light_str"] = "ON" if ml else "OFF"
+                if parsed_pkt.get("battery_pct") is not None:
+                    rec["battery_pct"] = int(parsed_pkt["battery_pct"])
+                if parsed_pkt.get("armed") is not None:
+                    rec["armed"] = bool(parsed_pkt["armed"])
+                if parsed_pkt.get("emergency") is not None:
+                    rec["emergency"] = bool(parsed_pkt["emergency"])
+
+        elif proto == "dpu":
+            addr = parsed_pkt.get("ADDR") if parsed_pkt.get("ADDR") is not None else parsed_pkt.get("loco_id")
+            trid = parsed_pkt.get("TRID")
+            tp = str(parsed_pkt.get("TP") or "").strip().upper()
+            power = parsed_pkt.get("Power") or parsed_pkt.get("throttle")
+            rev = parsed_pkt.get("REV")
+            nrm = parsed_pkt.get("NRM")
+            mtr = parsed_pkt.get("MTR")
+            prk = parsed_pkt.get("PRK")
+            alarms = parsed_pkt.get("AL")
+
+            if trid is not None:
+                try:
+                    t_i = int(trid)
+                    if t_i > 0 or rec.get("dpu_trid") is None:
+                        rec["dpu_trid"] = t_i
+                except (ValueError, TypeError):
+                    pass
+            if addr is not None:
+                try:
+                    a_i = int(addr)
+                    addrs = list(rec.get("dpu_addrs") or [])
+                    if a_i not in addrs:
+                        addrs.append(a_i)
+                    rec["dpu_addrs"] = addrs
+                except (ValueError, TypeError):
+                    pass
+            if nrm is not None:
+                try:
+                    rec["dpu_nrm"] = int(nrm)
+                except (ValueError, TypeError):
+                    pass
+            if power:
+                rec["dpu_power"] = str(power).strip().upper()
+                if rec.get("is_rf_train"):
+                    rec["speed_str"] = _format_dpu_short_power(rec["dpu_power"])
+            if rev:
+                rec["dpu_rev"] = str(rev).strip().upper()
+                if rec.get("is_rf_train"):
+                    rec["direction"] = rec["dpu_rev"]
+            if isinstance(alarms, list):
+                rec["dpu_alarms"] = [str(a) for a in alarms]
+            if tp == "ST" and parsed_pkt.get("BP") is not None:
+                try:
+                    # Prefer fresher EOT PSI if received within the last 15s, else update from DPU ST BP
+                    if (ts - float(rec.get("_eot_psi_ts") or 0.0)) > 15.0 or rec.get("psi") is None:
+                        rec["psi"] = int(parsed_pkt["BP"])
+                except (ValueError, TypeError):
+                    pass
+            # Only infer motion from DPU if EOT has not reported motion recently
+            if (ts - float(rec.get("_eot_motion_ts") or 0.0)) > 30.0 or rec.get("motion") is None:
+                pwr_u = str(power or "").upper()
+                if mtr == 1 or (pwr_u.startswith("N") and pwr_u[1:].isdigit()):
+                    rec["motion"] = "MOV"
+                elif prk == 1 or pwr_u == "SETOT":
+                    rec["motion"] = "STOP"
+
+        # Refresh human-readable RF summary info column
+        if rec.get("is_rf_train"):
+            info_parts: List[str] = []
+            if rec.get("eot_unit_id") is not None:
+                if rec.get("hot_seen") and rec.get("hot_cmd"):
+                    info_parts.append(f"HOT:{rec['hot_cmd']}")
+                elif rec.get("armed"):
+                    info_parts.append("Arm")
+                if rec.get("emergency"):
+                    info_parts.append("EMERG")
+            if rec.get("dpu_trid") or rec.get("dpu_addrs"):
+                if rec.get("dpu_nrm"):
+                    info_parts.append(f"{rec['dpu_nrm']}rem")
+                if rec.get("dpu_alarms"):
+                    info_parts.append(f"AL:{','.join(rec['dpu_alarms'])}")
+            if rec.get("merged_confidence"):
+                info_parts.append("Linked")
+            rec["last_location"] = " ".join(info_parts) if info_parts else (rec.get("train_source") or "RF")
+
+    def _merge_eot_and_dpu_trains(self, eot_key: str, dpu_key: str, score: float, now: float) -> Optional[str]:
+        """Merges a correlated standalone HOT/EOT train with a standalone DPU consist into one HOT/EOT/DPU entry."""
+        eot_rec = self.trains.get(eot_key)
+        dpu_rec = self.trains.get(dpu_key)
+        if not eot_rec or not dpu_rec:
+            return None
+
+        # Keep EOT key, EOT ID, and exact board_order row position; mark source as HOT/EOT/DPU
+        merged = dict(eot_rec)
+        merged["train_source"] = TRAIN_SOURCE_HOT_EOT_DPU
+        merged["is_rf_train"] = True
+        merged["merged_confidence"] = round(float(score), 1)
+        merged["merged_ts"] = now
+
+        if not merged.get("assigned_name") and dpu_rec.get("assigned_name"):
+            merged["assigned_name"] = dpu_rec["assigned_name"]
+        if not merged.get("assigned_id") and dpu_rec.get("assigned_id"):
+            merged["assigned_id"] = dpu_rec["assigned_id"]
+
+        eot_uid = merged.get("eot_unit_id")
+        dpu_trid = dpu_rec.get("dpu_trid")
+        dpu_addrs = list(dpu_rec.get("dpu_addrs") or [])
+        # Always use the reliable 5-digit EOT ID as the train name (TRID can be 0 / unreliable)
+        if eot_uid is not None:
+            merged["train_name"] = f"EOT #{int(eot_uid):05d}"
+
+        merged["dpu_trid"] = dpu_trid if (dpu_trid and int(dpu_trid) > 0) else None
+        merged["dpu_addrs"] = dpu_addrs
+        merged["dpu_nrm"] = dpu_rec.get("dpu_nrm", 0)
+        merged["dpu_power"] = dpu_rec.get("dpu_power")
+        merged["dpu_rev"] = dpu_rec.get("dpu_rev")
+        merged["dpu_alarms"] = list(dpu_rec.get("dpu_alarms") or [])
+        if merged.get("dpu_power"):
+            merged["speed_str"] = _format_dpu_short_power(merged["dpu_power"])
+        if merged.get("dpu_rev"):
+            merged["direction"] = merged["dpu_rev"]
+        if merged.get("psi") is None and dpu_rec.get("psi") is not None:
+            merged["psi"] = dpu_rec["psi"]
+        if merged.get("motion") is None and dpu_rec.get("motion") is not None:
+            merged["motion"] = dpu_rec["motion"]
+
+        prots = list(merged.get("rf_protocols") or [])
+        for p in (dpu_rec.get("rf_protocols") or []):
+            if p not in prots:
+                prots.append(p)
+        merged["rf_protocols"] = prots
+        merged["packets_received"] = int(eot_rec.get("packets_received", 0)) + int(dpu_rec.get("packets_received", 0))
+        merged["last_packet_ts"] = max(float(eot_rec.get("last_packet_ts", 0.0)), float(dpu_rec.get("last_packet_ts", 0.0)))
+        merged["updated_ts"] = max(float(eot_rec.get("updated_ts", 0.0)), float(dpu_rec.get("updated_ts", 0.0)))
+
+        # Combine RSSI sliding histories sorted by timestamp
+        comb_rssi = sorted(
+            list(self._rssi_history.get(eot_key, [])) + list(self._rssi_history.get(dpu_key, [])),
+            key=lambda x: x[0],
+        )[-RF_RSSI_WINDOW_SIZE:]
+        if comb_rssi:
+            self._rssi_history[eot_key] = comb_rssi[:-1]
+            self._update_rssi_stats(eot_key, merged, comb_rssi[-1][1], comb_rssi[-1][0])
+
+        # Refresh summary location/info string
+        info_parts: List[str] = []
+        if merged.get("hot_seen") and merged.get("hot_cmd"):
+            info_parts.append(f"HOT:{merged['hot_cmd']}")
+        elif merged.get("armed"):
+            info_parts.append("Arm")
+        if merged.get("dpu_nrm"):
+            info_parts.append(f"{merged['dpu_nrm']}rem")
+        if merged.get("dpu_alarms"):
+            info_parts.append(f"AL:{','.join(merged['dpu_alarms'])}")
+        info_parts.append("Linked")
+        merged["last_location"] = " ".join(info_parts)
+
+        self.trains[eot_key] = merged
+        self.trains.pop(dpu_key, None)
+        self._rssi_history.pop(dpu_key, None)
+        self._rf_events.pop(eot_key, None)
+        self._rf_events.pop(dpu_key, None)
+        self._pair_corr_scores = {
+            pk: sc for pk, sc in self._pair_corr_scores.items()
+            if eot_key not in pk and dpu_key not in pk
+        }
+        return eot_key
+
+    def _attempt_eot_dpu_correlation(self, trigger_key: str, now: float):
+        """
+        Infers whether an unmerged HOT/EOT train belongs to an unmerged DPU consist by
+        scoring sequential correlated state changes:
+          - DPU brake reduction / BP drop -> EOT pressure drop within 0..12s (+3, +1 if PSI matches within 6)
+          - DPU brake release / BP rise   -> EOT pressure rise within 0..12s (+2)
+          - DPU traction start / stop     -> EOT motion start / stop within 0..15s (+2)
+          - Simultaneous Emergency        -> +4
+        Merges only when confidence >= 4.0 and unambiguously ahead of any rival candidate (+2.0 margin).
+        """
+        trig = self.trains.get(trigger_key)
+        if not trig or not trig.get("is_rf_train"):
+            return
+        src = trig.get("train_source")
+        if src not in (TRAIN_SOURCE_HOT_EOT, TRAIN_SOURCE_DPU):
+            return
+
+        # Decay stale pair scores (> 180s without reinforcement)
+        self._pair_corr_scores = {
+            pk: (sc, pts) for pk, (sc, pts) in self._pair_corr_scores.items()
+            if (now - pts) <= 180.0 and pk[0] in self.trains and pk[1] in self.trains
+        }
+
+        if src == TRAIN_SOURCE_HOT_EOT:
+            eot_keys = [trigger_key]
+            dpu_keys = [k for k, t in self.trains.items() if t.get("train_source") == TRAIN_SOURCE_DPU]
+        else:
+            eot_keys = [k for k, t in self.trains.items() if t.get("train_source") == TRAIN_SOURCE_HOT_EOT]
+            dpu_keys = [trigger_key]
+
+        if not eot_keys or not dpu_keys:
+            return
+
+        for ek in eot_keys:
+            e_evs = self._rf_events.get(ek, [])
+            if not e_evs:
+                continue
+            for dk in dpu_keys:
+                d_evs = self._rf_events.get(dk, [])
+                if not d_evs:
+                    continue
+                pair_k = (ek, dk)
+                cur_score, cur_ts = self._pair_corr_scores.get(pair_k, (0.0, now))
+                added = 0.0
+                for d_ts, d_kind, d_val in d_evs:
+                    for e_ts, e_kind, e_val in e_evs:
+                        dt = e_ts - d_ts  # Positive when DPU command precedes EOT response
+                        sig_tok = (dk, round(d_ts, 3), d_kind, ek, round(e_ts, 3), e_kind)
+                        if sig_tok in self._consumed_corr_events:
+                            continue
+                        pts = 0.0
+                        if d_kind == "bp_drop" and e_kind == "bp_drop" and -2.0 <= dt <= RF_CORRELATION_WINDOW_SEC:
+                            pts = 3.0
+                            if isinstance(d_val, (int, float)) and isinstance(e_val, (int, float)):
+                                if abs(float(d_val) - float(e_val)) <= 6.0:
+                                    pts += 1.0
+                        elif d_kind == "bp_rise" and e_kind == "bp_rise" and -2.0 <= dt <= RF_CORRELATION_WINDOW_SEC:
+                            pts = 2.0
+                        elif d_kind == "motion_start" and e_kind == "motion_start" and -2.0 <= dt <= RF_MOTION_CORR_WINDOW_SEC:
+                            pts = 2.0
+                        elif d_kind == "motion_stop" and e_kind == "motion_stop" and -2.0 <= dt <= RF_MOTION_CORR_WINDOW_SEC:
+                            pts = 2.0
+                        elif d_kind == "emergency" and e_kind == "emergency" and abs(dt) <= 8.0:
+                            pts = 4.0
+                        if pts > 0.0:
+                            self._consumed_corr_events.add(sig_tok)
+                            if len(self._consumed_corr_events) > 512:
+                                self._consumed_corr_events.clear()
+                            added += pts
+                if added > 0.0:
+                    self._pair_corr_scores[pair_k] = (cur_score + added, now)
+
+        # Evaluate whether any EOT candidate has an unambiguous winning DPU match (score >= 4.0, lead >= 2.0)
+        for ek in list(eot_keys):
+            if ek not in self.trains or self.trains[ek].get("train_source") != TRAIN_SOURCE_HOT_EOT:
+                continue
+            cand_scores = sorted(
+                [(sc, dk) for (pek, dk), (sc, _) in self._pair_corr_scores.items()
+                 if pek == ek and dk in self.trains and self.trains[dk].get("train_source") == TRAIN_SOURCE_DPU],
+                reverse=True,
+            )
+            if not cand_scores:
+                continue
+            best_sc, best_dk = cand_scores[0]
+            second_sc = cand_scores[1][0] if len(cand_scores) > 1 else 0.0
+            # Also ensure best_dk does not have a competing higher-scoring EOT match
+            rival_eot = [
+                sc for (pek, pdk), (sc, _) in self._pair_corr_scores.items()
+                if pdk == best_dk and pek != ek and pek in self.trains
+            ]
+            rival_max = max(rival_eot) if rival_eot else 0.0
+            if best_sc >= 4.0 and (best_sc - second_sc) >= 2.0 and (best_sc - rival_max) >= 2.0:
+                self._merge_eot_and_dpu_trains(ek, best_dk, best_sc, now)
+
+    def check_packet(self, parsed_pkt: dict):
+        """
+        Rule 10 + Unified RF Train Tracking (EMP / PTC Inferred / HOT / EOT / DPU):
+          - If a packet matches a user-assigned train ID (_node_id_ / unit_id / ADDR / TRID),
+            updates RX indicator, _speed_, and enriches that train with any RF telemetry.
+          - Otherwise, tracks standalone HOT/EOT (unified by 5-digit EOT unit_id) and DPU
+            consists (unified by TRID) as RF trains with sliding-avg RSSI & Towards/Away trend,
+            and runs sequential state-change correlation to merge EOT/HOT + DPU when proven.
+          - Supports future EMP protocol packets with source 'EMP'.
+        """
+        if not isinstance(parsed_pkt, dict):
+            return
+        ts = _coerce_packet_ts(parsed_pkt.get("timestamp"))
+        proto = str(parsed_pkt.get("protocol") or "").strip().lower()
+
+        # 0. Future EMP source hook
+        if proto == "emp" or parsed_pkt.get("_emp_train_"):
+            emp_id = parsed_pkt.get("train_id") or parsed_pkt.get("_node_id_") or parsed_pkt.get("unit_id") or "EMP"
+            tkey = f"EMP-{emp_id}"
+            rec = self.trains.get(tkey)
+            if rec is None:
+                rec = {
+                    "train_key": tkey,
+                    "train_name": f"EMP #{emp_id}",
+                    "board_order": self._alloc_board_order(),
+                    "train_source": TRAIN_SOURCE_EMP,
+                    "is_rf_train": True,
+                    "assigned_id": str(emp_id),
+                    "assigned_name": parsed_pkt.get("train_name"),
+                    "status": "Active",
+                    "direction": str(parsed_pkt.get("direction") or "---"),
+                    "speed_mph": parsed_pkt.get("_speed_"),
+                    "speed_str": f"{float(parsed_pkt['_speed_']):.1f} MPH" if parsed_pkt.get("_speed_") is not None else "Unk.",
+                    "last_location": str(parsed_pkt.get("location") or "EMP"),
+                    "is_dimmed": False,
+                    "is_receiving_packets": True,
+                    "packets_received": 0,
+                    "last_packet_ts": ts,
+                    "rssi_dbfs": None,
+                    "rssi_avg": None,
+                    "rssi_delta_db": 0.0,
+                    "rssi_trend": "NONE",
+                    "rssi_trend_label": "---",
+                    "psi": parsed_pkt.get("pressure_psi"),
+                    "motion": None,
+                    "marker_light": None,
+                    "light_str": "---",
+                    "rf_protocols": ["emp"],
+                    "created_ts": ts,
+                    "updated_ts": ts,
+                    "time_str": time.strftime("%H:%M:%S", time.localtime(ts)),
+                }
+                self.trains[tkey] = rec
+            self._apply_rf_telemetry_to_record(tkey, rec, parsed_pkt, "emp", ts)
+            if parsed_pkt.get("_speed_") is not None:
+                try:
+                    s = float(parsed_pkt["_speed_"])
+                    rec["speed_mph"] = round(s, 1)
+                    rec["speed_str"] = f"{s:.1f} MPH"
+                except (ValueError, TypeError):
+                    pass
+            return
+
+        # 1. Rule 10: Check if packet matches any existing train's user-assigned ID
+        candidate_ids: Set[str] = set()
+        for fld in ("_node_id_", "unit_id", "ADDR", "loco_id", "TRID"):
+            v = parsed_pkt.get(fld)
+            if v is not None and str(v).strip() != "":
+                # TRID=0 is common/unlinked on DPU frames -> never treat "0" as a matchable train ID
+                if fld == "TRID":
+                    try:
+                        if int(v) == 0:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                candidate_ids.add(str(v).strip())
+                if fld == "unit_id":
+                    try:
+                        candidate_ids.add(f"{int(v):05d}")
+                    except (ValueError, TypeError):
+                        pass
+
+        matched_assigned_non_rf = False
+        if candidate_ids:
+            for tkey, trn in self.trains.items():
+                aid = trn.get("assigned_id")
+                if aid is not None and str(aid).strip() in candidate_ids:
+                    if proto in ("eot", "hot", "dpu"):
+                        self._apply_rf_telemetry_to_record(tkey, trn, parsed_pkt, proto, ts)
+                        if not trn.get("is_rf_train"):
+                            matched_assigned_non_rf = True
+                    else:
+                        trn["is_receiving_packets"] = True
+                        trn["packets_received"] = int(trn.get("packets_received", 0)) + 1
+                        trn["last_packet_ts"] = ts
+                        rssi_raw = parsed_pkt.get("rssi") if parsed_pkt.get("rssi") is not None else parsed_pkt.get("rssi_dbfs")
+                        self._update_rssi_stats(tkey, trn, rssi_raw, ts)
+                    if "_speed_" in parsed_pkt and parsed_pkt["_speed_"] is not None:
+                        try:
+                            s = float(parsed_pkt["_speed_"])
+                            trn["speed_mph"] = round(s, 1)
+                            trn["speed_str"] = f"{s:.1f} MPH"
+                        except (ValueError, TypeError):
+                            pass
+
+        # If a HOT/EOT/DPU packet already attached to a user-assigned PTC track train, do not create a duplicate RF row
+        if matched_assigned_non_rf:
+            return
+
+        # 2. Standalone HOT / EOT tracking (unified by shared 5-digit AAR S-9152 unit_id)
+        if proto in ("eot", "hot"):
+            uid_raw = parsed_pkt.get("unit_id")
+            if uid_raw is None:
+                uid_raw = parsed_pkt.get("_node_id_")
+            if uid_raw is None:
+                return
+            try:
+                uid = int(uid_raw)
+            except (ValueError, TypeError):
+                return
+            # AAR S-5701 / S-9152 EOT unit IDs are strictly 5 decimal digits (00001..99999)
+            if not (1 <= uid <= 99999):
+                return
+
+            # Find existing EOT/HOT or already-merged HOT/EOT/DPU train on the board OR in pending staging
+            target_key = None
+            in_board = False
+            for k, trn in self.trains.items():
+                if trn.get("is_rf_train") and trn.get("eot_unit_id") == uid:
+                    target_key = k
+                    in_board = True
+                    break
+            if target_key is None:
+                for k, trn in self._rf_pending.items():
+                    if trn.get("eot_unit_id") == uid:
+                        target_key = k
+                        break
+            if target_key is None:
+                target_key = f"RF-EOT-{uid:05d}"
+                new_rec = {
+                    "train_key": target_key,
+                    "train_name": f"EOT #{uid:05d}",
+                    "train_source": TRAIN_SOURCE_HOT_EOT,
+                    "is_rf_train": True,
+                    "assigned_id": None,
+                    "assigned_name": None,
+                    "status": "Active",
+                    "direction": "---",
+                    "speed_mph": None,
+                    "speed_str": "---",
+                    "last_location": "HOT/EOT",
+                    "is_dimmed": False,
+                    "is_receiving_packets": True,
+                    "packets_received": 0,
+                    "last_packet_ts": ts,
+                    "eot_unit_id": uid,
+                    "hot_seen": False,
+                    "eot_seen": False,
+                    "hot_cmd": None,
+                    "rssi_dbfs": None,
+                    "rssi_avg": None,
+                    "rssi_delta_db": 0.0,
+                    "rssi_trend": "NONE",
+                    "rssi_trend_label": "---",
+                    "psi": None,
+                    "motion": None,
+                    "marker_light": None,
+                    "light_str": "---",
+                    "rf_protocols": [],
+                    "created_ts": ts,
+                    "updated_ts": ts,
+                    "time_str": time.strftime("%H:%M:%S", time.localtime(ts)),
+                }
+                if self.rf_min_packets <= 1:
+                    new_rec["board_order"] = self._alloc_board_order()
+                    self.trains[target_key] = new_rec
+                    in_board = True
+                else:
+                    self._rf_pending[target_key] = new_rec
+
+            rec = self.trains[target_key] if in_board else self._rf_pending[target_key]
+            prev_psi = rec.get("psi")
+            prev_mov = rec.get("motion")
+            prev_emg = bool(rec.get("emergency", False))
+
+            self._apply_rf_telemetry_to_record(target_key, rec, parsed_pkt, proto, ts)
+
+            # Promote staged RF candidate onto Train Board once it reaches rf_min_packets (default: 2)
+            if not in_board and int(rec.get("packets_received", 0)) >= self.rf_min_packets:
+                rec["board_order"] = self._alloc_board_order()
+                self.trains[target_key] = rec
+                self._rf_pending.pop(target_key, None)
+                in_board = True
+
+            # Log state-change events for sequential EOT <-> DPU correlation
+            if rec.get("train_source") == TRAIN_SOURCE_HOT_EOT:
+                new_psi = rec.get("psi")
+                if prev_psi is not None and new_psi is not None:
+                    if (new_psi - prev_psi) <= -2:
+                        self._record_rf_event(target_key, ts, "bp_drop", new_psi)
+                    elif (new_psi - prev_psi) >= 2:
+                        self._record_rf_event(target_key, ts, "bp_rise", new_psi)
+                new_mov = rec.get("motion")
+                if prev_mov is not None and new_mov is not None and new_mov != prev_mov:
+                    self._record_rf_event(target_key, ts, "motion_start" if new_mov == "MOV" else "motion_stop", new_mov)
+                if bool(rec.get("emergency", False)) and not prev_emg:
+                    self._record_rf_event(target_key, ts, "emergency", True)
+                if in_board:
+                    self._attempt_eot_dpu_correlation(target_key, ts)
+            return
+
+        # 3. Standalone DPU tracking: look up primarily by permanent 16-bit hardware ADDR
+        # (TRID is often 0 / unreliable across trains; only group by TRID when TRID > 0).
+        # Never add unverified CRC-less DPU_BURST hits to the Train Board!
+        if proto == "dpu":
+            if parsed_pkt.get("crc_ok") is False or str(parsed_pkt.get("type_name") or "").upper() == "DPU_BURST":
+                return
+            trid_raw = parsed_pkt.get("TRID")
+            addr_raw = parsed_pkt.get("ADDR") if parsed_pkt.get("ADDR") is not None else parsed_pkt.get("loco_id")
+            if addr_raw is None:
+                addr_raw = parsed_pkt.get("_node_id_")
+            try:
+                trid = int(trid_raw or 0)
+            except (ValueError, TypeError):
+                trid = 0
+            try:
+                addr = int(addr_raw or 0)
+            except (ValueError, TypeError):
+                addr = 0
+            if trid == 0 and addr == 0:
+                return
+
+            target_key = None
+            in_board = False
+            # Priority 1: Exact hardware ADDR lookup on board (standalone DPU or merged HOT/EOT/DPU)
+            if addr > 0:
+                for k, trn in self.trains.items():
+                    if trn.get("is_rf_train") and addr in (trn.get("dpu_addrs") or []):
+                        target_key = k
+                        in_board = True
+                        break
+            # Priority 2: Non-zero TRID consist lookup on board
+            if target_key is None and trid > 0:
+                for k, trn in self.trains.items():
+                    if trn.get("is_rf_train") and trn.get("dpu_trid") == trid:
+                        target_key = k
+                        in_board = True
+                        break
+            # Priority 3: Check pending staging candidates
+            if target_key is None and addr > 0:
+                for k, trn in self._rf_pending.items():
+                    if addr in (trn.get("dpu_addrs") or []):
+                        target_key = k
+                        break
+            if target_key is None and trid > 0:
+                for k, trn in self._rf_pending.items():
+                    if trn.get("dpu_trid") == trid:
+                        target_key = k
+                        break
+            if target_key is None:
+                target_key = f"RF-DPU-{addr}" if addr > 0 else f"RF-DPU-T{trid}"
+                dname = f"DPU #{addr}" if addr > 0 else f"DPU Tr:{trid}"
+                new_rec = {
+                    "train_key": target_key,
+                    "train_name": dname,
+                    "train_source": TRAIN_SOURCE_DPU,
+                    "is_rf_train": True,
+                    "assigned_id": None,
+                    "assigned_name": None,
+                    "status": "Active",
+                    "direction": "---",
+                    "speed_mph": None,
+                    "speed_str": "---",
+                    "last_location": "DPU",
+                    "is_dimmed": False,
+                    "is_receiving_packets": True,
+                    "packets_received": 0,
+                    "last_packet_ts": ts,
+                    "dpu_trid": trid if trid > 0 else None,
+                    "dpu_addrs": [addr] if addr > 0 else [],
+                    "dpu_nrm": int(parsed_pkt.get("NRM") or 0),
+                    "dpu_power": None,
+                    "dpu_rev": None,
+                    "dpu_alarms": [],
+                    "rssi_dbfs": None,
+                    "rssi_avg": None,
+                    "rssi_delta_db": 0.0,
+                    "rssi_trend": "NONE",
+                    "rssi_trend_label": "---",
+                    "psi": None,
+                    "motion": None,
+                    "marker_light": None,
+                    "light_str": "---",
+                    "rf_protocols": [],
+                    "created_ts": ts,
+                    "updated_ts": ts,
+                    "time_str": time.strftime("%H:%M:%S", time.localtime(ts)),
+                }
+                if self.rf_min_packets <= 1:
+                    new_rec["board_order"] = self._alloc_board_order()
+                    self.trains[target_key] = new_rec
+                    in_board = True
+                else:
+                    self._rf_pending[target_key] = new_rec
+
+            rec = self.trains[target_key] if in_board else self._rf_pending[target_key]
+            prev_psi = rec.get("psi")
+            prev_pwr = str(rec.get("dpu_power") or "").upper()
+            prev_mtr = 1 if (prev_pwr.startswith("N") and prev_pwr[1:].isdigit()) else 0
+            prev_bpred = rec.get("_last_dpu_bpred")
+
+            self._apply_rf_telemetry_to_record(target_key, rec, parsed_pkt, proto, ts)
+
+            # Promote staged DPU candidate onto Train Board once it reaches rf_min_packets (default: 2)
+            if not in_board and int(rec.get("packets_received", 0)) >= self.rf_min_packets:
+                rec["board_order"] = self._alloc_board_order()
+                self.trains[target_key] = rec
+                self._rf_pending.pop(target_key, None)
+                in_board = True
+
+            # Log state-change events for sequential DPU <-> EOT correlation
+            if rec.get("train_source") == TRAIN_SOURCE_DPU:
+                tp = str(parsed_pkt.get("TP") or "").upper()
+                bpred = parsed_pkt.get("BPRED")
+                new_psi = rec.get("psi")
+                new_pwr = str(rec.get("dpu_power") or "").upper()
+                new_mtr = 1 if (parsed_pkt.get("MTR") == 1 or (new_pwr.startswith("N") and new_pwr[1:].isdigit())) else 0
+                alarms = [str(a).upper() for a in (parsed_pkt.get("AL") or [])]
+
+                if tp == "CM":
+                    if bpred == "EMER":
+                        self._record_rf_event(target_key, ts, "emergency", True)
+                        self._record_rf_event(target_key, ts, "bp_drop", None)
+                    elif isinstance(bpred, (int, float)) and bpred > 0 and bpred != prev_bpred:
+                        est_bp = (prev_psi - int(bpred)) if prev_psi is not None else None
+                        self._record_rf_event(target_key, ts, "bp_drop", est_bp)
+                    elif bpred == "REL" and isinstance(prev_bpred, (int, float)) and prev_bpred > 0:
+                        self._record_rf_event(target_key, ts, "bp_rise", None)
+                    rec["_last_dpu_bpred"] = bpred
+                elif tp == "ST":
+                    if prev_psi is not None and new_psi is not None:
+                        if (new_psi - prev_psi) <= -2:
+                            self._record_rf_event(target_key, ts, "bp_drop", new_psi)
+                        elif (new_psi - prev_psi) >= 2:
+                            self._record_rf_event(target_key, ts, "bp_rise", new_psi)
+                    if "EMR" in alarms or "BPDR" in alarms:
+                        self._record_rf_event(target_key, ts, "emergency", True)
+
+                if prev_pwr and new_pwr != prev_pwr:
+                    if prev_mtr == 0 and new_mtr == 1:
+                        self._record_rf_event(target_key, ts, "motion_start", new_pwr)
+                    elif prev_mtr == 1 and (new_mtr == 0 or new_pwr == "SETOT" or parsed_pkt.get("PRK") == 1):
+                        self._record_rf_event(target_key, ts, "motion_stop", new_pwr)
+                if in_board:
+                    self._attempt_eot_dpu_correlation(target_key, ts)
 
     def update_or_assign_train(
         self,
@@ -292,9 +1297,13 @@ class TrainTracker:
         resolved_dir = direction or prev_rec.get("direction", "E")
 
         rec = dict(prev_rec)
+        if "board_order" not in rec:
+            rec["board_order"] = self._alloc_board_order()
         rec.update({
             "train_key": train_name,
             "train_name": train_name,
+            "train_source": rec.get("train_source", TRAIN_SOURCE_PTC),
+            "is_rf_train": rec.get("is_rf_train", False),
             "status": rec.get("status", "Inferred"),
             "speed_mph": resolved_speed,
             "speed_str": f"{resolved_speed:.1f} MPH" if resolved_speed is not None else rec.get("speed_str", "Unk."),
@@ -307,8 +1316,18 @@ class TrainTracker:
             "is_dimmed": rec.get("is_dimmed", False),
             "is_receiving_packets": rec.get("is_receiving_packets", False),
             "packets_received": rec.get("packets_received", 0),
-            "last_packet_ts": rec.get("last_packet_ts", 0.0),
+            "last_packet_ts": rec.get("last_packet_ts") or timestamp,
         })
+        rec.setdefault("rssi_dbfs", None)
+        rec.setdefault("rssi_avg", None)
+        rec.setdefault("rssi_delta_db", 0.0)
+        rec.setdefault("rssi_trend", "NONE")
+        rec.setdefault("rssi_trend_label", "---")
+        rec.setdefault("psi", None)
+        rec.setdefault("motion", None)
+        rec.setdefault("marker_light", None)
+        rec.setdefault("light_str", "---")
+        rec.setdefault("rf_protocols", [])
         self.trains[train_name] = rec
         return train_name
 
@@ -323,14 +1342,43 @@ class TrainTracker:
                     matched_key = k
                     break
         if matched_key:
+            self._rssi_history.pop(matched_key, None)
+            self._rf_events.pop(matched_key, None)
+            self._pair_corr_scores = {
+                pk: sc for pk, sc in self._pair_corr_scores.items()
+                if matched_key not in pk
+            }
             return self.trains.pop(matched_key, None)
         return None
 
+    def prune_rf_trains(self, now: Optional[float] = None, rf_max_age: float = RF_TRAIN_TIMEOUT_SEC) -> List[str]:
+        """Deletes EOT/HOT, DPU, and EMP RF trains (and stale 1-packet candidates) after 7 minutes (420s) of inactivity."""
+        cur_now = float(now) if now is not None else time.time()
+        expired_pending = [
+            tkey for tkey, rec in self._rf_pending.items()
+            if (cur_now - float(rec.get("last_packet_ts") or rec.get("updated_ts") or 0.0)) >= float(rf_max_age)
+        ]
+        for tkey in expired_pending:
+            self._rf_pending.pop(tkey, None)
+            self._rssi_history.pop(tkey, None)
+            self._rf_events.pop(tkey, None)
+
+        expired = [
+            tkey for tkey, rec in self.trains.items()
+            if rec.get("is_rf_train")
+            and (cur_now - float(rec.get("last_packet_ts") or rec.get("updated_ts") or 0.0)) >= float(rf_max_age)
+        ]
+        for tkey in expired:
+            self.delete_train(tkey)
+        return expired
+
     def prune_inactive(self, active_elem_ids: set, now: float, max_age: float = 180.0):
-        """Cleans up stale orphaned records whose elements have been inactive for max_age."""
+        """Cleans up stale orphaned PTC records (max_age) and expired RF trains (7 minutes / 420s)."""
+        self.prune_rf_trains(now=now, rf_max_age=RF_TRAIN_TIMEOUT_SEC)
         to_delete = [
             tname for tname, rec in self.trains.items()
-            if rec.get("status") != "Potential"
+            if not rec.get("is_rf_train")
+            and rec.get("status") != "Potential"
             and rec.get("current_element_id") not in active_elem_ids
             and rec.get("last_element_id") not in active_elem_ids
             and (now - rec.get("updated_ts", 0.0)) > max_age
@@ -338,9 +1386,37 @@ class TrainTracker:
         for tname in to_delete:
             del self.trains[tname]
 
-    def to_state_dict(self, layout_wiu_ids: Optional[set] = None, rrdata: Optional[Dict[str, str]] = None) -> dict:
-        """Serializes current trains for network telemetry broadcast and renderer consumption."""
-        sorted_trains = sorted(self.trains.values(), key=lambda r: r.get("updated_ts", 0.0), reverse=True)[: self.max_len]
+    def to_state_dict(self, layout_wiu_ids: Optional[set] = None, rrdata: Optional[Dict[str, str]] = None, now: Optional[float] = None) -> dict:
+        """Serializes all trains on the Train Board in stable row order (no row jumping on updates)."""
+        cur_now = float(now) if now is not None else time.time()
+        self.prune_rf_trains(now=cur_now, rf_max_age=RF_TRAIN_TIMEOUT_SEC)
+        # Keep stable board_order ascending so rows stay pinned in place until deleted
+        for r in self.trains.values():
+            if "board_order" not in r:
+                r["board_order"] = self._alloc_board_order()
+        sorted_raw = sorted(
+            self.trains.values(),
+            key=lambda r: (int(r.get("board_order", 0)), float(r.get("created_ts", 0.0))),
+        )
+        sorted_trains: List[dict] = []
+        for rec in sorted_raw:
+            out_r = {k: v for k, v in rec.items() if not k.startswith("_")}
+            out_r.setdefault("train_source", TRAIN_SOURCE_PTC)
+            out_r.setdefault("is_rf_train", False)
+            out_r.setdefault("rssi_avg", None)
+            out_r.setdefault("rssi_trend", "NONE")
+            out_r.setdefault("rssi_trend_label", "---")
+            out_r.setdefault("psi", None)
+            out_r.setdefault("motion", None)
+            out_r.setdefault("marker_light", None)
+            out_r.setdefault("light_str", "---")
+            ref_ts = float(out_r.get("last_packet_ts") or out_r.get("updated_ts") or cur_now)
+            age_s = max(0.0, cur_now - ref_ts)
+            max_age_s = RF_TRAIN_TIMEOUT_SEC if out_r.get("is_rf_train") else 180.0
+            out_r["age_sec"] = round(age_s, 1)
+            out_r["rf_timeout_sec"] = RF_TRAIN_TIMEOUT_SEC if out_r.get("is_rf_train") else None
+            out_r["fade_factor"] = round(compute_train_fade_factor(age_s, max_age_s), 3)
+            sorted_trains.append(out_r)
         last_ts = max((r.get("updated_ts", 0.0) for r in self.trains.values()), default=0.0)
         return {
             "id": self.id,
@@ -357,8 +1433,9 @@ class TrainTracker:
         }
 
 
-# Maintain backward-compatible class alias
+# Maintain backward-compatible class aliases
 TrainScroller = TrainTracker
+TrainBoard = TrainTracker
 
 
 class TrainInferenceManager:
@@ -927,6 +2004,8 @@ class TrainInferenceManager:
         # 1. Rule 4: Check if this signal drop matches an Inferred or Confirmed train expecting this signal
         matched_expected = None
         for tkey, trn in train_tracker.trains.items():
+            if trn.get("is_rf_train"):
+                continue
             if trn.get("status") in ("Inferred", "Confirmed"):
                 exp_sig = trn.get("expected_signal_id")
                 is_expected = (exp_sig == sig_id)
@@ -1281,6 +2360,8 @@ class TrainInferenceManager:
                 is_duplicate = False
                 matched_existing = None
                 for tkey, trn in train_tracker.trains.items():
+                    if trn.get("is_rf_train"):
+                        continue
                     # 1. Same entry signal
                     if trn.get("initial_signal_id") == sig_id:
                         is_duplicate = True
@@ -1375,6 +2456,8 @@ class TrainInferenceManager:
         # 3. Rule 11: Timeout, Dimming, Reactivation, and Deletion
         trains_to_delete = []
         for tkey, trn in list(train_tracker.trains.items()):
+            if trn.get("is_rf_train"):
+                continue
             if trn.get("status") in ("Inferred", "Confirmed"):
                 at_edge = (trn.get("expected_signal_id") is None)
                 stale_signal = False

@@ -42,6 +42,8 @@ from version import VERSION
 
 CORE_SCRIPTS = [
     "ApexBOSGrabber.py",
+    "ApexBOSLatch.py",
+    "ApexBOSFred.py",
     "ApexBOSScanner.py",
     "ApexBOSChroma.py",
     "ApexBOSFlux.py",
@@ -89,6 +91,8 @@ DATA_FILES = [
     "ptc_status_parser.json",
     "README.md",
     "GRABBER_README.md",
+    "LATCH_README.md",
+    "FRED_README.md",
     "SCANNER_README.md",
     "CHROMA_README.md",
     "BANC_README.md",
@@ -112,6 +116,7 @@ PARSER_RULE_FILES = [
     "config/x70_rules.json",
     "config/x06_rules.json",
     "config/x04_rules.json",
+    "config/dpu_rules.json",
 ]
 
 EXCLUDED_EXACT_FILES = {
@@ -139,8 +144,12 @@ EXECUTABLE_SCRIPTS = {"setup.sh", "setup.command", "update.sh", "uninstall.sh", 
 ALLOWED_NEW_DIST_FILES = {
     "ApexBOSScanner.py",
     "ApexBOSChroma.py",
+    "ApexBOSLatch.py",
+    "ApexBOSFred.py",
     "SCANNER_README.md",
     "CHROMA_README.md",
+    "LATCH_README.md",
+    "FRED_README.md",
     "install_utils.py",
     "update.py",
     "uninstall.py",

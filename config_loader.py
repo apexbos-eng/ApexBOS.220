@@ -12,6 +12,7 @@ import re
 import sys
 import copy
 import json
+import math
 import base64
 import socket
 import secrets
@@ -55,6 +56,22 @@ DEFAULT_CHANNELS = [
 ]
 DEFAULT_CHANNELS_STR = ", ".join(str(c) for c in DEFAULT_CHANNELS)
 DEFAULT_BASE_ZMQ_PORT = 20101
+DEFAULT_PTC_DEVICE = 0
+DEFAULT_ATCS_DEVICE = 1
+DEFAULT_FRED_DEVICE = 2
+DEFAULT_ATCS_ZMQ_PORT = 18201
+DEFAULT_ATCS_CHROMA_PORT = 18299
+DEFAULT_ATCS_CTRL_PORT = 18298
+DEFAULT_FRED_ZMQ_PORT = 18301
+DEFAULT_FRED_CHROMA_PORT = 18399
+DEFAULT_FRED_CTRL_PORT = 18398
+MILES_TO_KM = 1.609344
+KM_TO_MILES = 1.0 / MILES_TO_KM
+DEFAULT_FRED_RX_RADIUS_MI = 12.0
+DEFAULT_PTC_RX_RADIUS_MI = 25.0
+DEFAULT_ATCS_RX_RADIUS_MI = 20.0
+SDR_PRIVACY_OFFSET_MIN_MI = 2.5
+SDR_PRIVACY_OFFSET_MAX_MI = 4.5
 DEFAULT_LAYOUT = "layouts/arrow_layout.json"
 DEFAULT_ENGINE_PARSERS = [
     "x33_rule.json",
@@ -80,6 +97,153 @@ DEFAULT_SPY_RULES = [
 def itc_channel_frequency(channel_num: int) -> int:
     """ITC frequency formula: 217 587 500 + (channel# * 25 000)."""
     return 217587500 + int(channel_num) * 25000
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in kilometers between two WGS84 (lat, lon) points."""
+    r_earth = 6371.0088
+    p1 = math.radians(float(lat1))
+    p2 = math.radians(float(lat2))
+    dlat = p2 - p1
+    dlon = math.radians(float(lon2) - float(lon1))
+    a = (math.sin(dlat / 2.0) ** 2) + math.cos(p1) * math.cos(p2) * (math.sin(dlon / 2.0) ** 2)
+    c = 2.0 * math.atan2(math.sqrt(max(0.0, a)), math.sqrt(max(0.0, 1.0 - a)))
+    return r_earth * c
+
+
+def quantize_geo_point(lat: float, lon: float, step_deg: float = 0.05) -> Tuple[float, float]:
+    """Snaps (lat, lon) to a coarse degree grid to prevent coordinate-oracle triangulation."""
+    step = max(0.001, float(step_deg))
+    q_lat = max(-85.0, min(85.0, round(round(float(lat) / step) * step, 4)))
+    q_lon = max(-180.0, min(180.0, round(round(float(lon) / step) * step, 4)))
+    return q_lat, q_lon
+
+
+def blur_sdr_gps_for_privacy(
+    lat: float,
+    lon: float,
+    rx_radius_mi: float = DEFAULT_FRED_RX_RADIUS_MI,
+    min_offset_mi: float = SDR_PRIVACY_OFFSET_MIN_MI,
+    max_offset_mi: float = SDR_PRIVACY_OFFSET_MAX_MI,
+    rng: Optional[Any] = None,
+) -> Dict[str, float]:
+    """
+    Applies a one-time cryptographically random spatial privacy perturbation to a user-selected
+    SDR location and expands the reported radius by the offset distance so the entire true RF
+    reception disk remains enclosed while the exact SDR coordinates are discarded immediately.
+
+    Returns ONLY the anonymized region dict:
+      {"region_lat": float, "region_lon": float, "region_radius_mi": float}
+    Never returns or persists raw GPS coordinates or the exact offset vector.
+    """
+    lat_f = max(-85.0, min(85.0, float(lat)))
+    lon_f = ((float(lon) + 180.0) % 360.0) - 180.0
+    rad_mi = max(4.0, min(60.0, float(rx_radius_mi)))
+    lo_off = max(0.5, float(min_offset_mi))
+    hi_off = max(lo_off, float(max_offset_mi))
+
+    rand_src = rng if rng is not None else secrets.SystemRandom()
+    bearing_rad = rand_src.uniform(0.0, 2.0 * math.pi)
+    offset_mi = rand_src.uniform(lo_off, hi_off)
+    offset_km = offset_mi * MILES_TO_KM
+
+    r_earth = 6371.0088
+    ang = offset_km / r_earth
+    lat1 = math.radians(lat_f)
+    lon1 = math.radians(lon_f)
+    sin_lat2 = math.sin(lat1) * math.cos(ang) + math.cos(lat1) * math.sin(ang) * math.cos(bearing_rad)
+    lat2 = math.asin(max(-1.0, min(1.0, sin_lat2)))
+    lon2 = lon1 + math.atan2(
+        math.sin(bearing_rad) * math.sin(ang) * math.cos(lat1),
+        math.cos(ang) - math.sin(lat1) * math.sin(lat2),
+    )
+
+    blurred_lat = round(max(-85.0, min(85.0, math.degrees(lat2))), 4)
+    blurred_lon = round((((math.degrees(lon2) + 180.0) % 360.0) - 180.0), 4)
+    enclosing_radius_mi = round(max(4.0, min(80.0, rad_mi + offset_mi)), 2)
+    return {
+        "region_lat": blurred_lat,
+        "region_lon": blurred_lon,
+        "region_radius_mi": enclosing_radius_mi,
+    }
+
+
+def sanitize_sdr_region(
+    region: Optional[Dict[str, Any]],
+    default_radius_mi: float = DEFAULT_FRED_RX_RADIUS_MI,
+    min_radius_mi: float = 4.0,
+    max_radius_mi: float = 80.0,
+) -> Optional[Dict[str, float]]:
+    """Validates and normalizes a stored blurred SDR region dict, stripping any raw fields."""
+    if not isinstance(region, dict):
+        return None
+    lat_raw = region.get("region_lat")
+    if lat_raw is None:
+        lat_raw = region.get("center_lat")
+    lon_raw = region.get("region_lon")
+    if lon_raw is None:
+        lon_raw = region.get("center_lon")
+    if lat_raw is None or lon_raw is None:
+        return None
+    try:
+        lat = float(lat_raw)
+        lon = float(lon_raw)
+    except (ValueError, TypeError):
+        return None
+    if not (-85.0 <= lat <= 85.0 and -180.0 <= lon <= 180.0):
+        return None
+    if lat == 0.0 and lon == 0.0:
+        return None
+
+    rad_mi: Optional[float] = None
+    if region.get("region_radius_mi") is not None:
+        try:
+            rad_mi = float(region["region_radius_mi"])
+        except (ValueError, TypeError):
+            rad_mi = None
+    elif region.get("radius_km") is not None:
+        try:
+            rad_mi = float(region["radius_km"]) * KM_TO_MILES
+        except (ValueError, TypeError):
+            rad_mi = None
+    if rad_mi is None or not math.isfinite(rad_mi) or rad_mi <= 0.0:
+        rad_mi = float(default_radius_mi)
+    rad_mi = max(float(min_radius_mi), min(float(max_radius_mi), rad_mi))
+    return {
+        "region_lat": round(lat, 4),
+        "region_lon": round(lon, 4),
+        "region_radius_mi": round(rad_mi, 2),
+    }
+
+
+def extract_sdr_regions_from_config(cfg: Any) -> Dict[str, Dict[str, float]]:
+    """
+    Extracts configured blurred SDR regions from unified config.json keyed by protocol:
+      - 'ptc'  <- cfg['grabber']
+      - 'atcs' <- cfg['latch']
+      - 'fred' <- cfg['fred']
+    Each value uses Banc wire format: {'center_lat', 'center_lon', 'radius_km'}.
+    """
+    if not isinstance(cfg, dict):
+        return {}
+    out: Dict[str, Dict[str, float]] = {}
+    mapping = (
+        ("grabber", "ptc", DEFAULT_PTC_RX_RADIUS_MI),
+        ("latch", "atcs", DEFAULT_ATCS_RX_RADIUS_MI),
+        ("fred", "fred", DEFAULT_FRED_RX_RADIUS_MI),
+    )
+    for sec_name, proto_key, def_mi in mapping:
+        sec = cfg.get(sec_name)
+        if not isinstance(sec, dict):
+            continue
+        clean = sanitize_sdr_region(sec, default_radius_mi=def_mi)
+        if clean:
+            out[proto_key] = {
+                "center_lat": clean["region_lat"],
+                "center_lon": clean["region_lon"],
+                "radius_km": round(clean["region_radius_mi"] * MILES_TO_KM, 2),
+            }
+    return out
 
 
 def distribute_channels_across_workers(channel_list: List[int], worker_count: int) -> List[List[int]]:
@@ -748,6 +912,12 @@ def generate_unified_config(
     ports: Optional[List[int]] = None,
     sample_rate: int = 2048000,
     device_index: int = 0,
+    atcs_device_index: int = DEFAULT_ATCS_DEVICE,
+    fred_device_index: int = DEFAULT_FRED_DEVICE,
+    latch_enabled: bool = True,
+    latch_chans: str = "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6",
+    fred_enabled: bool = True,
+    fred_chans: str = "EOT,DPU3,DPU4",
     ppm: int = 0,
     gain: str = "auto",
     sdr: Optional[Dict[str, Any]] = None,
@@ -760,6 +930,13 @@ def generate_unified_config(
     sdr_mode: Optional[str] = None,
     rtl_tcp_host: Optional[str] = None,
     rtl_tcp_port: Optional[int] = None,
+    grabber_region: Optional[Dict[str, Any]] = None,
+    latch_region: Optional[Dict[str, Any]] = None,
+    fred_region: Optional[Dict[str, Any]] = None,
+    latch_gain: Optional[str] = None,
+    latch_ppm: Optional[int] = None,
+    fred_gain: Optional[str] = None,
+    fred_ppm: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Generates the unified configuration dictionary.
@@ -782,6 +959,20 @@ def generate_unified_config(
         sdr["rtl_tcp_host"] = chosen_tcp_host
         sdr["rtl_tcp_port"] = chosen_tcp_port
     device_index = max(0, int(device_index))
+    atcs_device_index = max(0, int(atcs_device_index))
+    fred_device_index = max(0, int(fred_device_index))
+    grab_gain_str = str(gain).strip() if (gain is not None and str(gain).strip()) else "auto"
+    grab_ppm_int = int(ppm)
+    latch_gain_str = str(latch_gain).strip() if (latch_gain is not None and str(latch_gain).strip()) else grab_gain_str
+    try:
+        latch_ppm_int = int(latch_ppm) if (latch_ppm is not None and str(latch_ppm).strip() != "") else grab_ppm_int
+    except (ValueError, TypeError):
+        latch_ppm_int = grab_ppm_int
+    fred_gain_str = str(fred_gain).strip() if (fred_gain is not None and str(fred_gain).strip()) else grab_gain_str
+    try:
+        fred_ppm_int = int(fred_ppm) if (fred_ppm is not None and str(fred_ppm).strip() != "") else grab_ppm_int
+    except (ValueError, TypeError):
+        fred_ppm_int = grab_ppm_int
     if not identity or identity == "ApexNode_01":
         node_identity = generate_unique_identity()
     else:
@@ -906,6 +1097,8 @@ def generate_unified_config(
             "bias_t": True,
             "bias_tee": 1,
             "device": device_index,
+            "atcs_device": atcs_device_index,
+            "fred_device": fred_device_index,
             "sdr_mode": chosen_sdr_mode,
             "rtl_sdr_bin": sdr.get("rtl_sdr_bin"),
             "rtl_tcp_bin": sdr.get("rtl_tcp_bin"),
@@ -917,6 +1110,30 @@ def generate_unified_config(
             "rtl_tcp_port": chosen_tcp_port,
             "dedup_ttl": 0.4,
             "processes": proc_allocations,
+        },
+        "latch": {
+            "enabled": bool(latch_enabled),
+            "device": atcs_device_index,
+            "chans": str(latch_chans or "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6").strip(),
+            "zmq_port": DEFAULT_ATCS_ZMQ_PORT,
+            "chroma_port": DEFAULT_ATCS_CHROMA_PORT,
+            "ctrl_port": DEFAULT_ATCS_CTRL_PORT,
+            "gain": latch_gain_str,
+            "ppm": latch_ppm_int,
+            "bias_tee": 0,
+            "sdr_mode": chosen_sdr_mode,
+        },
+        "fred": {
+            "enabled": bool(fred_enabled),
+            "device": fred_device_index,
+            "chans": str(fred_chans or "EOT,DPU3,DPU4").strip(),
+            "zmq_port": DEFAULT_FRED_ZMQ_PORT,
+            "chroma_port": DEFAULT_FRED_CHROMA_PORT,
+            "ctrl_port": DEFAULT_FRED_CTRL_PORT,
+            "gain": fred_gain_str,
+            "ppm": fred_ppm_int,
+            "bias_tee": 0,
+            "sdr_mode": chosen_sdr_mode,
         },
         "flux": {
             "sources": flux_sources_str,
@@ -995,6 +1212,18 @@ def generate_unified_config(
             "default_rules": "signals_default.json",
         },
     }
+
+    # Optional privacy-blurred SDR reception regions (never raw GPS)
+    _clean_grab_reg = sanitize_sdr_region(grabber_region, default_radius_mi=DEFAULT_PTC_RX_RADIUS_MI)
+    if _clean_grab_reg:
+        cfg["grabber"].update(_clean_grab_reg)
+    _clean_latch_reg = sanitize_sdr_region(latch_region, default_radius_mi=DEFAULT_ATCS_RX_RADIUS_MI)
+    if _clean_latch_reg:
+        cfg["latch"].update(_clean_latch_reg)
+    _clean_fred_reg = sanitize_sdr_region(fred_region, default_radius_mi=DEFAULT_FRED_RX_RADIUS_MI)
+    if _clean_fred_reg:
+        cfg["fred"].update(_clean_fred_reg)
+
     return cfg
 
 
@@ -1010,6 +1239,91 @@ def load_unified_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         except Exception as e:
             print(f"[WARN] Failed to load config from {target_path}: {e}", file=sys.stderr)
     return generate_unified_config()
+
+
+def get_aux_demod_ports(cfg_or_path: Any = None) -> Dict[str, Dict[str, int]]:
+    """
+    Returns configured (or default) SDR device index and ZMQ/Chroma ports for
+    auxiliary demodulators ApexBOSLatch (ATCS 900 MHz) and ApexBOSFred (EOT/HOT 450 MHz).
+    """
+    cfg: Dict[str, Any] = {}
+    if isinstance(cfg_or_path, dict):
+        cfg = cfg_or_path
+    elif isinstance(cfg_or_path, str) and os.path.exists(cfg_or_path):
+        try:
+            with open(cfg_or_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f) or {}
+        except Exception:
+            cfg = {}
+    else:
+        for cand in (CONFIG_FILENAME, os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME)):
+            if os.path.exists(cand):
+                try:
+                    with open(cand, "r", encoding="utf-8") as f:
+                        cfg = json.load(f) or {}
+                    break
+                except Exception:
+                    pass
+
+    grab = cfg.get("grabber", {}) if isinstance(cfg.get("grabber"), dict) else {}
+    latch = cfg.get("latch", {}) if isinstance(cfg.get("latch"), dict) else {}
+    fred = cfg.get("fred", {}) if isinstance(cfg.get("fred"), dict) else {}
+
+    def _safe_int(val: Any, default: int) -> int:
+        try:
+            if val is not None and str(val).strip() != "":
+                return int(val)
+        except (ValueError, TypeError):
+            pass
+        return default
+
+    def _safe_gain(val: Any, fallback: Any, default: str = "28.0") -> str:
+        for cand in (val, fallback):
+            if cand is not None and str(cand).strip() != "":
+                return str(cand).strip()
+        return default
+
+    return {
+        "ptc": {
+            "device": _safe_int(grab.get("device"), DEFAULT_PTC_DEVICE),
+            "gain": _safe_gain(grab.get("gain"), None, "auto"),
+            "ppm": _safe_int(grab.get("ppm", grab.get("frequency_correction")), 0),
+            "ctrl_port": 18098,
+            "chroma_port": 18099,
+        },
+        "atcs": {
+            "enabled": bool(latch.get("enabled", True)),
+            "device": _safe_int(latch.get("device", grab.get("atcs_device")), DEFAULT_ATCS_DEVICE),
+            "chans": str(latch.get("chans") or "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6"),
+            "gain": _safe_gain(latch.get("gain"), grab.get("gain"), "28.0"),
+            "ppm": _safe_int(latch.get("ppm"), _safe_int(grab.get("ppm"), 0)),
+            "zmq_port": _safe_int(latch.get("zmq_port"), DEFAULT_ATCS_ZMQ_PORT),
+            "chroma_port": _safe_int(latch.get("chroma_port"), DEFAULT_ATCS_CHROMA_PORT),
+            "ctrl_port": _safe_int(latch.get("ctrl_port"), DEFAULT_ATCS_CTRL_PORT),
+        },
+        "fred": {
+            "enabled": bool(fred.get("enabled", True)),
+            "device": _safe_int(fred.get("device", grab.get("fred_device")), DEFAULT_FRED_DEVICE),
+            "chans": str(fred.get("chans") or "EOT,DPU3,DPU4"),
+            "gain": _safe_gain(fred.get("gain"), grab.get("gain"), "28.0"),
+            "ppm": _safe_int(fred.get("ppm"), _safe_int(grab.get("ppm"), 0)),
+            "zmq_port": _safe_int(fred.get("zmq_port"), DEFAULT_FRED_ZMQ_PORT),
+            "chroma_port": _safe_int(fred.get("chroma_port"), DEFAULT_FRED_CHROMA_PORT),
+            "ctrl_port": _safe_int(fred.get("ctrl_port"), DEFAULT_FRED_CTRL_PORT),
+        },
+    }
+
+
+def is_tcp_port_open(host: str, port: int, timeout: float = 0.12) -> bool:
+    """Fast, non-blocking TCP probe to detect whether a local/remote demodulator port is listening."""
+    target_host = (host or "127.0.0.1").strip()
+    if target_host.lower() in ("", "localhost", "0.0.0.0", "::"):
+        target_host = "127.0.0.1"
+    try:
+        with socket.create_connection((target_host, int(port)), timeout=float(timeout)):
+            return True
+    except OSError:
+        return False
 
 
 def save_unified_config(cfg: Dict[str, Any], config_path: Optional[str] = None):

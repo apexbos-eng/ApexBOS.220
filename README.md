@@ -83,7 +83,9 @@ ApexBOS is partitioned into modular, independently executable components. Each c
 
 | Component | Source File | Documentation | Role & Capabilities |
 | :--- | :--- | :--- | :--- |
-| **ApexBOSGrabber** | [ApexBOSGrabber.py](ApexBOSGrabber.py) | [GRABBER_README.md](GRABBER_README.md) | High-speed SDR receiver and $\pi/4$-DQPSK demodulator. Decodes 220 MHz bursts, executes Viterbi and Reed-Solomon FEC, and publishes streams over ZeroMQ PUB sockets (defaulting to ports 18071–18131) and UDP. |
+| **ApexBOSGrabber** | [ApexBOSGrabber.py](ApexBOSGrabber.py) | [GRABBER_README.md](GRABBER_README.md) | High-speed 220 MHz PTC SDR receiver and $\pi/4$-DQPSK demodulator. Decodes 220 MHz bursts, executes Viterbi and Reed-Solomon FEC, and publishes streams over ZeroMQ PUB sockets (defaulting to ports 18071–18131) and UDP. |
+| **ApexBOSLatch** | [ApexBOSLatch.py](ApexBOSLatch.py) | [LATCH_README.md](LATCH_README.md) | Clean-room 900 MHz ATCS (AAR Spec 200) 4800 bps 2-FSK + BCH(48, 32) SDR demodulator. Monitors 935 MHz BCP and 896 MHz MCP channels on a dedicated SDR and publishes unified telemetry to Flux, Engine, Packet Scroller, Spy (`18201`), and Chroma (`18299`/`18298`). |
+| **ApexBOSFred** | [ApexBOSFred.py](ApexBOSFred.py) | [FRED_README.md](FRED_README.md) | Clean-room 450 MHz EOT/HOT (AAR S-9152) 1200-baud coherent FFSK (1200/1800 Hz) + BCH(63, 45) SDR demodulator. Decodes rear brake pressure, motion, marker light, and battery health (`457.9375` / `452.9375 MHz`) into Flux, Packet Scroller, Spy (`18301`), and Chroma (`18399`/`18398`). |
 | **ApexBOSScanner** | [ApexBOSScanner.py](ApexBOSScanner.py) | [SCANNER_README.md](SCANNER_README.md) | Automated ITC 220 MHz channel scanner & master oscillator PPM calibrator. Hunts active PTC channels (97–176), sweeps tuner offsets $\pm 4$ PPM, calculates consensus tuner PPM and safe gain headroom, and updates Grabber configurations. |
 | **ApexBOSChroma** | [ApexBOSChroma.py](ApexBOSChroma.py) | [CHROMA_README.md](CHROMA_README.md) | Real-time Pygame FFT spectrum analyzer & scrolling waterfall tailored to PTC Channels 97–176. Runs alongside Grabber from the same RTL-SDR with zero demod impact (plus Standalone & `--mock` modes), dynamic Native/Wideband (`2.304 MS/s`) switching, live PPM/Gain/Bias-T controls, interactive channel ruler, and flowing WIU/`src->dst` packet blips. |
 | **ApexBOSFlux** | [ApexBOSFlux.py](ApexBOSFlux.py) | [FLUX_README.md](FLUX_README.md) | Asynchronous multi-channel telemetry aggregator. Collects ZMQ worker streams, performs sliding-window deduplication, relays packets locally on UDP multicast (`239.1.1.1:23003`), and uploads encrypted bursts to Banc Cloud. |
@@ -104,15 +106,21 @@ The diagram below illustrates the end-to-end data pipeline across local hardware
 
 ```mermaid
 flowchart TD
-    subgraph RF_Layer["1. RF Ingestion - Local Site"]
-        ANT["220 MHz Antenna"] --> SDR["RTL-SDR or HackRF"]
-        SDR --> GRAB["ApexBOSGrabber.py<br/>SDR Demodulator"]
+    subgraph RF_Layer["1. RF Ingestion - Local Site (Multi-SDR Ready)"]
+        ANT["220 / 900 / 450 MHz Antennas"] --> SDR["RTL-SDR / SDRplay RSP1B / SoapySDR"]
+        SDR --> GRAB["ApexBOSGrabber.py<br/>220 MHz PTC Demod"]
+        SDR --> LATCH["ApexBOSLatch.py<br/>900 MHz ATCS Demod"]
+        SDR --> FRED["ApexBOSFred.py<br/>450 MHz EOT/HOT Demod"]
     end
 
     subgraph Relay_Layer["2. Telemetry Aggregation"]
         GRAB -->|"ZMQ PUB 18071..18131"| FLUX["ApexBOSFlux.py<br/>Local Multicast Relay"]
+        LATCH -->|"ZMQ PUB 18201"| FLUX
+        FRED -->|"ZMQ PUB 18301"| FLUX
         GRAB -.->|"ZeroMQ or UDP"| SPY["ApexBOSSpy.py<br/>Packet Inspector"]
-        GRAB -.->|"ZMQ XPUB 18099 + REP 18098"| CHROMA["ApexBOSChroma.py<br/>RF Spectrum & Waterfall"]
+        GRAB -.->|"ZMQ XPUB 18099 + REP 18098"| CHROMA["ApexBOSChroma.py<br/>Multi-Band RF Spectrum"]
+        LATCH -.->|"XPUB 18299 / REP 18298"| CHROMA
+        FRED -.->|"XPUB 18399 / REP 18398"| CHROMA
     end
 
     subgraph Cloud_Layer["3. Cloud WAN Infrastructure"]
@@ -138,7 +146,9 @@ flowchart TD
 | Port / Address | Transport Protocol | Direction | Source Component | Destination Component | Purpose & Description |
 | :--- | :--- | :---: | :--- | :--- | :--- |
 | `18071`–`18131` | TCP (ZeroMQ PUB/SUB) | Unicast | ApexBOSGrabber | ApexBOSFlux / Spy / Chroma | High-speed channelized telemetry slices published by Grabber demodulator workers (starting at 18071, 18000 + channel). |
-| `18098`–`18099` | TCP (ZeroMQ REP / XPUB) | Localhost | ApexBOSGrabber | ApexBOSChroma | Localhost-only gated IQ spectrum tap (`18099`, 0% load when unsubscribed) and live SDR control bridge (`18098`) for ApexBOSChroma. |
+| `18098`–`18099` | TCP (ZeroMQ REP / XPUB) | Localhost | ApexBOSGrabber | ApexBOSChroma | Localhost-only gated IQ spectrum tap (`18099`, 0% load when unsubscribed) and live SDR control bridge (`18098`) for ApexBOSChroma (220 MHz PTC). |
+| `18201` / `18298`–`18299` | TCP (ZeroMQ PUB / REP / XPUB) | Unicast / Localhost | ApexBOSLatch | Flux / Spy / Chroma | 900 MHz ATCS decoded telemetry stream (`18201`), Chroma control bridge (`18298`), and gated IQ spectrum tap (`18299`). |
+| `18301` / `18398`–`18399` | TCP (ZeroMQ PUB / REP / XPUB) | Unicast / Localhost | ApexBOSFred | Flux / Spy / Chroma | 450 MHz EOT/HOT decoded telemetry stream (`18301`), Chroma control bridge (`18398`), and gated IQ spectrum tap (`18399`). |
 | `239.1.1.1:23003` | UDP Multicast | Local LAN | ApexBOSFlux | Dispatcher Engine / Spy | Local area network telemetry distribution for sub-millisecond packet delivery. |
 | `23009` | TCP (Dual-Stack IPv4/IPv6) | WAN / LAN | ApexBOSFlux / Engine / Viewer | ApexBOSBanc Cloud | Encrypted cloud telemetry uplink, packet archives, layout synchronization, and Foamer Chat. |
 | `23010` | TCP (HTTP / Telnet) | Localhost / LAN | Browser / Terminal | ApexBOSBanc | Banc cloud telemetry monitoring dashboard, active connection table, and cooldown manager. |

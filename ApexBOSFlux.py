@@ -37,6 +37,7 @@ import asyncio
 import collections
 import hashlib
 import re
+import zlib
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -343,6 +344,58 @@ class StatsManager:
 # ZeroMQ Connection Manager & Data Collection
 # ---------------------------------------------------------------------------
 
+# Protocol codes stored in Banc packets.b2 (INTEGER) and packets.b3 (TEXT)
+PKT_PROTO_PTC = 0
+PKT_PROTO_ATCS = 1
+PKT_PROTO_FRED = 2  # EOT / HOT / DPU / RLC
+
+
+def classify_packet_protocol(
+    data_bytes: Optional[bytes],
+    hex_data: str = "",
+    channel: int = 0,
+) -> Tuple[int, str, str, bytes]:
+    """
+    Classifies a packet arriving on Flux ZMQ into Banc storage metadata:
+        (b2_proto_code, b3_proto_tag, banc_hex_data, hash_basis_bytes)
+    - PTC (legacy/default): (0, '"NA"', hex_data, data_bytes) — 100% unchanged!
+    - ATCS (b'A{...}'):     (1, 'ATCS', data_bytes.hex().upper(), canonical_bytes)
+    - FRED (b'E{...}'):     (2, 'EOT'|'HOT'|'DPU'|'RLC'|'FRED', data_bytes.hex().upper(), canonical_bytes)
+    """
+    raw = bytes(data_bytes) if isinstance(data_bytes, (bytes, bytearray)) else b""
+    if len(raw) > 2 and raw[:2] in (b"A{", b"E{"):
+        is_atcs = raw[:1] == b"A"
+        b2_code = PKT_PROTO_ATCS if is_atcs else PKT_PROTO_FRED
+        b3_tag = "ATCS" if is_atcs else "FRED"
+        inner_hex = str(hex_data or "").strip().upper()
+        try:
+            env = json.loads(raw[1:].decode("utf-8"))
+            if isinstance(env, dict):
+                proto = str(env.get("protocol") or "").strip().upper()
+                if proto == "ATCS":
+                    b2_code = PKT_PROTO_ATCS
+                    b3_tag = "ATCS"
+                elif proto in ("EOT", "HOT", "DPU", "RLC", "FRED"):
+                    b2_code = PKT_PROTO_FRED
+                    b3_tag = proto
+                if env.get("hex"):
+                    inner_hex = str(env["hex"]).strip().upper()
+                if not channel and env.get("channel"):
+                    try:
+                        channel = int(env["channel"])
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+        # Sanitize b3_tag so CSV splitting on ',' is always safe
+        b3_tag = re.sub(r"[^A-Za-z0-9_-]", "", b3_tag) or ("ATCS" if b2_code == PKT_PROTO_ATCS else "FRED")
+        banc_hex = raw.hex().upper()
+        basis = f"{b2_code}:{b3_tag}:{int(channel or 0)}:{inner_hex or banc_hex}".encode("ascii", errors="ignore")
+        return b2_code, b3_tag, banc_hex, basis
+
+    return PKT_PROTO_PTC, '"NA"', str(hex_data or "").strip().upper(), raw
+
+
 def parse_incoming_zmq_packet(frames: List[bytes]) -> Tuple[Optional[bytes], str, Optional[float], Optional[int]]:
     """
     Parses incoming ZeroMQ frames from Grabber or other external sources.
@@ -644,8 +697,46 @@ async def cloud_burst_loop(config, stats, packet_queue):
     fernet = Fernet(enc_key.encode())
     buffer = []
     start_time = time.time()
-    
+    sdr_regions = config.get("_sdr_regions") if isinstance(config.get("_sdr_regions"), dict) else {}
+    last_region_sync = 0.0
+    region_sync_interval = 600.0  # Refresh private blurred SDR region registration every 10 min
+
+    async def _sync_sdr_regions_once() -> bool:
+        if not sdr_regions or cloud_ip == "None" or not cloud_port:
+            return False
+        try:
+            tok = mosfet_auth.generate_token(auth_secret)
+            hdr = f"PUT_SDR_REGION:{stats.identity}:{tok}"
+            enc_hdr = fernet.encrypt(hdr.encode("utf-8"))
+            enc_pay = fernet.encrypt(json.dumps(sdr_regions).encode("utf-8"))
+            frame = struct.pack(">I", len(enc_hdr)) + enc_hdr + struct.pack(">I", len(enc_pay)) + enc_pay
+            r_reg, w_reg = await asyncio.wait_for(asyncio.open_connection(cloud_ip, cloud_port), timeout=5.0)
+            try:
+                w_reg.write(frame)
+                await w_reg.drain()
+                # Read optional ack frame cleanly without failing against older Banc servers
+                try:
+                    len_b = await asyncio.wait_for(r_reg.readexactly(4), timeout=3.0)
+                    r_len = struct.unpack(">I", len_b)[0]
+                    if 0 < r_len < 65536:
+                        await asyncio.wait_for(r_reg.readexactly(r_len), timeout=3.0)
+                except Exception:
+                    pass
+            finally:
+                w_reg.close()
+                await w_reg.wait_closed()
+            return True
+        except Exception:
+            return False
+
     while True:
+        # Privately register configured blurred SDR regions with Banc on startup & periodically
+        if sdr_regions and not getattr(stats, "upload_paused", False):
+            now_reg = time.time()
+            if last_region_sync <= 0.0 or (now_reg - last_region_sync) >= region_sync_interval:
+                ok_reg = await _sync_sdr_regions_once()
+                last_region_sync = now_reg if ok_reg else (now_reg - region_sync_interval + 60.0)
+
         # If uploads are paused, clear buffer, drain incoming queue, and do not accumulate packets for Banc
         if getattr(stats, "upload_paused", False):
             stats.cloud_next_burst = "PAUSED"
@@ -716,8 +807,13 @@ async def cloud_burst_loop(config, stats, packet_queue):
                 except Exception:
                     channel = 0
             
-            pkt_hash = hash(data) & ((1<<32)-1) # 32-bit positive int
-            
+            b2_code, b3_tag, banc_hex, hash_basis = classify_packet_protocol(data, hex_data, channel=channel)
+            if b2_code == PKT_PROTO_PTC:
+                pkt_hash = hash(data) & ((1<<32)-1) # 32-bit positive int (legacy PTC path)
+            else:
+                # Deterministic cross-node 32-bit hash for ATCS / EOT-HOT-DPU-RLC deduplication in Banc
+                pkt_hash = zlib.crc32(hash_basis) & 0xFFFFFFFF
+
             # Relay true RSSI or fallback to "NA" / 0.0 for backwards compatibility
             if rssi is not None:
                 sig_str = f"{rssi:.1f}"
@@ -725,8 +821,8 @@ async def cloud_burst_loop(config, stats, packet_queue):
             else:
                 sig_str = "NA"
                 b1_val = "0.0"
-            
-            row = f'{date_str},{unix_ts},{stats.identity},{hex_data},{channel},{sig_str},{pkt_hash},{b1_val},0,"NA"'
+
+            row = f"{date_str},{unix_ts},{stats.identity},{banc_hex},{channel},{sig_str},{pkt_hash},{b1_val},{b2_code},{b3_tag}"
             buffer.append(row)
             stats.packets_in_buffer = len(buffer)
 
@@ -1041,6 +1137,28 @@ async def autodiscover_loop(scan_pool, active_conns, ctx, mcast_sock, mcast_addr
         await asyncio.sleep(60)
 
 
+async def aux_autodiscover_loop(aux_pool, active_conns, ctx, mcast_sock, mcast_addr, stats, packet_queue, interval_sec: float = 3.0):
+    """
+    Lightweight fast-polling auto-discovery loop for auxiliary SDR demodulators
+    (ApexBOSLatch ATCS 900 MHz and ApexBOSFred 450 MHz EOT/HOT/DPU/RLC).
+    Only connects once the auxiliary port is actually listening so stopped aux
+    demodulators never clutter Flux's endpoint table or break PTC-only operation.
+    """
+    while True:
+        try:
+            for host, port in aux_pool:
+                ep = f"tcp://{host}:{port}"
+                if ep in active_conns and getattr(active_conns[ep], "is_running", True):
+                    continue
+                if await is_port_open(host, port):
+                    active_conns[ep] = ZmqConnection(ep, ctx, mcast_sock, mcast_addr, stats, packet_queue)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+        await asyncio.sleep(interval_sec)
+
+
 async def main():
     parser = argparse.ArgumentParser(description=f"MosFET ({VERSION}) ZMQ Multicast Relay")
     parser.add_argument("--config", type=str, default="MosFET.json", help="Path to JSON configuration file")
@@ -1077,9 +1195,32 @@ async def main():
     with open(args.config, 'r') as f:
         config = json.load(f)
 
-    # Support unified config.json root structures
+    # Support unified config.json root structures (capture aux Latch/Fred ports before unwrapping)
+    aux_scan_pool: List[Tuple[str, int]] = []
+    if isinstance(config, dict):
+        latch_sec = config.get("latch") if isinstance(config.get("latch"), dict) else None
+        fred_sec = config.get("fred") if isinstance(config.get("fred"), dict) else None
+        if latch_sec is None or latch_sec.get("enabled", True):
+            lp = int((latch_sec or {}).get("zmq_port", 18201) or 18201)
+            if lp > 0:
+                aux_scan_pool.append(("127.0.0.1", lp))
+        if fred_sec is None or fred_sec.get("enabled", True):
+            fp = int((fred_sec or {}).get("zmq_port", 18301) or 18301)
+            if fp > 0:
+                aux_scan_pool.append(("127.0.0.1", fp))
+
+    # Extract optional privacy-blurred SDR reception regions from unified config before unwrapping
+    extracted_sdr_regions: Dict[str, Any] = {}
+    try:
+        import config_loader as _cfg_loader
+        extracted_sdr_regions = _cfg_loader.extract_sdr_regions_from_config(config)
+    except Exception:
+        extracted_sdr_regions = {}
+
     if "flux" in config and isinstance(config["flux"], dict):
         flux_sub = dict(config["flux"])
+        if extracted_sdr_regions:
+            flux_sub["_sdr_regions"] = extracted_sdr_regions
         if "common" in config and isinstance(config["common"], dict):
             common = config["common"]
             if "banc" in common:
@@ -1222,6 +1363,11 @@ async def main():
 
     if scan_pool:
         asyncio.create_task(autodiscover_loop(scan_pool, active_connections, ctx, mcast_sock, mcast_addr, stats, packet_queue))
+
+    # Auto-attach to running ApexBOSLatch (ATCS) & ApexBOSFred (EOT/HOT/DPU/RLC) ZMQ PUB ports
+    filtered_aux = [(h, p) for (h, p) in aux_scan_pool if f"tcp://{h}:{p}" not in direct_endpoints]
+    if filtered_aux:
+        asyncio.create_task(aux_autodiscover_loop(filtered_aux, active_connections, ctx, mcast_sock, mcast_addr, stats, packet_queue))
 
     # Cloud Bursting Task
     asyncio.create_task(cloud_burst_loop(config, stats, packet_queue))

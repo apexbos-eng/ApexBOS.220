@@ -482,6 +482,8 @@ class RulesRegistry:
             unique_files = sorted(set(candidate_files))
             for fpath in unique_files:
                 name = os.path.basename(fpath)
+                if name.lower() == "atcs_rules.json":
+                    continue
                 try:
                     mtime = os.path.getmtime(fpath)
                     with open(fpath, "r", encoding="utf-8") as f:
@@ -932,6 +934,22 @@ class ApexBOSSpy:
         self.colors = Colors(enabled=not no_color)
 
         self.rules_registry = RulesRegistry(rule_paths)
+        self.atcs_decoder = None
+        self.dsu_decoder = None
+        self.rlc_decoder = None
+        try:
+            import ApexBOSLatch as _latch_mod
+            self.atcs_decoder = _latch_mod.AtcsRulesDecoder(config_dir=os.path.join(PROJECT_ROOT, "config"))
+        except Exception:
+            self.atcs_decoder = None
+        try:
+            import ApexBOSFred as _fred_mod
+            self.dsu_decoder = _fred_mod.DsuPacketDecoder(config_dir=os.path.join(PROJECT_ROOT, "config"))
+            self.rlc_decoder = _fred_mod.RlcRulesDecoder(config_dir=os.path.join(PROJECT_ROOT, "config"))
+        except Exception:
+            self.dsu_decoder = None
+            self.rlc_decoder = None
+        self.active_aux_sources: Set[str] = set()
         self.rules_status_msg: str = ""
         self.last_rules_reload_time: float = time.time()
         self.start_time = time.time()
@@ -1300,8 +1318,36 @@ class ApexBOSSpy:
             self.total_packets_received += 1
             self.rate_window_total.append(now_t)
 
+        # Minimal unified hook for ApexBOSLatch (b'A{...}' ATCS) and ApexBOSFred (b'E{...}' EOT/HOT)
+        is_valid, parsed_data, rule_name = False, {}, ""
+        if isinstance(raw_bytes, (bytes, bytearray)) and len(raw_bytes) > 2 and raw_bytes[:2] in (b"A{", b"E{"):
+            try:
+                env_obj = json.loads(bytes(raw_bytes[1:]).decode("utf-8"))
+                if isinstance(env_obj, dict) and env_obj.get("protocol") in ("atcs", "eot", "hot", "dpu", "dsu", "rlc"):
+                    is_valid = True
+                    p_name = str(env_obj.get("protocol") or "").lower()
+                    if p_name == "atcs" and getattr(self, "atcs_decoder", None) is not None:
+                        parsed_data = self.atcs_decoder.decode(env_obj)
+                    elif p_name in ("dpu", "dsu") and getattr(self, "dsu_decoder", None) is not None:
+                        parsed_data = self.dsu_decoder.decode(env_obj)
+                    elif p_name == "rlc" and getattr(self, "rlc_decoder", None) is not None:
+                        parsed_data = self.rlc_decoder.decode(env_obj)
+                    else:
+                        parsed_data = dict(env_obj)
+                    proto_u = str(parsed_data.get("protocol")).upper()
+                    rule_name = str(parsed_data.get("type_name") or proto_u)
+                    if channel is None and parsed_data.get("channel") is not None:
+                        channel = parsed_data.get("channel")
+                    if rssi is None and parsed_data.get("rssi") is not None:
+                        rssi = float(parsed_data.get("rssi"))
+                    if not raw_hex and parsed_data.get("hex"):
+                        raw_hex = str(parsed_data["hex"]).upper()
+            except Exception:
+                pass
+
         # Parse through modular JSON packet rules
-        is_valid, parsed_data, rule_name = self.rules_registry.parse(raw_bytes)
+        if not is_valid:
+            is_valid, parsed_data, rule_name = self.rules_registry.parse(raw_bytes)
         if is_valid and channel is None and parsed_data:
             channel = parsed_data.get("Channel") or parsed_data.get("channel") or parsed_data.get("channel_meta")
 
@@ -1535,7 +1581,10 @@ class ApexBOSSpy:
         eps_str = ", ".join(self.endpoints[:3])
         if len(self.endpoints) > 3:
             eps_str += f" (+{len(self.endpoints) - 3} more)"
-        lines.append(f" * Endpoints: {cols.WHITE}{eps_str}{cols.RESET} | Rules: {cols.WHITE}{len(self.rules_registry.parsers)} loaded{cols.RESET}" + cols.CLEAR_EOL)
+        aux_tag = ""
+        if getattr(self, "active_aux_sources", None):
+            aux_tag = f" {cols.GREEN}[+{' +'.join(sorted(self.active_aux_sources))}]{cols.RESET}"
+        lines.append(f" * Endpoints: {cols.WHITE}{eps_str}{cols.RESET}{aux_tag} | Rules: {cols.WHITE}{len(self.rules_registry.parsers)} loaded{cols.RESET}" + cols.CLEAR_EOL)
 
         # Pack/Min Stat Line
         pack_stat = (
@@ -1680,9 +1729,13 @@ class ApexBOSSpy:
                 if now - last_mtime_check >= 1.0:
                     last_mtime_check = now
                     reloaded_count = self.rules_registry.check_and_reload_modified()
-                    if reloaded_count is not None:
+                    atcs_reloaded = bool(getattr(self, "atcs_decoder", None) and self.atcs_decoder.reload(force=False))
+                    dpu_reloaded = bool(getattr(self, "dsu_decoder", None) and self.dsu_decoder.reload(force=False))
+                    rlc_reloaded = bool(getattr(self, "rlc_decoder", None) and self.rlc_decoder.reload(force=False))
+                    if reloaded_count is not None or atcs_reloaded or dpu_reloaded or rlc_reloaded:
                         t_str = datetime.now().strftime("%H:%M:%S")
-                        self.rules_status_msg = f"[RULES] Auto-reloaded {reloaded_count} rule parser(s) at {t_str}"
+                        rc = reloaded_count if reloaded_count is not None else len(self.rules_registry.parsers)
+                        self.rules_status_msg = f"[RULES] Auto-reloaded {rc} rule parser(s) at {t_str}"
 
                 self.render_tui()
                 time.sleep(0.1)
@@ -1692,8 +1745,33 @@ class ApexBOSSpy:
     # -----------------------------------------------------------------------
     # Ingestion Receivers (ZeroMQ and UDP)
     # -----------------------------------------------------------------------
+    def _probe_and_attach_aux_demods(self, sock, connected_aux: Dict[str, str], target_host: str = "127.0.0.1"):
+        """Auto-detects running ApexBOSLatch (ATCS) and ApexBOSFred (EOT/HOT) on their assigned ports."""
+        try:
+            import config_loader
+        except ImportError:
+            return
+        aux_cfg = config_loader.get_aux_demod_ports()
+        host = (target_host or "127.0.0.1").strip()
+        if host.lower() in ("", "localhost"):
+            host = "127.0.0.1"
+        for tag, key in (("ATCS", "atcs"), ("EOT/HOT", "fred")):
+            port = int(aux_cfg[key]["zmq_port"])
+            ep = f"tcp://{host}:{port}"
+            if ep in connected_aux.values() or ep in self.endpoints:
+                if config_loader.is_tcp_port_open(host, port, timeout=0.10):
+                    self.active_aux_sources.add(tag)
+                continue
+            if config_loader.is_tcp_port_open(host, port, timeout=0.10):
+                try:
+                    sock.connect(ep)
+                    connected_aux[tag] = ep
+                    self.active_aux_sources.add(tag)
+                except Exception:
+                    pass
+
     def run_zmq_receiver(self):
-        """Background thread receiving ZeroMQ multipart messages from Grabber."""
+        """Background thread receiving ZeroMQ multipart messages from Grabber (+ auto-detected Latch/Fred)."""
         ctx = zmq.Context.instance()
         sock = ctx.socket(zmq.SUB)
         sock.setsockopt(zmq.SUBSCRIBE, b"")
@@ -1713,7 +1791,15 @@ class ApexBOSSpy:
             except Exception as e:
                 print(f"[!] Warning: Failed connecting to {target_ep}: {e}", file=sys.stderr)
 
+        aux_host = self.remote_host or "127.0.0.1"
+        connected_aux: Dict[str, str] = {}
+        last_aux_probe = 0.0
+
         while not self.shutdown_flag.is_set():
+            now_m = time.monotonic()
+            if (now_m - last_aux_probe) >= 2.5:
+                last_aux_probe = now_m
+                self._probe_and_attach_aux_demods(sock, connected_aux, target_host=aux_host)
             try:
                 frames = sock.recv_multipart()
                 if not frames:

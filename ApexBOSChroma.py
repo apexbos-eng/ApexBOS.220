@@ -584,11 +584,105 @@ PKT_TYPE_COLORS = {
     "TIME": (195, 115, 255),
     "QSTAT": (250, 225, 70),
     "ACK": (160, 195, 255),
+    "ATCS": (70, 185, 255),
+    "EOT": (255, 85, 155),
+    "HOT": (255, 200, 65),
+    "DPU": (255, 145, 45),
+    "RLC": (205, 115, 255),
+}
+
+# Multi-band profiles allowing Chroma to inspect 220 MHz PTC (Grabber),
+# 900 MHz ATCS (ApexBOSLatch), or 450 MHz EOT/HOT/DPU/RLC (ApexBOSFred)
+BAND_PROFILES: Dict[str, Dict[str, Any]] = {
+    "ptc": {
+        "label": "PTC 220",
+        "iq_port": DEFAULT_CHROMA_IQ_PORT,
+        "ctrl_port": DEFAULT_CHROMA_CTRL_PORT,
+        "worker_ports": [18071],
+        "center_hz": WIDEBAND_CENTER_HZ,
+        "rate_hz": WIDEBAND_SAMPLE_RATE,
+        "channels": None,  # Uses standard PTC Ch 97-176 grid
+    },
+    "atcs": {
+        "label": "ATCS 935",
+        "iq_port": 18299,
+        "ctrl_port": 18298,
+        "worker_ports": [18201],
+        "center_hz": 936437500,
+        "rate_hz": 1920000,
+        "channels": {
+            1: (935887500, "F-1"), 2: (935937500, "F-2"), 3: (935987500, "F-3"),
+            4: (936887500, "F-4"), 5: (936937500, "F-5"), 6: (936987500, "F-6"),
+            11: (896887500, "F-1M"), 12: (896937500, "F-2M"), 13: (896987500, "F-3M"),
+            14: (897887500, "F-4M"), 15: (897937500, "F-5M"), 16: (897987500, "F-6M"),
+        },
+    },
+    "atcs_mcp": {
+        "label": "ATCS 896",
+        "iq_port": 18299,
+        "ctrl_port": 18298,
+        "worker_ports": [18201],
+        "center_hz": 897437500,
+        "rate_hz": 1920000,
+        "channels": {
+            11: (896887500, "MCP1"), 12: (896937500, "MCP2"), 13: (896987500, "MCP3"),
+            14: (897887500, "MCP4"), 15: (897937500, "MCP5"), 16: (897987500, "MCP6"),
+        },
+    },
+    "fred": {
+        "label": "FRED 457",
+        "iq_port": 18399,
+        "ctrl_port": 18398,
+        "worker_ports": [18301],
+        "center_hz": 457943750,
+        "rate_hz": 960000,
+        "channels": {
+            1: (457937500, "EOT"),
+            2: (452937500, "HOT"),
+            3: (452925000, "DPU1"),
+            4: (452950000, "DPU2"),
+            5: (457925000, "DPU3"),
+            6: (457950000, "DPU4"),
+            7: (452931250, "RLC1"),
+            8: (452943750, "RLC2"),
+            9: (452956250, "RLC3"),
+            10: (452962500, "RLC4"),
+            11: (452968750, "RLC5"),
+        },
+    },
+    "fred452": {
+        "label": "FRED 452",
+        "iq_port": 18399,
+        "ctrl_port": 18398,
+        "worker_ports": [18301],
+        "center_hz": 452946875,
+        "rate_hz": 960000,
+        "channels": {
+            2: (452937500, "HOT"),
+            3: (452925000, "DPU1"),
+            4: (452950000, "DPU2"),
+            7: (452931250, "RLC1"),
+            8: (452943750, "RLC2"),
+            9: (452956250, "RLC3"),
+            10: (452962500, "RLC4"),
+            11: (452968750, "RLC5"),
+        },
+    },
 }
 
 
 def classify_blip_category(type_name: str, pkt_type: int) -> str:
     tn = (type_name or "").upper()
+    if "EOT" in tn:
+        return "EOT"
+    if "HOT" in tn:
+        return "HOT"
+    if "DPU" in tn:
+        return "DPU"
+    if "RLC" in tn:
+        return "RLC"
+    if "ATCS" in tn:
+        return "ATCS"
     if pkt_type in (0x33, 0x34) or "WIU" in tn or "WAYSIDE" in tn or "STATUS" in tn:
         return "WIU"
     if pkt_type == 0x02 or "BASE" in tn or "BEACON" in tn:
@@ -616,7 +710,13 @@ class PacketRuleEnricher:
         self.rrdata: Dict[str, str] = {}
         self.rules: List[dict] = []
         self._parse_fn = None
+        self.atcs_decoder = None
         self._load_assets()
+        try:
+            import ApexBOSLatch as _latch_mod
+            self.atcs_decoder = _latch_mod.AtcsRulesDecoder(config_dir=os.path.join(self.base_dir, "config"))
+        except Exception:
+            self.atcs_decoder = None
 
     def _load_assets(self):
         # 1. Load rrdata.json for Railroad lookup
@@ -643,6 +743,8 @@ class PacketRuleEnricher:
                 os.path.join(self.base_dir, "ptc_status_parser.json"),
             ] + sorted(glob.glob(os.path.join(self.base_dir, "config", "*rule*.json")))
             for rp in rule_candidates:
+                if os.path.basename(rp).lower() == "atcs_rules.json":
+                    continue
                 if os.path.isfile(rp):
                     try:
                         with open(rp, "r", encoding="utf-8") as f:
@@ -668,6 +770,11 @@ class PacketRuleEnricher:
 
     def enrich(self, meta: Dict[str, Any]) -> Dict[str, Any]:
         """Extracts WIU/Node ID, src, dst, railroad, and concise tag for waterfall blips."""
+        if meta.get("protocol") == "atcs" and getattr(self, "atcs_decoder", None) is not None:
+            try:
+                meta = self.atcs_decoder.decode(meta)
+            except Exception:
+                pass
         tel = meta.get("telemetry") if isinstance(meta.get("telemetry"), dict) else {}
         wiu = tel.get("wiu_id") or tel.get("radio_id") or tel.get("tid") or ""
         src = tel.get("src") or tel.get("src_id") or ""
@@ -700,7 +807,27 @@ class PacketRuleEnricher:
         cat = classify_blip_category(type_name, pkt_type)
         rr = self.lookup_railroad(wiu or src)
 
-        if src and dst:
+        if cat == "EOT" and meta.get("unit_id") is not None:
+            psi = meta.get("pressure_psi", "?")
+            short_lbl = f"EOT #{int(meta['unit_id']):05d} {psi}PSI"
+        elif cat == "HOT" and meta.get("unit_id") is not None:
+            short_lbl = f"HOT #{int(meta['unit_id']):05d}"
+        elif cat == "DPU":
+            lid = meta.get("loco_id", meta.get("unit_id", ""))
+            thr = meta.get("throttle", "")
+            short_lbl = f"DPU #{lid} {thr}".strip()
+        elif cat == "RLC":
+            ocu = int(meta.get("unit_id", 0) or 0)
+            short_lbl = f"RLC 0x{ocu:04X}"
+        elif cat == "ATCS" and (meta.get("mcp_addr") or meta.get("ctc_id")):
+            st_n = str(meta.get("atcs_station") or "").strip()
+            toks = meta.get("ctc_tokens") or []
+            tok_s = f" {','.join(toks[:3])}" if toks else ""
+            if st_n:
+                short_lbl = f"ATCS {st_n[:10]}{tok_s}"
+            else:
+                short_lbl = f"ATCS {str(meta.get('ctc_id') or meta.get('mcp_addr'))[-6:]}{tok_s}"
+        elif src and dst:
             short_lbl = f"{src}->{dst}"
         elif wiu:
             prefix = "BASE" if cat == "BASE" else ("TID" if tel.get("tid") else "WIU")
@@ -734,6 +861,7 @@ class PacketBlipSubscriber:
         self.lock = threading.Lock()
         self.blips: collections.deque = collections.deque(maxlen=max_blips)
         self.channel_stats: Dict[int, Dict[str, Any]] = {}
+        self.last_aux_summary: Dict[str, Tuple[float, str]] = {}
         self._ports: Tuple[int, ...] = ()
         self._stop_ev = threading.Event()
         self._ports_changed = threading.Event()
@@ -791,6 +919,12 @@ class PacketBlipSubscriber:
         }
         with self.lock:
             self.blips.append(blip)
+            if en["category"] == "ATCS":
+                scroll_s = str(meta.get("_scroll_ptc_") or en["short_label"])
+                self.last_aux_summary["atcs"] = (t_m, scroll_s)
+            elif en["category"] in ("EOT", "HOT", "DPU", "RLC"):
+                scroll_s = str(meta.get("_scroll_ptc_") or en["short_label"])
+                self.last_aux_summary["fred"] = (t_m, scroll_s)
             if ch > 0:
                 st = self.channel_stats.setdefault(ch, {"times": collections.deque(maxlen=300), "last_rssi": rssi, "last_df": df_hz, "last_wiu": ""})
                 st["times"].append(t_m)
@@ -1004,6 +1138,7 @@ class StandaloneSDRThread:
         self.sample_rate = int(sample_rate)
         self.gain = gain
         self.ppm = int(ppm)
+        self.requested_device_idx = int(device_idx)
         self.device_idx = int(device_idx)
         self.bias_tee = bool(bias_tee)
         self.use_mock = bool(use_mock)
@@ -1014,16 +1149,59 @@ class StandaloneSDRThread:
         self._cmd_queue: queue.Queue = queue.Queue()
         self._stop_ev = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._stream: Any = None
+        self._stream_kind: str = ""
         self.active = False
         self.error_msg: str = ""
+
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
     def start(self):
         self._stop_ev.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self, wait: bool = True, timeout: float = 2.5):
+        """
+        Signals the SDR reader thread to stop and (when wait=True) waits for it
+        to close its USB handle / subprocess so a subsequent open never hits
+        LIBUSB_ERROR_ACCESS (-3) on Windows or LIBUSB_ERROR_BUSY (-6) on Linux.
+        """
         self._stop_ev.set()
+        thr = self._thread
+        if wait and thr is not None and thr.is_alive() and thr is not threading.current_thread():
+            thr.join(timeout=min(0.6, float(timeout)))
+            if thr.is_alive():
+                # Unblock a potentially stalled subprocess pipe or TCP socket
+                st = self._stream
+                if st is not None:
+                    proc = getattr(st, "process", None)
+                    if proc is not None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        try:
+                            proc.wait(timeout=0.35)
+                        except Exception:
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=0.35)
+                            except Exception:
+                                pass
+                    sock = getattr(st, "sock", None)
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                thr.join(timeout=max(0.5, float(timeout) - 0.6))
+        while True:
+            try:
+                self._iq_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def update_hw(self, **kwargs):
         if "ppm" in kwargs and kwargs["ppm"] is not None:
@@ -1034,7 +1212,84 @@ class StandaloneSDRThread:
             self.bias_tee = bool(kwargs["bias_tee"])
         if "freq" in kwargs and kwargs["freq"] is not None:
             self.center_freq = int(kwargs["freq"])
+        if "rate" in kwargs and kwargs["rate"] is not None:
+            self.sample_rate = int(kwargs["rate"])
         self._cmd_queue.put(kwargs)
+
+    def _drain_iq_queue(self):
+        while True:
+            try:
+                self._iq_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _open_rtlsdr_with_retry(self, grabber_mod, dev_idx: int):
+        """Opens DirectRtlSdrSource with brief retries for WinUSB/libusb release settle."""
+        last_err = None
+        for attempt in range(3):
+            if self._stop_ev.is_set():
+                return None
+            try:
+                return grabber_mod.DirectRtlSdrSource(
+                    self.center_freq, self.sample_rate, self.gain, self.ppm, dev_idx, bias_tee=self.bias_tee
+                )
+            except Exception as e:
+                last_err = e
+                msg = str(e).upper()
+                transient = ("ACCESS" in msg) or ("BUSY" in msg) or ("-3" in msg) or ("-6" in msg)
+                if attempt < 2 and transient:
+                    time.sleep(0.18)
+                    continue
+                break
+        if last_err is not None:
+            raise last_err
+        return None
+
+    def _open_pipe_with_probe(self, grabber_mod, bin_p: str, read_bytes: int):
+        """
+        Opens SubprocessPipeSource and reads an initial probe chunk to verify rtl_sdr
+        actually claimed the dongle and streamed IQ. Automatically retries transient USB
+        busy, falls back to bias_tee=False for older rtl_sdr builds, and falls back to
+        device index 0 if the requested device index is absent.
+        """
+        attempts = [(self.device_idx, self.bias_tee, 0.0), (self.device_idx, self.bias_tee, 0.25)]
+        if self.bias_tee:
+            attempts.append((self.device_idx, False, 0.1))
+        if self.device_idx != 0:
+            attempts.append((0, self.bias_tee, 0.1))
+            if self.bias_tee:
+                attempts.append((0, False, 0.1))
+
+        last_err = f"rtl_sdr exited immediately without IQ data (dev #{self.device_idx})"
+        for dev_try, bt_try, delay_s in attempts:
+            if self._stop_ev.is_set():
+                return None, b""
+            if delay_s > 0:
+                time.sleep(delay_s)
+            if self._stop_ev.is_set():
+                return None, b""
+            st = None
+            try:
+                st = grabber_mod.SubprocessPipeSource(
+                    bin_p, self.center_freq, self.sample_rate, self.gain, self.ppm, dev_try, bias_tee=bt_try
+                )
+                self._stream = st
+                probe = st.read_exact_bytes(read_bytes)
+                if probe and len(probe) >= 128:
+                    self.device_idx = int(dev_try)
+                    self.bias_tee = bool(bt_try)
+                    return st, probe
+                rc = st.process.poll() if st.process is not None else None
+                last_err = f"rtl_sdr exited (rc={rc}) on dev #{dev_try} @ {self.center_freq/1e6:.3f} MHz"
+            except Exception as e:
+                last_err = str(e)
+            if st is not None:
+                try:
+                    st.close()
+                except Exception:
+                    pass
+                self._stream = None
+        raise RuntimeError(last_err)
 
     def pop_latest_iq(self) -> Optional[Tuple[Dict[str, Any], bytes]]:
         latest = None
@@ -1067,12 +1322,21 @@ class StandaloneSDRThread:
                 host = str(cfg.get("rtl_tcp_host") or "127.0.0.1")
                 port = int(cfg.get("rtl_tcp_port") or 1234)
             kind = grabber.resolve_sdr_stream_kind(_Args())
+            self._stream_kind = kind
             sample_fmt = "u8"
             bps = 2
+            prefetched_raw = b""
+            pipe_bin_path = ""
+
             if kind == "rtlsdr":
-                stream = grabber.DirectRtlSdrSource(
-                    self.center_freq, self.sample_rate, self.gain, self.ppm, self.device_idx, bias_tee=self.bias_tee
-                )
+                try:
+                    stream = self._open_rtlsdr_with_retry(grabber, self.device_idx)
+                except Exception:
+                    if self.device_idx != 0 and not self._stop_ev.is_set():
+                        self.device_idx = 0
+                        stream = self._open_rtlsdr_with_retry(grabber, 0)
+                    else:
+                        raise
             elif kind == "tcp":
                 stream = grabber.DirectRtlTcpSource(
                     _Args.host, _Args.port, self.center_freq, self.sample_rate, self.gain, self.ppm, bias_tee=self.bias_tee
@@ -1095,49 +1359,122 @@ class StandaloneSDRThread:
                 bps = stream.bytes_per_sample
                 self.sample_rate = int(stream.sample_rate)
             elif kind == "soapy":
-                stream = grabber.DirectSoapySdrSource(
-                    self.center_freq,
-                    self.sample_rate,
-                    self.gain,
-                    self.ppm,
-                    self.device_idx,
-                    bias_tee=self.bias_tee,
-                    soapy_args=cfg.get("soapy_args"),
-                    lna_state=cfg.get("rsp_lna_state"),
-                    antenna=cfg.get("rsp_antenna"),
-                )
+                try:
+                    stream = grabber.DirectSoapySdrSource(
+                        self.center_freq,
+                        self.sample_rate,
+                        self.gain,
+                        self.ppm,
+                        self.device_idx,
+                        bias_tee=self.bias_tee,
+                        soapy_args=cfg.get("soapy_args"),
+                        lna_state=cfg.get("rsp_lna_state"),
+                        antenna=cfg.get("rsp_antenna"),
+                    )
+                except Exception:
+                    if self.device_idx != 0 and not self._stop_ev.is_set():
+                        self.device_idx = 0
+                        stream = grabber.DirectSoapySdrSource(
+                            self.center_freq,
+                            self.sample_rate,
+                            self.gain,
+                            self.ppm,
+                            0,
+                            bias_tee=self.bias_tee,
+                            soapy_args=cfg.get("soapy_args"),
+                            lna_state=cfg.get("rsp_lna_state"),
+                            antenna=cfg.get("rsp_antenna"),
+                        )
+                    else:
+                        raise
                 sample_fmt = stream.sample_format
                 bps = stream.bytes_per_sample
                 self.sample_rate = int(stream.sample_rate)
             elif kind == "pipe":
-                bin_p = grabber.detect_rtl_sdr_executable(_Args.rtl_sdr_bin)
-                stream = grabber.SubprocessPipeSource(
-                    bin_p, self.center_freq, self.sample_rate, self.gain, self.ppm, self.device_idx, bias_tee=self.bias_tee
-                )
+                pipe_bin_path = grabber.detect_rtl_sdr_executable(_Args.rtl_sdr_bin)
+                probe_samps = 16384 if int(self.sample_rate) <= 300000 else 32768
+                stream, prefetched_raw = self._open_pipe_with_probe(grabber, pipe_bin_path, probe_samps * bps)
             else:
                 raise RuntimeError(f"Unsupported standalone SDR mode '{kind}'")
 
+            if stream is None or self._stop_ev.is_set():
+                return
+
+            self._stream = stream
             self.active = True
-            read_bytes = 32768 * bps
+            applied_freq = int(self.center_freq)
+            applied_rate = int(getattr(stream, "sample_rate", self.sample_rate) or self.sample_rate)
+            self.sample_rate = applied_rate
+            read_bytes = (16384 if applied_rate <= 300000 else 32768) * bps
+            pipe_empty_retries = 0
+
             while not self._stop_ev.is_set():
-                while not self._cmd_queue.empty():
+                # Coalesce any pending hardware parameter updates (including live band retunes)
+                merged_kw: Dict[str, Any] = {}
+                while True:
                     try:
                         kw = self._cmd_queue.get_nowait()
-                        stream.update_hardware_params(
-                            freq=kw.get("freq"),
-                            gain=kw.get("gain"),
-                            ppm=kw.get("ppm"),
-                            bias_tee=kw.get("bias_tee"),
-                        )
+                        for k, v in kw.items():
+                            if v is not None:
+                                merged_kw[k] = v
                     except queue.Empty:
                         break
-                raw = stream.read_exact_bytes(read_bytes)
+
+                if merged_kw:
+                    retuned = ("freq" in merged_kw) or ("rate" in merged_kw)
+                    stream.update_hardware_params(
+                        freq=merged_kw.get("freq"),
+                        rate=merged_kw.get("rate"),
+                        gain=merged_kw.get("gain"),
+                        ppm=merged_kw.get("ppm"),
+                        bias_tee=merged_kw.get("bias_tee"),
+                    )
+                    if "freq" in merged_kw:
+                        applied_freq = int(merged_kw["freq"])
+                    if "rate" in merged_kw:
+                        applied_rate = int(getattr(stream, "sample_rate", merged_kw["rate"]) or merged_kw["rate"])
+                        self.sample_rate = applied_rate
+                        read_bytes = (16384 if applied_rate <= 300000 else 32768) * bps
+                    if retuned:
+                        prefetched_raw = b""
+                        self._drain_iq_queue()
+                        # Purge 1 stale buffer from the USB FIFO / subprocess pipe after retuning
+                        if kind != "pipe":
+                            try:
+                                stream.read_exact_bytes(read_bytes)
+                            except Exception:
+                                pass
+
+                if prefetched_raw:
+                    raw = prefetched_raw
+                    prefetched_raw = b""
+                else:
+                    raw = stream.read_exact_bytes(read_bytes)
+
                 if not raw:
+                    if self._stop_ev.is_set():
+                        break
+                    if kind == "pipe" and getattr(stream, "process", None) is not None and stream.process.poll() is not None:
+                        pipe_empty_retries += 1
+                        if pipe_empty_retries <= 2:
+                            try:
+                                stream.close()
+                            except Exception:
+                                pass
+                            self._stream = None
+                            stream, prefetched_raw = self._open_pipe_with_probe(grabber, pipe_bin_path, read_bytes)
+                            if stream is None:
+                                break
+                            self._stream = stream
+                            continue
+                        raise RuntimeError(f"rtl_sdr subprocess stopped unexpectedly on dev #{self.device_idx}")
                     time.sleep(0.02)
                     continue
+
+                pipe_empty_retries = 0
                 meta = {
-                    "center_freq": self.center_freq,
-                    "sample_rate": self.sample_rate,
+                    "center_freq": applied_freq,
+                    "sample_rate": applied_rate,
                     "sample_format": sample_fmt,
                     "ppm": self.ppm,
                     "gain_db": float(self.gain) if str(self.gain).replace(".", "", 1).isdigit() else 0.0,
@@ -1156,7 +1493,8 @@ class StandaloneSDRThread:
                         pass
                 time.sleep(0.025)
         except Exception as e:
-            self.error_msg = str(e)
+            if not self._stop_ev.is_set():
+                self.error_msg = str(e)
             self.active = False
         finally:
             self.active = False
@@ -1165,6 +1503,7 @@ class StandaloneSDRThread:
                     stream.close()
                 except Exception:
                     pass
+            self._stream = None
 
     def _run_mock(self):
         """Generates realistic synthetic 220 MHz PTC bursts & packet blips for offline testing/demo."""
@@ -1180,13 +1519,17 @@ class StandaloneSDRThread:
             (162, 0.30, 310.0, 0x06, "TIME_SYNC", {"tid": "000101"}, "HR"),
         ]
         frame_idx = 0
+        last_rate = int(self.sample_rate)
         while not self._stop_ev.is_set():
-            # Drain any live control updates
+            # Drain any live control updates (including in-place band retunes)
             while not self._cmd_queue.empty():
                 try:
                     self._cmd_queue.get_nowait()
                 except queue.Empty:
                     break
+            if int(self.sample_rate) != last_rate:
+                last_rate = int(self.sample_rate)
+                t = np.arange(n_samps, dtype=np.float32) / float(max(1, last_rate))
             gain_f = float(self.gain) if str(self.gain).replace(".", "", 1).isdigit() else 20.7
             gain_scale = 0.4 + max(0.0, min(50.0, gain_f)) / 35.0
             noise = (rng.standard_normal(n_samps) + 1j * rng.standard_normal(n_samps)).astype(np.complex64) * (2.2 * gain_scale)
@@ -1286,6 +1629,7 @@ class ApexBOSChromaApp:
         wideband: bool = False,
         width: int = 1280,
         height: int = 760,
+        band: Optional[str] = None,
     ):
         import pygame
         self.pygame = pygame
@@ -1293,15 +1637,29 @@ class ApexBOSChromaApp:
         if not pygame.font.get_init():
             pygame.font.init()
 
+        self._explicit_band: bool = (band is not None)
+        self.band: str = str(band or "ptc").strip().lower()
+        if self.band not in BAND_PROFILES:
+            self.band = "ptc"
+        self._band_profile = BAND_PROFILES[self.band]
+        if self.band != "ptc":
+            if iq_port == DEFAULT_CHROMA_IQ_PORT:
+                iq_port = int(self._band_profile["iq_port"])
+            if ctrl_port == DEFAULT_CHROMA_CTRL_PORT:
+                ctrl_port = int(self._band_profile["ctrl_port"])
+
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.config_path = config_path or os.path.join(self.base_dir, config_loader.CONFIG_FILENAME)
         self.config = config_loader.load_unified_config(self.config_path) if os.path.exists(self.config_path) else {}
+        self.aux_ports_cfg = config_loader.get_aux_demod_ports(self.config)
+        self.detected_bands: Set[str] = set()
+        self._last_aux_probe: float = 0.0
         grab_cfg = self.config.get("grabber", {})
 
         self.width = max(800, int(width))
         self.height = max(520, int(height))
         self.screen = pygame.display.set_mode((self.width, self.height), pygame.RESIZABLE)
-        pygame.display.set_caption(f"ApexBOSChroma — PTC 220 MHz Spectrum & Waterfall ({VERSION})")
+        pygame.display.set_caption(f"ApexBOSChroma — {self._band_profile['label']} Spectrum & Waterfall ({VERSION})")
 
         self.clock = pygame.time.Clock()
         self.font_xs = pygame.font.SysFont("Consolas,DejaVu Sans Mono,monospace", 10)
@@ -1311,12 +1669,21 @@ class ApexBOSChromaApp:
 
         # Core DSP engine
         self.engine = ChromaSpectrumEngine(fft_size=4096, max_rows=520)
+        self.engine.center_freq = int(self._band_profile["center_hz"])
+        self.engine.sample_rate = int(self._band_profile["rate_hz"])
 
-        # Frequency viewport (Hz): default spans Ch 97-176 with slight margin
-        self.full_ptc_min_hz = float(itc_channel_frequency(PTC_CH_MIN) - 50000)
-        self.full_ptc_max_hz = float(itc_channel_frequency(PTC_CH_MAX) + 50000)
+        # Frequency viewport (Hz): default spans active band profile
+        if self.band == "ptc":
+            self.full_ptc_min_hz = float(itc_channel_frequency(PTC_CH_MIN) - 50000)
+            self.full_ptc_max_hz = float(itc_channel_frequency(PTC_CH_MAX) + 50000)
+        else:
+            half_bw = float(self._band_profile["rate_hz"]) * 0.5
+            self.full_ptc_min_hz = float(self._band_profile["center_hz"]) - half_bw
+            self.full_ptc_max_hz = float(self._band_profile["center_hz"]) + half_bw
         self.view_f_min: float = self.full_ptc_min_hz
         self.view_f_max: float = self.full_ptc_max_hz
+        if self.band in ("fred", "fred452"):
+            self.fit_to_captured_band()
 
         # dB display range
         self.min_db: float = -95.0
@@ -1350,10 +1717,13 @@ class ApexBOSChromaApp:
         self.auto_ppm: bool = bool(grab_cfg.get("auto_ppm", True))
         self.device_idx: int = int(grab_cfg.get("device", 0) or 0)
 
-        ex_ports = grab_cfg.get("ports") or []
-        if not ex_ports and grab_cfg.get("procs"):
-            ex_ports = [int(p.strip()) for p in str(grab_cfg["procs"]).split(",") if p.strip().isdigit()]
-        self.worker_ports: List[int] = [int(p) for p in ex_ports] if ex_ports else [18071]
+        if self.band != "ptc":
+            self.worker_ports = list(self._band_profile["worker_ports"])
+        else:
+            ex_ports = grab_cfg.get("ports") or []
+            if not ex_ports and grab_cfg.get("procs"):
+                ex_ports = [int(p.strip()) for p in str(grab_cfg["procs"]).split(",") if p.strip().isdigit()]
+            self.worker_ports = [int(p) for p in ex_ports] if ex_ports else [18071]
 
         # Packet blip enrichment & ZMQ SUB
         self.enricher = PacketRuleEnricher(self.base_dir)
@@ -1385,47 +1755,108 @@ class ApexBOSChromaApp:
 
     def _init_sources(self):
         if self.mode == "mock":
-            self.standalone_sdr = StandaloneSDRThread(
-                center_freq=WIDEBAND_CENTER_HZ,
-                sample_rate=WIDEBAND_SAMPLE_RATE,
-                gain=self.gain_db or 20.7,
-                ppm=self.ppm,
-                bias_tee=self.bias_tee,
-                use_mock=True,
-                blip_sub=self.blip_sub,
-            )
-            self.standalone_sdr.start()
-            self.wideband_active = True
-            self.set_toast("Running in Mock PTC Spectrum mode (synthetic bursts & blips).")
+            self._start_standalone_for_active_band(use_mock=True)
+            self.wideband_active = (self.band == "ptc")
+            self.set_toast(f"Running in Mock {self._band_profile['label']} mode (synthetic bursts & blips).")
         elif self.mode == "standalone":
             if self.gain_db <= 0.0:
                 self.gain_db = 20.7
-            self.standalone_sdr = StandaloneSDRThread(
-                center_freq=WIDEBAND_CENTER_HZ,
-                sample_rate=WIDEBAND_SAMPLE_RATE,
-                gain=self.gain_db,
-                ppm=self.ppm,
-                device_idx=self.device_idx,
-                bias_tee=self.bias_tee,
-                use_mock=False,
-                sdr_cfg=self.config.get("grabber") or {},
+            self._start_standalone_for_active_band(use_mock=False)
+            self.wideband_active = (self.band == "ptc")
+            self.set_toast(
+                f"Started Standalone SDR ({self._band_profile['label']} @ {self._band_profile['center_hz']/1e6:.4f} MHz, "
+                f"{self._band_profile['rate_hz']/1e6:.3f} MS/s, dev #{self._standalone_device_for_band()})."
             )
-            self.standalone_sdr.start()
-            self.wideband_active = True
-            self.set_toast("Started Standalone RTL-SDR mode @ 221.000 MHz (2.304 MS/s).")
         else:
+            # Auto-detect running PTC, ATCS (Latch), and EOT/HOT (Fred) demodulators on their assigned ports
+            self._probe_aux_demods(initial=True)
             self.grabber_client = GrabberIQClient(iq_port=self.iq_port, ctrl_port=self.ctrl_port)
             self.grabber_client.start()
-            self.blip_sub.start(self.worker_ports)
+            self.blip_sub.start(self._effective_blip_ports())
             state = self.grabber_client.send_control({"cmd": "get_state"}, timeout_ms=350)
             if state and state.get("ok"):
                 self._sync_state_from_dict(state)
-                if self.want_wideband and not self.wideband_active:
+                if self.want_wideband and not self.wideband_active and self.band == "ptc":
                     self._toggle_wideband(force_val=True)
                 self.fit_to_captured_band()
-                self.set_toast(f"Attached to ApexBOSGrabber ({self.engine.sample_rate/1e6:.3f} MS/s @ {self.engine.center_freq/1e6:.4f} MHz).")
+                self.set_toast(f"Attached to {self._band_profile['label']} ({self.engine.sample_rate/1e6:.3f} MS/s @ {self.engine.center_freq/1e6:.4f} MHz).")
             else:
-                self.set_toast("Waiting for ApexBOSGrabber IQ tap... (Click 'Standalone' to open SDR directly)")
+                self.set_toast(f"Waiting for {self._band_profile['label']} IQ tap... (Click 'Standalone' to open SDR directly)")
+
+    def _effective_blip_ports(self) -> List[int]:
+        """Returns active band worker ports plus any auto-detected running ATCS/FRED ZMQ PUB ports."""
+        ports = list(self.worker_ports)
+        for bk in ("atcs", "fred"):
+            if bk in self.detected_bands:
+                zp = int(self.aux_ports_cfg[bk]["zmq_port"])
+                if zp not in ports:
+                    ports.append(zp)
+        return ports
+
+    def _apply_band_profile(self, band_key: str):
+        """Applies band frequency/port profile for 'ptc', 'atcs', or 'fred'."""
+        self.band = band_key if band_key in BAND_PROFILES else "ptc"
+        self._band_profile = BAND_PROFILES[self.band]
+        if self.band == "ptc":
+            self.iq_port = int(self.aux_ports_cfg["ptc"]["chroma_port"])
+            self.ctrl_port = int(self.aux_ports_cfg["ptc"]["ctrl_port"])
+            grab_cfg = self.config.get("grabber", {})
+            ex_ports = grab_cfg.get("ports") or []
+            if not ex_ports and grab_cfg.get("procs"):
+                ex_ports = [int(p.strip()) for p in str(grab_cfg["procs"]).split(",") if p.strip().isdigit()]
+            self.worker_ports = [int(p) for p in ex_ports] if ex_ports else [18071]
+        else:
+            aux_k = "atcs" if self.band in ("atcs", "atcs_mcp") else "fred"
+            self.iq_port = int(self.aux_ports_cfg[aux_k]["chroma_port"])
+            self.ctrl_port = int(self.aux_ports_cfg[aux_k]["ctrl_port"])
+            self.worker_ports = [int(self.aux_ports_cfg[aux_k]["zmq_port"])]
+        self.engine.clear_waterfall()
+        self.engine.center_freq = int(self._band_profile["center_hz"])
+        self.engine.sample_rate = int(self._band_profile["rate_hz"])
+        if self.band == "ptc":
+            self.full_ptc_min_hz = float(itc_channel_frequency(PTC_CH_MIN) - 50000)
+            self.full_ptc_max_hz = float(itc_channel_frequency(PTC_CH_MAX) + 50000)
+        else:
+            half_bw = float(self._band_profile["rate_hz"]) * 0.5
+            self.full_ptc_min_hz = float(self._band_profile["center_hz"]) - half_bw
+            self.full_ptc_max_hz = float(self._band_profile["center_hz"]) + half_bw
+        self.view_f_min, self.view_f_max = self.full_ptc_min_hz, self.full_ptc_max_hz
+        if self.band in ("fred", "fred452"):
+            self.fit_to_captured_band()
+        self.pygame.display.set_caption(f"ApexBOSChroma — {self._band_profile['label']} Spectrum & Waterfall ({VERSION})")
+
+    def _probe_aux_demods(self, initial: bool = False):
+        """
+        Detects running PTC Grabber, ApexBOSLatch (ATCS), and ApexBOSFred (EOT/HOT) on their
+        assigned ports. Preserves PTC whenever PTC is running, auto-selects ATCS/FRED if PTC
+        is absent on startup, and auto-subscribes to live ATCS/FRED packets in all bands.
+        """
+        if self.mode == "mock":
+            return
+        detected: Set[str] = set()
+        ptc_ctrl = int(self.aux_ports_cfg["ptc"]["ctrl_port"])
+        if config_loader.is_tcp_port_open("127.0.0.1", ptc_ctrl, timeout=0.08):
+            detected.add("ptc")
+        for bk in ("atcs", "fred"):
+            z_p = int(self.aux_ports_cfg[bk]["zmq_port"])
+            c_p = int(self.aux_ports_cfg[bk]["ctrl_port"])
+            if config_loader.is_tcp_port_open("127.0.0.1", z_p, timeout=0.08) or config_loader.is_tcp_port_open("127.0.0.1", c_p, timeout=0.08):
+                detected.add(bk)
+
+        prev = set(self.detected_bands)
+        self.detected_bands = detected
+
+        if initial and not self._explicit_band and "ptc" not in detected:
+            if "atcs" in detected:
+                self._apply_band_profile("atcs")
+            elif "fred" in detected:
+                self._apply_band_profile("fred")
+
+        if not initial and detected != prev:
+            self.blip_sub.update_ports(self._effective_blip_ports())
+            newly = sorted(detected - prev)
+            if newly:
+                self.set_toast(f"Auto-detected running demodulator(s): {', '.join(b.upper() for b in newly)}")
 
     def shutdown(self):
         if self.grabber_client is not None:
@@ -1453,7 +1884,7 @@ class ApexBOSChromaApp:
             self.ppm = int(d["ppm"])
         if "gain_db" in d and d["gain_db"] is not None:
             self.gain_db = float(d["gain_db"])
-        if "bias_tee" in d and d["bias_tee"] is not None:
+        if "bias_tee" in d and d["bias_tee"] is not None and self.mode == "grabber":
             self.bias_tee = bool(d["bias_tee"])
         if "auto_ppm" in d and d["auto_ppm"] is not None:
             self.auto_ppm = bool(d["auto_ppm"])
@@ -1467,7 +1898,7 @@ class ApexBOSChromaApp:
             new_ports = [int(p) for p in d["worker_ports"]]
             if new_ports != self.worker_ports:
                 self.worker_ports = new_ports
-                self.blip_sub.update_ports(new_ports)
+                self.blip_sub.update_ports(self._effective_blip_ports())
 
     # ----- Geometry & Coordinate Helpers -----
     def _layout_rects(self):
@@ -1476,7 +1907,7 @@ class ApexBOSChromaApp:
         footer_h = 26
         left_axis_w = 56
         right_pad = 14
-        ruler_h = 28
+        ruler_h = 30
 
         plot_w = max(200, self.width - left_axis_w - right_pad)
         avail_h = max(200, self.height - top_h - footer_h - ruler_h)
@@ -1506,7 +1937,7 @@ class ApexBOSChromaApp:
     def zoom_at_freq(self, anchor_freq: float, factor: float):
         """Zooms horizontal frequency window around anchor_freq (factor < 1 zooms in)."""
         cur_span = self.view_f_max - self.view_f_min
-        min_span = 30000.0  # Down to ~1.2 PTC channels (30 kHz)
+        min_span = 15000.0 if self.band in ("fred", "fred452") else 30000.0
         max_span = max(self.full_ptc_max_hz - self.full_ptc_min_hz, float(self.engine.sample_rate) * 1.15)
         new_span = max(min_span, min(max_span, cur_span * factor))
         frac = (anchor_freq - self.view_f_min) / max(1.0, cur_span)
@@ -1528,6 +1959,28 @@ class ApexBOSChromaApp:
         self.view_f_max = f_max
 
     def fit_to_captured_band(self):
+        if self.band in ("fred", "fred452"):
+            # Tightly frame the active FRED 457/452 channel group (12.5 kHz channels) while SDR runs
+            # at alias-free 960 kS/s; users can still zoom out with mouse wheel up to full captured span.
+            custom_chans = self._band_profile.get("channels") or {}
+            cap_lo = self.engine.center_freq - self.engine.sample_rate * 0.5
+            cap_hi = self.engine.center_freq + self.engine.sample_rate * 0.5
+            mon = getattr(self, "monitored_channels", None) or set()
+            in_band_freqs = [
+                float(fc)
+                for ch, (fc, _) in custom_chans.items()
+                if cap_lo <= fc <= cap_hi and (not mon or ch in mon)
+            ]
+            if not in_band_freqs:
+                in_band_freqs = [float(fc) for _, (fc, _) in custom_chans.items() if cap_lo <= fc <= cap_hi]
+            if in_band_freqs:
+                lo_f = min(in_band_freqs)
+                hi_f = max(in_band_freqs)
+                span_ch = hi_f - lo_f
+                pad = max(25000.0, span_ch * 0.45)
+                self.view_f_min = lo_f - pad
+                self.view_f_max = hi_f + pad
+                return
         if self.engine.sample_rate >= 2000000:
             self.view_f_min = self.full_ptc_min_hz
             self.view_f_max = self.full_ptc_max_hz
@@ -1626,6 +2079,51 @@ class ApexBOSChromaApp:
         elif resp and resp.get("error"):
             self.set_toast(f"Ch {ch}: {resp['error']}")
 
+    def _standalone_device_for_band(self, band_key: Optional[str] = None) -> int:
+        bk = band_key or self.band
+        if bk in ("atcs", "atcs_mcp"):
+            return int(self.aux_ports_cfg.get("atcs", {}).get("device", self.device_idx))
+        if bk in ("fred", "fred452"):
+            return int(self.aux_ports_cfg.get("fred", {}).get("device", self.device_idx))
+        return int(self.device_idx)
+
+    def _start_standalone_for_active_band(self, use_mock: bool = False):
+        prof = self._band_profile
+        c_hz = int(prof["center_hz"])
+        r_hz = int(prof["rate_hz"])
+        dev = self._standalone_device_for_band()
+        bt_target = bool(self.bias_tee) if self.band == "ptc" else False
+        self.engine.center_freq = c_hz
+        self.engine.sample_rate = r_hz
+
+        cur = self.standalone_sdr
+        if cur is not None and cur.is_alive() and cur.use_mock == use_mock and cur.active:
+            same_dev = (dev == cur.device_idx) or (dev == cur.requested_device_idx)
+            if use_mock or same_dev:
+                # Retune the already-open SDR in place (avoids USB close/reopen races & LIBUSB_ERROR_ACCESS)
+                cur.update_hw(freq=c_hz, rate=r_hz, bias_tee=bt_target)
+                return
+
+        if cur is not None:
+            # Synchronously close & join the previous SDR handle/subprocess before opening a new one
+            cur.stop(wait=True, timeout=2.5)
+            self.standalone_sdr = None
+            if not use_mock:
+                time.sleep(0.08)
+
+        self.standalone_sdr = StandaloneSDRThread(
+            center_freq=c_hz,
+            sample_rate=r_hz,
+            gain=self.gain_db or 20.7,
+            ppm=self.ppm,
+            device_idx=dev,
+            bias_tee=bt_target,
+            use_mock=use_mock,
+            blip_sub=self.blip_sub if use_mock else None,
+            sdr_cfg=self.config.get("grabber") or {},
+        )
+        self.standalone_sdr.start()
+
     def _switch_to_standalone(self):
         if self.mode == "standalone":
             return
@@ -1635,19 +2133,32 @@ class ApexBOSChromaApp:
         self.mode = "standalone"
         if self.gain_db <= 0.0:
             self.gain_db = 20.7
-        self.standalone_sdr = StandaloneSDRThread(
-            center_freq=WIDEBAND_CENTER_HZ,
-            sample_rate=WIDEBAND_SAMPLE_RATE,
-            gain=self.gain_db,
-            ppm=self.ppm,
-            device_idx=self.device_idx,
-            bias_tee=self.bias_tee,
-            use_mock=False,
-            sdr_cfg=self.config.get("grabber") or {},
+        self._start_standalone_for_active_band(use_mock=False)
+        self.wideband_active = (self.band == "ptc")
+        self.set_toast(
+            f"Switched to Standalone SDR ({self._band_profile['label']} @ {self._band_profile['center_hz']/1e6:.4f} MHz, "
+            f"{self._band_profile['rate_hz']/1e6:.3f} MS/s, dev #{self._standalone_device_for_band()})."
         )
-        self.standalone_sdr.start()
-        self.wideband_active = True
-        self.set_toast("Switched to Standalone RTL-SDR mode @ 221.000 MHz (2.304 MS/s).")
+
+    def _cycle_band(self):
+        order = ["ptc", "atcs", "atcs_mcp", "fred", "fred452"] if self.mode in ("standalone", "mock") else ["ptc", "atcs", "fred"]
+        nxt = order[(order.index(self.band) + 1) % len(order)] if self.band in order else "ptc"
+        self._explicit_band = True
+        self._apply_band_profile(nxt)
+        if self.mode == "grabber":
+            if self.grabber_client:
+                self.grabber_client.stop()
+            self.grabber_client = GrabberIQClient(iq_port=self.iq_port, ctrl_port=self.ctrl_port)
+            self.grabber_client.start()
+            self.blip_sub.update_ports(self._effective_blip_ports())
+            self.set_toast(f"Switched Chroma band -> {self._band_profile['label']} (IQ:{self.iq_port}, Ctrl:{self.ctrl_port})")
+        else:
+            self._start_standalone_for_active_band(use_mock=(self.mode == "mock"))
+            self.wideband_active = (self.band == "ptc")
+            self.set_toast(
+                f"Standalone SDR -> {self._band_profile['label']} @ {self._band_profile['center_hz']/1e6:.4f} MHz "
+                f"({self._band_profile['rate_hz']/1e6:.3f} MS/s, dev #{self._standalone_device_for_band()})"
+            )
 
     def _cycle_fft_size(self):
         sizes = [2048, 4096, 8192, 16384]
@@ -1667,6 +2178,9 @@ class ApexBOSChromaApp:
     # ----- Data Polling -----
     def poll_sources(self):
         now_m = time.monotonic()
+        if self.mode == "grabber" and (now_m - self._last_aux_probe) >= 3.0:
+            self._last_aux_probe = now_m
+            self._probe_aux_demods(initial=False)
         item = None
         if self.mode == "grabber" and self.grabber_client:
             item = self.grabber_client.pop_latest_iq()
@@ -1743,6 +2257,11 @@ class ApexBOSChromaApp:
         self._draw_btn("mode_badge", pygame.Rect(x, y1, bw, h1), badge_txt, bg=badge_bg)
         x += bw + 6
 
+        band_txt = f"Band:{self._band_profile['label']}"
+        band_w = self.font_sm_bold.size(band_txt)[0] + 10
+        self._draw_btn("cycle_band", pygame.Rect(x, y1, band_w, h1), band_txt, bg=(42, 62, 92), cb=self._cycle_band)
+        x += band_w + 6
+
         if self.mode == "grabber" and not is_live:
             sw_txt = "Standalone SDR"
             sw_w = self.font_sm_bold.size(sw_txt)[0] + 12
@@ -1750,7 +2269,8 @@ class ApexBOSChromaApp:
             x += sw_w + 6
 
         if self.mode == "grabber":
-            wb_txt = "BW:Wide(2.30M)" if self.wideband_active else f"BW:Native({self.engine.sample_rate/1e6:.2f}M)"
+            sr_lbl = f"{self.engine.sample_rate/1e3:.0f}k" if self.engine.sample_rate < 1000000 else f"{self.engine.sample_rate/1e6:.2f}M"
+            wb_txt = "BW:Wide(2.30M)" if self.wideband_active else f"BW:Native({sr_lbl})"
             wb_w = self.font_sm_bold.size(wb_txt)[0] + 12
             self._draw_btn("toggle_wb", pygame.Rect(x, y1, wb_w, h1), wb_txt, bg=COLOR_BTN_ON if self.wideband_active else COLOR_BTN, cb=self._toggle_wideband)
             x += wb_w + 8
@@ -1863,15 +2383,30 @@ class ApexBOSChromaApp:
 
         # Monitored & locked channel vertical tint bands
         band_surf = pygame.Surface((spec_rect.width, spec_rect.height), pygame.SRCALPHA)
-        for ch in self.monitored_channels:
-            fc = itc_channel_frequency(ch)
-            if fc + 12500 < self.view_f_min or fc - 12500 > self.view_f_max:
-                continue
-            bx0 = int(self.freq_to_x(fc - 12500, spec_rect)) - spec_rect.x
-            bx1 = int(self.freq_to_x(fc + 12500, spec_rect)) - spec_rect.x
-            bw = max(2, bx1 - bx0)
-            col = (255, 195, 55, 28) if ch in self.locked_channels else (45, 220, 255, 24)
-            pygame.draw.rect(band_surf, col, (bx0, 0, bw, spec_rect.height))
+        custom_chans = self._band_profile.get("channels")
+        if custom_chans:
+            half_bw_hz = 6250  # 12.5 kHz narrowband channel width for Fred (EOT/HOT/DPU/RLC) & Latch (ATCS)
+            for ch in self.monitored_channels:
+                if ch not in custom_chans:
+                    continue
+                fc = custom_chans[ch][0]
+                if fc + half_bw_hz < self.view_f_min or fc - half_bw_hz > self.view_f_max:
+                    continue
+                bx0 = int(self.freq_to_x(fc - half_bw_hz, spec_rect)) - spec_rect.x
+                bx1 = int(self.freq_to_x(fc + half_bw_hz, spec_rect)) - spec_rect.x
+                bw = max(2, bx1 - bx0)
+                col = (255, 195, 55, 28) if ch in self.locked_channels else (45, 220, 255, 24)
+                pygame.draw.rect(band_surf, col, (bx0, 0, bw, spec_rect.height))
+        else:
+            for ch in self.monitored_channels:
+                fc = itc_channel_frequency(ch)
+                if fc + 12500 < self.view_f_min or fc - 12500 > self.view_f_max:
+                    continue
+                bx0 = int(self.freq_to_x(fc - 12500, spec_rect)) - spec_rect.x
+                bx1 = int(self.freq_to_x(fc + 12500, spec_rect)) - spec_rect.x
+                bw = max(2, bx1 - bx0)
+                col = (255, 195, 55, 28) if ch in self.locked_channels else (45, 220, 255, 24)
+                pygame.draw.rect(band_surf, col, (bx0, 0, bw, spec_rect.height))
         self.screen.blit(band_surf, spec_rect.topleft)
 
         # Horizontal dBFS gridlines
@@ -1883,18 +2418,27 @@ class ApexBOSChromaApp:
             lbl = self.font_xs.render(f"{dbv:>4d}", True, COLOR_TEXT_DIM)
             self.screen.blit(lbl, (axis_rect.right - lbl.get_width() - 6, gy - 5))
 
-        # Vertical PTC channel gridlines
-        first_ch = max(PTC_CH_MIN, int(math.floor((self.view_f_min - PTC_BASE_HZ) / PTC_STEP_HZ)))
-        last_ch = min(PTC_CH_MAX, int(math.ceil((self.view_f_max - PTC_BASE_HZ) / PTC_STEP_HZ)))
-        px_per_ch = (PTC_STEP_HZ / max(1.0, self.view_f_max - self.view_f_min)) * spec_rect.width
-        ch_step = 1 if px_per_ch >= 14 else (2 if px_per_ch >= 7 else 5)
-        for ch in range(first_ch, last_ch + 1):
-            if ch % ch_step != 0 and ch not in self.monitored_channels:
-                continue
-            cx = int(self.freq_to_x(itc_channel_frequency(ch), spec_rect))
-            if spec_rect.left <= cx <= spec_rect.right:
-                gcol = (40, 72, 92) if ch in self.monitored_channels else (22, 31, 44)
-                pygame.draw.line(self.screen, gcol, (cx, spec_rect.top), (cx, spec_rect.bottom), 1)
+        # Vertical channel gridlines
+        if custom_chans:
+            for ch, (fc, _) in custom_chans.items():
+                if fc < self.view_f_min or fc > self.view_f_max:
+                    continue
+                cx = int(self.freq_to_x(fc, spec_rect))
+                if spec_rect.left <= cx <= spec_rect.right:
+                    gcol = (40, 72, 92) if ch in self.monitored_channels else (22, 31, 44)
+                    pygame.draw.line(self.screen, gcol, (cx, spec_rect.top), (cx, spec_rect.bottom), 1)
+        else:
+            first_ch = max(PTC_CH_MIN, int(math.floor((self.view_f_min - PTC_BASE_HZ) / PTC_STEP_HZ)))
+            last_ch = min(PTC_CH_MAX, int(math.ceil((self.view_f_max - PTC_BASE_HZ) / PTC_STEP_HZ)))
+            px_per_ch = (PTC_STEP_HZ / max(1.0, self.view_f_max - self.view_f_min)) * spec_rect.width
+            ch_step = 1 if px_per_ch >= 14 else (2 if px_per_ch >= 7 else 5)
+            for ch in range(first_ch, last_ch + 1):
+                if ch % ch_step != 0 and ch not in self.monitored_channels:
+                    continue
+                cx = int(self.freq_to_x(itc_channel_frequency(ch), spec_rect))
+                if spec_rect.left <= cx <= spec_rect.right:
+                    gcol = (40, 72, 92) if ch in self.monitored_channels else (22, 31, 44)
+                    pygame.draw.line(self.screen, gcol, (cx, spec_rect.top), (cx, spec_rect.bottom), 1)
 
         # Noise floor horizontal reference line
         nf_y = self.db_to_y(self.engine.noise_floor_db, spec_rect)
@@ -1948,11 +2492,74 @@ class ApexBOSChromaApp:
         pygame.draw.line(self.screen, COLOR_BORDER, (ruler_rect.left, ruler_rect.top), (ruler_rect.right, ruler_rect.top), 1)
         pygame.draw.line(self.screen, COLOR_BORDER, (ruler_rect.left, ruler_rect.bottom - 1), (ruler_rect.right, ruler_rect.bottom - 1), 1)
 
+        ch_ppm = self.blip_sub.get_channel_ppm_counts(now_mono, 60.0)
+        custom_chans = self._band_profile.get("channels")
+        if custom_chans:
+            vis_chans = sorted(
+                [(ch, fc, short_name) for ch, (fc, short_name) in custom_chans.items() if self.view_f_min <= fc <= self.view_f_max],
+                key=lambda item: item[1],
+            )
+            min_px_gap = 999.0
+            for idx_c in range(1, len(vis_chans)):
+                g = abs(self.freq_to_x(vis_chans[idx_c][1], ruler_rect) - self.freq_to_x(vis_chans[idx_c - 1][1], ruler_rect))
+                if g < min_px_gap:
+                    min_px_gap = g
+            last_lbl_right = -1000
+            last_freq_right = -1000
+            half_w_hz = 6250  # 12.5 kHz channel width for EOT, HOT, DPU, RLC, and ATCS
+            for ch, fc, short_name in vis_chans:
+                cx = int(self.freq_to_x(fc, ruler_rect))
+                if cx < ruler_rect.left or cx > ruler_rect.right:
+                    continue
+                bx0 = max(ruler_rect.left, int(self.freq_to_x(fc - half_w_hz, ruler_rect)))
+                bx1 = min(ruler_rect.right, int(self.freq_to_x(fc + half_w_hz, ruler_rect)))
+                bw = max(6, bx1 - bx0)
+                ch_rect = pygame.Rect(bx0, ruler_rect.top + 1, bw, ruler_rect.height - 2)
+                self.channel_hit_rects.append((ch_rect, ch))
+
+                is_mon = ch in self.monitored_channels
+                is_lock = ch in self.locked_channels
+                if is_mon:
+                    bg = (55, 50, 22) if is_lock else (20, 56, 72)
+                    bd = COLOR_ACCENT if is_lock else COLOR_CYAN
+                    pygame.draw.rect(self.screen, bg, ch_rect)
+                    pygame.draw.rect(self.screen, bd, ch_rect, 1)
+
+                # Activity mini-bar at top of channel slot (matches PTC Band)
+                cnt = ch_ppm.get(ch, 0)
+                if cnt > 0:
+                    bar_w = max(2, min(bw - 2, int(bw * min(1.0, cnt / 20.0))))
+                    pygame.draw.rect(self.screen, COLOR_GREEN, (bx0 + 1, ruler_rect.top + 2, bar_w, 3))
+
+                pygame.draw.line(self.screen, COLOR_ACCENT if is_lock else (COLOR_CYAN if is_mon else COLOR_BORDER), (cx, ruler_rect.top), (cx, ruler_rect.top + 4), 1)
+
+                # Line 1: channel number / mnemonic (mirrors PTC channel flag top line)
+                if min_px_gap >= 40.0:
+                    tag = f"{ch}:{short_name}." if is_lock else f"{ch}:{short_name}"
+                elif min_px_gap >= 24.0:
+                    tag = f"{short_name}." if is_lock else short_name
+                else:
+                    tag = f"{ch}." if is_lock else str(ch)
+                col = COLOR_ACCENT if is_lock else (COLOR_CYAN if is_mon else COLOR_TEXT)
+                ts = self.font_xs.render(tag, True, col)
+                lx = cx - ts.get_width() // 2
+                if lx >= last_lbl_right + 2:
+                    self.screen.blit(ts, (lx, ruler_rect.top + 5))
+                    last_lbl_right = lx + ts.get_width()
+
+                # Line 2: channel frequency in MHz (mirrors PTC channel flag second line)
+                freq_txt = f"{fc/1e6:.5f}" if (fc % 1000) != 0 else f"{fc/1e6:.4f}"
+                fs = self.font_xs.render(freq_txt, True, COLOR_TEXT_DIM)
+                fx = cx - fs.get_width() // 2
+                if fx >= last_freq_right + 3:
+                    self.screen.blit(fs, (fx, ruler_rect.top + 16))
+                    last_freq_right = fx + fs.get_width()
+            return
+
         first_ch = max(PTC_CH_MIN, int(math.floor((self.view_f_min - PTC_BASE_HZ) / PTC_STEP_HZ)))
         last_ch = min(PTC_CH_MAX, int(math.ceil((self.view_f_max - PTC_BASE_HZ) / PTC_STEP_HZ)))
         px_per_ch = (PTC_STEP_HZ / max(1.0, self.view_f_max - self.view_f_min)) * ruler_rect.width
         lbl_step = 1 if px_per_ch >= 28 else (2 if px_per_ch >= 15 else (5 if px_per_ch >= 7 else 10))
-        ch_ppm = self.blip_sub.get_channel_ppm_counts(now_mono, 60.0)
 
         for ch in range(first_ch, last_ch + 1):
             fc = itc_channel_frequency(ch)
@@ -2008,8 +2615,14 @@ class ApexBOSChromaApp:
         self.screen.blit(wf_surf, wf_rect.topleft)
 
         # Subtle monitored channel edge ticks on waterfall
+        custom_chans = self._band_profile.get("channels")
         for ch in self.monitored_channels:
-            fc = itc_channel_frequency(ch)
+            if custom_chans:
+                if ch not in custom_chans:
+                    continue
+                fc = custom_chans[ch][0]
+            else:
+                fc = itc_channel_frequency(ch)
             if fc < self.view_f_min or fc > self.view_f_max:
                 continue
             cx = int(self.freq_to_x(fc, wf_rect))
@@ -2123,20 +2736,37 @@ class ApexBOSChromaApp:
         cursor_info = ""
         if spec_rect.collidepoint(mx, my) or wf_rect.collidepoint(mx, my):
             f_cur = self.x_to_freq(mx, spec_rect)
-            ch_near, ch_off = freq_to_nearest_channel(f_cur)
             db_str = ""
             if spec_rect.collidepoint(mx, my):
                 db_cur = self.min_db + ((spec_rect.bottom - my) / float(max(1, spec_rect.height))) * (self.max_db - self.min_db)
                 db_str = f" | {db_cur:.1f} dBFS"
-            cursor_info = f"Cursor: {f_cur/1e6:.4f} MHz (Ch {ch_near} {ch_off/1e3:+.1f} kHz){db_str}  |  "
+            custom_chans = self._band_profile.get("channels")
+            if custom_chans:
+                near_ch, (near_fc, near_lbl) = min(custom_chans.items(), key=lambda kv: abs(f_cur - kv[1][0]))
+                ch_off = f_cur - float(near_fc)
+                cursor_info = f"Cursor: {f_cur/1e6:.5f} MHz ({near_lbl} {ch_off/1e3:+.1f} kHz){db_str}  |  "
+            else:
+                ch_near, ch_off = freq_to_nearest_channel(f_cur)
+                cursor_info = f"Cursor: {f_cur/1e6:.4f} MHz (Ch {ch_near} {ch_off/1e3:+.1f} kHz){db_str}  |  "
 
         fps = self.clock.get_fps()
         agc_tag = f" | AGC-Stab:{self.engine.agc_comp_db:+.1f}dB" if (self.gain_db <= 0.0 and self.mode != "mock") else ""
+        aux_parts: List[str] = []
+        if self.detected_bands:
+            aux_live = [b.upper() for b in ("ptc", "atcs", "fred") if b in self.detected_bands]
+            if any(b in self.detected_bands for b in ("atcs", "fred")):
+                aux_parts.append(f"Live:[{'/'.join(aux_live)}]")
+        with self.blip_sub.lock:
+            for ak in ("atcs", "fred"):
+                ent = self.blip_sub.last_aux_summary.get(ak)
+                if ent and (time.monotonic() - ent[0]) < 120.0:
+                    aux_parts.append(ent[1][:54])
+        aux_str = (" | " + " | ".join(aux_parts)) if aux_parts else ""
         info = (
             f"{cursor_info}"
             f"Center: {self.engine.center_freq/1e6:.4f} MHz | Rate: {self.engine.sample_rate/1e6:.3f} MS/s | "
             f"Mon: {len(self.monitored_channels)} ch ({len(self.locked_channels)} lock){agc_tag} | "
-            f"dB:[{self.min_db:.0f},{self.max_db:.0f}] | {fps:.0f} FPS | {self.status_toast}"
+            f"dB:[{self.min_db:.0f},{self.max_db:.0f}] | {fps:.0f} FPS{aux_str} | {self.status_toast}"
         )
         surf = self.font_sm.render(info, True, COLOR_TEXT)
         self.screen.blit(surf, (10, fy + 5))
@@ -2277,7 +2907,8 @@ def build_chroma_cli_parser() -> argparse.ArgumentParser:
         description=f"ApexBOSChroma ({VERSION}) - PTC 220 MHz Spectrum Analyzer & Waterfall"
     )
     parser.add_argument("--config", default=None, help="Path to unified config.json")
-    parser.add_argument("--chroma-port", type=int, default=DEFAULT_CHROMA_IQ_PORT, help=f"Grabber XPUB IQ tap port (default: {DEFAULT_CHROMA_IQ_PORT})")
+    parser.add_argument("--band", default=None, choices=["ptc", "atcs", "atcs_mcp", "fred", "fred452"], help="RF band profile (auto-detects PTC/ATCS/FRED if omitted)")
+    parser.add_argument("--chroma-port", type=int, default=DEFAULT_CHROMA_IQ_PORT, help=f"Demodulator XPUB IQ tap port (default: {DEFAULT_CHROMA_IQ_PORT})")
     parser.add_argument("--ctrl-port", type=int, default=DEFAULT_CHROMA_CTRL_PORT, help=f"Grabber REP control port (default: {DEFAULT_CHROMA_CTRL_PORT})")
     parser.add_argument("--wideband", action="store_true", default=False, help="Automatically expand Grabber to 2.304 MS/s wideband on connect")
     parser.add_argument("--standalone", action="store_true", default=False, help="Open RTL-SDR directly without attaching to Grabber")
@@ -2299,6 +2930,7 @@ def main():
         wideband=args.wideband,
         width=args.width,
         height=args.height,
+        band=args.band,
     )
     app.run()
 

@@ -351,6 +351,8 @@ def spawn_in_new_terminal(
 
 SUBSYSTEM_SCRIPTS = {
     "grabber": "ApexBOSGrabber.py",
+    "latch": "ApexBOSLatch.py",
+    "fred": "ApexBOSFred.py",
     "flux": "ApexBOSFlux.py",
     "engine": "ApexBOS.220.py",
     "viewer": "View_ApexBOS.220.py",
@@ -416,7 +418,7 @@ class ProcessManager:
                 continue
 
             # Check single subsystems
-            for skey in ("grabber", "flux", "banc", "creator", "chroma", "spy", "packfig", "scanner"):
+            for skey in ("grabber", "latch", "fred", "flux", "banc", "creator", "chroma", "spy", "packfig", "scanner"):
                 script = SUBSYSTEM_SCRIPTS.get(skey)
                 if script and script.lower() in cmd_low and skey not in live:
                     live[skey] = int(p["pid"])
@@ -674,6 +676,88 @@ class ProcessManager:
             with self._lock:
                 self._starting_until["grabber"] = time.time() + 2.5
             self.set_toast(f"Started ApexBOSGrabber (SDR #{device_idx}, {num_procs} procs, {ch_count} chans).")
+
+    def _build_aux_demod_args(self, kind: str) -> List[str]:
+        """Builds CLI args for ApexBOSLatch ('latch') or ApexBOSFred ('fred') from config.json."""
+        grabber_cfg = self.config.get("grabber", {}) if isinstance(self.config.get("grabber"), dict) else {}
+        sec = self.config.get(kind, {}) if isinstance(self.config.get(kind), dict) else {}
+        def_dev = config_loader.DEFAULT_ATCS_DEVICE if kind == "latch" else config_loader.DEFAULT_FRED_DEVICE
+        def_chans = "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6" if kind == "latch" else "EOT,DPU3,DPU4"
+        dev_idx = int(sec.get("device", def_dev) if sec.get("device") is not None else def_dev)
+        chans_s = str(sec.get("chans") or def_chans).strip()
+        args = ["--device", str(dev_idx)]
+        if chans_s:
+            args.extend(["--chans", chans_s])
+        sdr_mode = str(sec.get("sdr_mode") or grabber_cfg.get("sdr_mode") or "auto").strip().lower()
+        if sdr_mode and sdr_mode != "auto":
+            args.extend(["--sdr-mode", sdr_mode])
+        if sdr_mode == "rsptcp":
+            args.append("--rsp-tcp")
+            if grabber_cfg.get("rsp_extended"):
+                args.append("--rsp-16bit")
+            if grabber_cfg.get("rsp_tcp_bin"):
+                args.extend(["--rsp-tcp-bin", str(grabber_cfg["rsp_tcp_bin"])])
+        elif sdr_mode == "soapy":
+            args.append("--soapy")
+            if grabber_cfg.get("soapy_args"):
+                args.extend(["--soapy-args", str(grabber_cfg["soapy_args"])])
+        if grabber_cfg.get("rtl_sdr_bin"):
+            args.extend(["--rtl-sdr-bin", str(grabber_cfg["rtl_sdr_bin"])])
+        if grabber_cfg.get("rtlsdr_dll_dir"):
+            args.extend(["--rtlsdr-dll-dir", str(grabber_cfg["rtlsdr_dll_dir"])])
+        gain_v = sec.get("gain")
+        if gain_v is None or not str(gain_v).strip():
+            gain_v = grabber_cfg.get("gain")
+        if gain_v is not None and str(gain_v).strip():
+            args.extend(["--gain", str(gain_v).strip()])
+        ppm_v = sec.get("ppm")
+        if ppm_v is None or str(ppm_v).strip() == "":
+            ppm_v = grabber_cfg.get("ppm", 0)
+        if ppm_v is not None and str(ppm_v).strip() != "":
+            args.extend(["--ppm", str(ppm_v).strip()])
+        if sec.get("zmq_port"):
+            args.extend(["--zmq-port", str(sec["zmq_port"])])
+        if sec.get("chroma_port"):
+            args.extend(["--chroma-port", str(sec["chroma_port"])])
+        if sec.get("ctrl_port"):
+            args.extend(["--ctrl-port", str(sec["ctrl_port"])])
+        return args
+
+    def start_latch(self):
+        """Starts ApexBOSLatch (900 MHz ATCS) in its own terminal window."""
+        if self.is_running("latch"):
+            self.set_toast("ApexBOSLatch is already running.")
+            return
+        sec = self.config.get("latch", {}) if isinstance(self.config.get("latch"), dict) else {}
+        dev_idx = int(sec.get("device", config_loader.DEFAULT_ATCS_DEVICE))
+        args = self._build_aux_demod_args("latch")
+        title = f"ApexBOSLatch ATCS 900 MHz (SDR #{dev_idx})"
+        marker = get_stop_marker_path("latch")
+        _clear_stop_marker(marker)
+        p = spawn_in_new_terminal(title, "ApexBOSLatch.py", args, cwd=self.work_dir, stop_marker=marker)
+        if p:
+            self.procs["latch"] = p
+            with self._lock:
+                self._starting_until["latch"] = time.time() + 2.5
+            self.set_toast(f"Started ApexBOSLatch (ATCS, SDR #{dev_idx}).")
+
+    def start_fred(self):
+        """Starts ApexBOSFred (450 MHz EOT/HOT/DPU/RLC) in its own terminal window."""
+        if self.is_running("fred"):
+            self.set_toast("ApexBOSFred is already running.")
+            return
+        sec = self.config.get("fred", {}) if isinstance(self.config.get("fred"), dict) else {}
+        dev_idx = int(sec.get("device", config_loader.DEFAULT_FRED_DEVICE))
+        args = self._build_aux_demod_args("fred")
+        title = f"ApexBOSFred EOT/HOT/DPU/RLC 450 MHz (SDR #{dev_idx})"
+        marker = get_stop_marker_path("fred")
+        _clear_stop_marker(marker)
+        p = spawn_in_new_terminal(title, "ApexBOSFred.py", args, cwd=self.work_dir, stop_marker=marker)
+        if p:
+            self.procs["fred"] = p
+            with self._lock:
+                self._starting_until["fred"] = time.time() + 2.5
+            self.set_toast(f"Started ApexBOSFred (EOT/HOT/DPU/RLC, SDR #{dev_idx}).")
 
     def start_scanner(self, dwell: float = 3.5, update_config: bool = False) -> Optional[subprocess.Popen]:
         """
@@ -1189,6 +1273,12 @@ class ProcessManager:
                 args.extend(["--ppm", str(ppm_val).strip()])
             return subprocess.list2cmdline(args)
 
+        if key_low == "latch":
+            return subprocess.list2cmdline([py_exe, "ApexBOSLatch.py"] + self._build_aux_demod_args("latch"))
+
+        if key_low == "fred":
+            return subprocess.list2cmdline([py_exe, "ApexBOSFred.py"] + self._build_aux_demod_args("fred"))
+
         if key_low == "flux":
             return subprocess.list2cmdline([py_exe, "ApexBOSFlux.py", "--config", "config.json", "--display"])
 
@@ -1303,6 +1393,13 @@ class ApexBOSLauncherApp:
         self.font_tiny = pygame.font.SysFont("Consolas,DejaVu Sans Mono,monospace", 10)
 
         self.mgr = ProcessManager(config_path)
+        latch_on = bool((self.mgr.config.get("latch") or {}).get("enabled", True))
+        fred_on = bool((self.mgr.config.get("fred") or {}).get("enabled", True))
+        is_ev_init = str(self.mgr.config.get("common", {}).get("deployment_mode", "")).lower() in ("engines_viewers", "client", "display")
+        extra_rows = (0 if is_ev_init else ((1 if latch_on else 0) + (1 if fred_on else 0)))
+        if extra_rows > 0:
+            self.height = 760 + extra_rows * 36
+            self.screen = pygame.display.set_mode((self.width, self.height))
         self.buttons: Dict[str, ButtonEntry] = {}
         self.modal_buttons: Dict[str, ButtonEntry] = {}
         self._modal_mode: Optional[str] = None  # None, "dwell_prompt", or "scan_complete"
@@ -1521,20 +1618,42 @@ class ApexBOSLauncherApp:
         is_ev = str(self.mgr.config.get("common", {}).get("deployment_mode", "")).lower() in ("engines_viewers", "client", "display")
         single_items = []
         if not is_ev:
-            single_items.extend([
-                (
-                    "grabber",
-                    f"ApexBOSGrabber SDR #{dev_idx} ({num_procs} procs, ZMQ {ports_str})",
-                    self.mgr.start_grabber,
-                    lambda: self.mgr.stop_process("grabber"),
-                ),
-                (
-                    "flux",
-                    "ApexBOSFlux Relay",
-                    self.mgr.start_flux,
-                    lambda: self.mgr.stop_process("flux"),
-                ),
-            ])
+            single_items.append((
+                "grabber",
+                f"ApexBOSGrabber SDR #{dev_idx} ({num_procs} procs, ZMQ {ports_str})",
+                self.mgr.start_grabber,
+                lambda: self.mgr.stop_process("grabber"),
+            ))
+            latch_cfg = self.mgr.config.get("latch", {}) if isinstance(self.mgr.config.get("latch"), dict) else {}
+            if bool(latch_cfg.get("enabled", True)):
+                l_dev = latch_cfg.get("device", config_loader.DEFAULT_ATCS_DEVICE)
+                l_ch = str(latch_cfg.get("chans") or "BCP1-6")
+                if len(l_ch) > 22:
+                    l_ch = l_ch[:19] + "..."
+                single_items.append((
+                    "latch",
+                    f"ApexBOSLatch ATCS SDR #{l_dev} ({l_ch}, ZMQ {latch_cfg.get('zmq_port', 18201)})",
+                    self.mgr.start_latch,
+                    lambda: self.mgr.stop_process("latch"),
+                ))
+            fred_cfg = self.mgr.config.get("fred", {}) if isinstance(self.mgr.config.get("fred"), dict) else {}
+            if bool(fred_cfg.get("enabled", True)):
+                f_dev = fred_cfg.get("device", config_loader.DEFAULT_FRED_DEVICE)
+                f_ch = str(fred_cfg.get("chans") or "EOT,DPU3,DPU4")
+                if len(f_ch) > 22:
+                    f_ch = f_ch[:19] + "..."
+                single_items.append((
+                    "fred",
+                    f"ApexBOSFred EOT/DPU/RLC SDR #{f_dev} ({f_ch}, ZMQ {fred_cfg.get('zmq_port', 18301)})",
+                    self.mgr.start_fred,
+                    lambda: self.mgr.stop_process("fred"),
+                ))
+            single_items.append((
+                "flux",
+                "ApexBOSFlux Relay",
+                self.mgr.start_flux,
+                lambda: self.mgr.stop_process("flux"),
+            ))
         if self.mgr.config.get("common", {}).get("banc", {}).get("enabled"):
             single_items.append((
                 "banc",

@@ -372,29 +372,96 @@ def itc_channel_frequency(channel_num: int) -> int:
     return 217587500 + int(channel_num) * 25000
 
 
+def avoid_channel_center_dc_offset(
+    center_freq: int,
+    channel_freqs,
+    channel_spacing_hz: int = 25000,
+    grid_base_hz: Optional[int] = None,
+) -> int:
+    """
+    Ensures the SDR center frequency never lands on (or right near) a channel center,
+    preventing zero-IF RTL-SDR DC spikes from sitting inside a monitored channel passband.
+
+    When `center_freq` falls within ~45% of a channel half-width of any monitored channel
+    (or any channel center on `grid_base_hz + k * channel_spacing_hz` when `grid_base_hz`
+    is provided), offsets it onto the nearest channel boundary (+/- half channel spacing)
+    that maximizes clearance from all monitored channels while keeping them balanced.
+    """
+    cf = int(round(center_freq))
+    freqs = sorted({int(round(f)) for f in (channel_freqs or [])})
+
+    step_hz = max(1000, int(channel_spacing_hz))
+    if len(freqs) >= 2:
+        min_adj = min(b - a for a, b in zip(freqs, freqs[1:]))
+        if 1000 <= min_adj < step_hz:
+            step_hz = int(min_adj)
+
+    half_ch = max(1, step_hz // 2)
+    guard_hz = max(1000, int(round(half_ch * 0.45)))
+
+    min_dist_mon = min((abs(cf - f) for f in freqs), default=step_hz)
+    grid_dist = step_hz
+    if grid_base_hz is not None:
+        rem = (cf - int(grid_base_hz)) % step_hz
+        grid_dist = min(rem, step_hz - rem)
+
+    if min(min_dist_mon, grid_dist) >= guard_hz:
+        return cf
+
+    if min_dist_mon < guard_hz and freqs:
+        f_near = min(freqs, key=lambda f: abs(cf - f))
+    elif grid_base_hz is not None:
+        f_near = int(grid_base_hz) + int(round((cf - int(grid_base_hz)) / float(step_hz))) * step_hz
+    else:
+        f_near = cf
+
+    cand_hi = int(f_near + half_ch)
+    cand_lo = int(f_near - half_ch)
+
+    def _score(cand: int):
+        mon_clear = min((abs(cand - f) for f in freqs), default=half_ch)
+        if grid_base_hz is not None:
+            g_rem = (cand - int(grid_base_hz)) % step_hz
+            g_clear = min(g_rem, step_hz - g_rem)
+            eff_clear = min(mon_clear, g_clear)
+        else:
+            eff_clear = mon_clear
+        max_span_dev = max((abs(cand - f) for f in freqs), default=0)
+        return (eff_clear, mon_clear, -max_span_dev, 1 if cand == cand_hi else 0)
+
+    return cand_hi if _score(cand_hi) >= _score(cand_lo) else cand_lo
+
+
 def calculate_optimal_center_freq(channel_list, max_bandwidth: int = DEFAULT_SAMPLE_RATE) -> int:
     """
     Calculates center frequency for the channel list.
     If the channel span is within bandwidth, centers at the midpoint of all channels.
     If the channel span exceeds bandwidth, centers on the primary downlink cluster (<= 136).
+    Never places the SDR center frequency in the middle of a 25 kHz PTC channel (offsets
+    to the channel boundary to keep zero-IF RTL-SDR DC spurs out of active channels).
     """
     if not channel_list:
-        return itc_channel_frequency(101)
+        return avoid_channel_center_dc_offset(
+            itc_channel_frequency(101), [itc_channel_frequency(101)], channel_spacing_hz=25000, grid_base_hz=217587500
+        )
     sorted_ch = sorted(channel_list)
     freqs = [itc_channel_frequency(ch) for ch in sorted_ch]
     span = max(freqs) - min(freqs)
     if span <= max_bandwidth:
-        return int(round((min(freqs) + max(freqs)) / 2.0))
+        raw_cf = int(round((min(freqs) + max(freqs)) / 2.0))
+        return avoid_channel_center_dc_offset(raw_cf, freqs, channel_spacing_hz=25000, grid_base_hz=217587500)
 
     base_chans = [ch for ch in sorted_ch if ch <= 136]
     if base_chans:
         base_freqs = [itc_channel_frequency(ch) for ch in base_chans]
         cluster = [f for f in base_freqs if f - min(base_freqs) <= max_bandwidth - 25000]
         if cluster:
-            return int(round((min(cluster) + max(cluster)) / 2.0))
+            raw_cf = int(round((min(cluster) + max(cluster)) / 2.0))
+            return avoid_channel_center_dc_offset(raw_cf, cluster, channel_spacing_hz=25000, grid_base_hz=217587500)
 
     cluster = [f for f in freqs if f - min(freqs) <= max_bandwidth - 25000]
-    return int(round((min(cluster) + max(cluster)) / 2.0))
+    raw_cf = int(round((min(cluster) + max(cluster)) / 2.0))
+    return avoid_channel_center_dc_offset(raw_cf, cluster, channel_spacing_hz=25000, grid_base_hz=217587500)
 
 
 def _parse_channel_token(raw_token) -> Tuple[Optional[int], bool]:
@@ -1613,12 +1680,35 @@ def parse_gain_value(gain_arg) -> Tuple[float, int]:
     return gain_db, gain_tenths
 
 
+RTLSDR_LOW_RATE_MIN = 225001
+RTLSDR_LOW_RATE_MAX = 300000
+RTLSDR_NARROW_RATE = 240000  # Exact 28.8 MHz / 120 and 5 * 48 kHz; narrowest reliable RTL2832U rate
+
+
+def sanitize_rtlsdr_sample_rate(rate: int) -> int:
+    """
+    Maps a requested sample rate to a valid RTL2832U hardware rate:
+      - Valid narrowband window: (225,000, 300,000] S/s (e.g. 240,000 / 250,000 / 288,000 S/s)
+      - Valid wideband window:   >= 960,000 S/s aligned to 192 kS/s multiples
+      - Rates <= 225,000 S/s (such as PTC's 192 kS/s baseband) or inside the RTL2832U
+        forbidden dead zone (300,001..900,000 S/s) clamp safely to 960,000 S/s.
+    """
+    r = int(rate)
+    if RTLSDR_LOW_RATE_MIN <= r <= RTLSDR_LOW_RATE_MAX:
+        return r
+    if r < 960000:
+        return 960000
+    if r % 192000 != 0:
+        return int(math.ceil(r / 192000.0) * 192000)
+    return r
+
+
 class SubprocessPipeSource:
     """Spawns rtl_sdr as a subprocess and reads stdout."""
     def __init__(self, binary_path: str, center_freq: int, sample_rate: int, gain, ppm: int, device_idx: int = 0, bias_tee: bool = True):
         self.bin = binary_path
         self.center_freq = int(center_freq)
-        self.sample_rate = int(sample_rate)
+        self.sample_rate = sanitize_rtlsdr_sample_rate(int(sample_rate))
         self.gain_db, self.gain_tenths = parse_gain_value(gain)
         self.ppm = int(ppm)
         self.device = int(device_idx)
@@ -1680,9 +1770,11 @@ class SubprocessPipeSource:
         if freq is not None and int(freq) != self.center_freq:
             self.center_freq = int(freq)
             restart_needed = True
-        if rate is not None and int(rate) != self.sample_rate:
-            self.sample_rate = int(rate)
-            restart_needed = True
+        if rate is not None:
+            new_r = sanitize_rtlsdr_sample_rate(int(rate))
+            if new_r != self.sample_rate:
+                self.sample_rate = new_r
+                restart_needed = True
         if gain is not None:
             g_db, g_tenths = parse_gain_value(gain)
             if (g_db, g_tenths) != (self.gain_db, self.gain_tenths):
@@ -1695,15 +1787,20 @@ class SubprocessPipeSource:
             self.bias_tee = bool(bias_tee)
             restart_needed = True
 
-        if restart_needed and self.process:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=0.5)
-            except Exception:
+        if restart_needed:
+            if self.process:
                 try:
-                    self.process.kill()
+                    self.process.terminate()
+                    self.process.wait(timeout=0.5)
                 except Exception:
-                    pass
+                    try:
+                        self.process.kill()
+                        self.process.wait(timeout=0.5)
+                    except Exception:
+                        pass
+                self.process = None
+                # Give Linux usbfs / Windows WinUSB a moment to release the RTL-SDR handle
+                time.sleep(0.08)
             self._spawn()
 
     def read_exact_bytes(self, byte_count: int) -> bytes:
@@ -1728,8 +1825,14 @@ class SubprocessPipeSource:
             except Exception:
                 try:
                     self.process.kill()
+                    self.process.wait(timeout=0.5)
                 except Exception:
                     pass
+            try:
+                if self.process.stdout:
+                    self.process.stdout.close()
+            except Exception:
+                pass
             self.process = None
 
 
@@ -1792,12 +1895,9 @@ class DirectRtlTcpSource:
             hdr += chunk
 
         # Hardware safety: RTL2832U chip physically rejects sample rates <= 225 kHz or between 300-900 kHz.
-        # Ensure hardware receives a valid multiple of 192,000 (minimum 960,000 S/s).
-        sdr_hardware_rate = self.sample_rate
-        if sdr_hardware_rate < 960000:
-            sdr_hardware_rate = 960000
-        elif sdr_hardware_rate % 192000 != 0:
-            sdr_hardware_rate = int(math.ceil(sdr_hardware_rate / 192000.0) * 192000)
+        # Allow valid narrowband rates (225,001..300,000 S/s, e.g. 240 kS/s) or 192k-aligned >= 960 kS/s.
+        sdr_hardware_rate = sanitize_rtlsdr_sample_rate(self.sample_rate)
+        self.sample_rate = sdr_hardware_rate
 
         self._send_command(0x02, sdr_hardware_rate)
         self._send_command(0x01, self.center_freq)
@@ -1837,9 +1937,11 @@ class DirectRtlTcpSource:
         self.sock.sendall(msg)
 
     def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
-        if rate is not None and int(rate) != self.sample_rate:
-            self.sample_rate = int(rate)
-            self._send_command(0x02, self.sample_rate)
+        if rate is not None:
+            new_r = sanitize_rtlsdr_sample_rate(int(rate))
+            if new_r != self.sample_rate:
+                self.sample_rate = new_r
+                self._send_command(0x02, self.sample_rate)
         if freq is not None:
             self.center_freq = int(freq)
             self._send_command(0x01, self.center_freq)
@@ -1918,11 +2020,8 @@ class DirectRtlSdrSource:
             raise RuntimeError(f"Failed to open RTL-SDR device index {self.device_idx}: {e}")
 
         # Hardware safety: Ensure hardware rate complies with RTL2832U constraints
-        hw_rate = self.sample_rate
-        if hw_rate < 960000:
-            hw_rate = 960000
-        elif hw_rate % 192000 != 0:
-            hw_rate = int(math.ceil(hw_rate / 192000.0) * 192000)
+        hw_rate = sanitize_rtlsdr_sample_rate(self.sample_rate)
+        self.sample_rate = hw_rate
 
         self.sdr.sample_rate = hw_rate
         self.sdr.center_freq = self.center_freq
@@ -1943,13 +2042,15 @@ class DirectRtlSdrSource:
     def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
         if not self.sdr:
             return
-        if rate is not None and int(rate) != self.sample_rate:
-            self.sample_rate = int(rate)
-            try:
-                self.sdr.sample_rate = self.sample_rate
-                self._buffer.clear()
-            except Exception:
-                pass
+        if rate is not None:
+            hw_rate = sanitize_rtlsdr_sample_rate(int(rate))
+            if hw_rate != self.sample_rate:
+                self.sample_rate = hw_rate
+                try:
+                    self.sdr.sample_rate = self.sample_rate
+                    self._buffer.clear()
+                except Exception:
+                    pass
         if freq is not None and int(freq) != self.center_freq:
             self.center_freq = int(freq)
             try:
@@ -2286,13 +2387,14 @@ class DirectSoapySdrSource:
         self._init_device()
 
     def _align_rate(self, rate: int) -> int:
-        min_r = DirectRspTcpSource.RSP_MIN_RATE if self.is_sdrplay else 960000
         r = int(rate)
-        if r < min_r:
-            r = min_r
-        elif r % 192000 != 0:
-            r = int(math.ceil(r / 192000.0) * 192000)
-        return r
+        if self.is_sdrplay:
+            if r < DirectRspTcpSource.RSP_MIN_RATE:
+                r = DirectRspTcpSource.RSP_MIN_RATE
+            elif r % 192000 != 0:
+                r = int(math.ceil(r / 192000.0) * 192000)
+            return r
+        return sanitize_rtlsdr_sample_rate(r)
 
     @staticmethod
     def _parse_soapy_args(args_str: str) -> Dict[str, str]:

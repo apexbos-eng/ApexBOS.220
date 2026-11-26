@@ -304,10 +304,140 @@ def _parse_ctc_tokens(raw_val: Any) -> List[str]:
 # ---------------------------------------------------------------------------
 # Database Management (Executor wrapped for asyncio)
 # ---------------------------------------------------------------------------
+# Protocol identifiers stored in reserved packets.b2 (INTEGER) and packets.b3 (TEXT)
+PKT_PROTO_PTC = 0
+PKT_PROTO_ATCS = 1
+PKT_PROTO_FRED = 2  # EOT / HOT / DPU / RLC
+
+# Regional privacy & geo-scoping constants for short-range RF packets (e.g. FRED)
+MILES_TO_KM = 1.609344
+DEFAULT_AUTO_PTC_RADIUS_KM = 24.0   # ~15 mi default enclosing radius for auto-inferred PTC WIU centroid
+MIN_GEO_QUERY_RADIUS_KM = 10.0      # Anti-triangulation minimum viewer query radius floor
+GEO_QUERY_GRID_DEG = 0.05           # ~5.5 km coarse snapping grid for viewer GET coordinates
+AUTO_PTC_GRID_DEG = 0.10            # ~11 km coarse quantization grid for Tier-2 auto PTC centroid
+GEO_QUERY_MAX_SWITCHES_30S = 5      # Anti-triangulation rate-limit on distinct coord sweeps per 30s
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in kilometers between two WGS84 points."""
+    r_earth = 6371.0088
+    p1 = math.radians(float(lat1))
+    p2 = math.radians(float(lat2))
+    dlat = p2 - p1
+    dlon = math.radians(float(lon2) - float(lon1))
+    a = (math.sin(dlat / 2.0) ** 2) + math.cos(p1) * math.cos(p2) * (math.sin(dlon / 2.0) ** 2)
+    c = 2.0 * math.atan2(math.sqrt(max(0.0, a)), math.sqrt(max(0.0, 1.0 - a)))
+    return r_earth * c
+
+
+def quantize_geo_point(lat: float, lon: float, step_deg: float = GEO_QUERY_GRID_DEG) -> Tuple[float, float]:
+    """Snaps (lat, lon) to a coarse degree grid to prevent coordinate-oracle triangulation."""
+    step = max(0.001, float(step_deg))
+    q_lat = max(-85.0, min(85.0, round(round(float(lat) / step) * step, 4)))
+    q_lon = max(-180.0, min(180.0, round(round(float(lon) / step) * step, 4)))
+    return q_lat, q_lon
+
+
+def _parse_gps_latlon(gps_str: Any) -> Optional[Tuple[float, float]]:
+    """Parses a stored WIU GPS string ('lat, lon') or tuple into (lat, lon) floats."""
+    if not gps_str:
+        return None
+    if isinstance(gps_str, (list, tuple)) and len(gps_str) >= 2:
+        try:
+            lat, lon = float(gps_str[0]), float(gps_str[1])
+            if -85.0 <= lat <= 85.0 and -180.0 <= lon <= 180.0 and not (lat == 0.0 and lon == 0.0):
+                return lat, lon
+        except (ValueError, TypeError):
+            return None
+        return None
+    s = str(gps_str).strip().strip("()[] ")
+    parts = [p.strip() for p in re.split(r"[,;\s]+", s) if p.strip()]
+    if len(parts) < 2:
+        return None
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+        if -85.0 <= lat <= 85.0 and -180.0 <= lon <= 180.0 and not (lat == 0.0 and lon == 0.0):
+            return lat, lon
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def extract_ptc_wiu_id_from_hex(hex_data: str) -> Optional[str]:
+    """
+    Extracts the 40-bit PTC WIU _node_id_ from an 0x33/0x34 packet hex payload
+    (Prefix[1] + PacketSize[2] + Type[1 in {0x33,0x34}] + Channel[1] + _node_id_[5]).
+    """
+    s = str(hex_data or "").strip()
+    if len(s) < 20:
+        return None
+    try:
+        raw = bytes.fromhex(s[:128])
+    except ValueError:
+        return None
+    if raw.startswith(b"CH"):
+        m = re.match(rb"^CH\d{2,3}(?::RSSI=[+-]?\d+(?:\.\d+)?)?:", raw)
+        if m:
+            raw = raw[m.end():]
+    if len(raw) >= 10 and raw[3] in (0x33, 0x34):
+        node_id = int.from_bytes(raw[5:10], "big", signed=False)
+        if node_id > 0:
+            return str(node_id)
+    return None
+
+
+def _proto_key_to_code(proto_key: Any) -> Optional[int]:
+    if isinstance(proto_key, int):
+        return proto_key if proto_key in (PKT_PROTO_PTC, PKT_PROTO_ATCS, PKT_PROTO_FRED) else None
+    s = str(proto_key or "").strip().lower()
+    if s in ("0", "ptc", "grabber", "itc"):
+        return PKT_PROTO_PTC
+    if s in ("1", "atcs", "latch"):
+        return PKT_PROTO_ATCS
+    if s in ("2", "fred", "eot", "hot", "dpu", "rlc"):
+        return PKT_PROTO_FRED
+    return None
+
+
+def normalize_packet_proto(b2_raw: Any, b3_raw: Any) -> Tuple[int, str]:
+    """
+    Normalizes reserved columns (b2, b3) for PTC (0), ATCS (1), and EOT/HOT/DPU/RLC (2).
+    Preserves legacy PTC rows (b2=0, b3='"NA"') verbatim for full backwards compatibility.
+    """
+    try:
+        b2 = int(b2_raw)
+    except (ValueError, TypeError):
+        b2 = PKT_PROTO_PTC
+
+    raw_b3 = str(b3_raw) if b3_raw is not None else '"NA"'
+    clean_b3 = raw_b3.strip().strip('"').strip("'").upper()
+
+    if b2 == PKT_PROTO_PTC:
+        if clean_b3 == "ATCS":
+            b2 = PKT_PROTO_ATCS
+        elif clean_b3 in ("EOT", "HOT", "DPU", "RLC", "FRED"):
+            b2 = PKT_PROTO_FRED
+
+    if b2 == PKT_PROTO_PTC:
+        return PKT_PROTO_PTC, raw_b3
+    if b2 == PKT_PROTO_ATCS:
+        tag = re.sub(r"[^A-Za-z0-9_-]", "", clean_b3) if clean_b3 and clean_b3 != "NA" else "ATCS"
+        return PKT_PROTO_ATCS, tag or "ATCS"
+    if b2 == PKT_PROTO_FRED:
+        tag = re.sub(r"[^A-Za-z0-9_-]", "", clean_b3) if clean_b3 and clean_b3 != "NA" else "FRED"
+        return PKT_PROTO_FRED, tag or "FRED"
+    safe_tag = re.sub(r"[^A-Za-z0-9_-]", "", clean_b3) or "NA"
+    return b2, safe_tag
+
+
 class DatabaseManager:
     def __init__(self, db_path, retention_sec=600):
         self.db_path = db_path
         self.retention_sec = retention_sec
+        self._region_lock = threading.Lock()
+        self._wiu_gps_cache: Dict[str, Tuple[float, float]] = {}
+        self._wiu_gps_cache_ts: float = 0.0
+        self._identity_wiu_obs: Dict[str, Dict[str, Tuple[float, float, float]]] = {}
         self.init_db()
 
     def init_db(self):
@@ -329,6 +459,7 @@ class DatabaseManager:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_stamp ON packets(stamp_received)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ident ON packets(identity)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pkt_proto ON packets(b2)")
 
             # Layouts storage table
             conn.execute("""
@@ -363,10 +494,252 @@ class DatabaseManager:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_wius_updated ON wius(last_updated)")
+
+            # Private server-side feeder reception regions (NEVER returned to GET clients)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS feeder_regions (
+                    identity TEXT NOT NULL,
+                    proto INTEGER NOT NULL,
+                    center_lat REAL NOT NULL,
+                    center_lon REAL NOT NULL,
+                    radius_km REAL NOT NULL,
+                    source TEXT DEFAULT 'user_blurred',
+                    updated_ts REAL NOT NULL,
+                    PRIMARY KEY (identity, proto)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_feeder_regions_ident ON feeder_regions(identity)")
             conn.commit()
 
+    def upsert_feeder_region(
+        self,
+        identity: str,
+        proto: int,
+        center_lat: float,
+        center_lon: float,
+        radius_km: float,
+        source: str = "user_blurred",
+    ) -> bool:
+        """
+        Stores a privacy-blurred feeder reception region in the private server-side table.
+        Auto-inferred ('ptc_wiu_auto') regions never overwrite explicit 'user_blurred' regions.
+        """
+        ident = str(identity or "").strip()
+        if not ident:
+            return False
+        p_code = _proto_key_to_code(proto)
+        if p_code is None:
+            return False
+        try:
+            lat = float(center_lat)
+            lon = float(center_lon)
+            rad = float(radius_km)
+        except (ValueError, TypeError):
+            return False
+        if not (-85.0 <= lat <= 85.0 and -180.0 <= lon <= 180.0):
+            return False
+        if lat == 0.0 and lon == 0.0:
+            return False
+        rad = max(8.0, min(130.0, rad))
+        src = str(source or "user_blurred").strip()
+        now_ts = time.time()
+        with self._region_lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if src == "ptc_wiu_auto":
+                    cur = conn.execute(
+                        "SELECT source FROM feeder_regions WHERE identity = ? AND proto = ?",
+                        (ident, p_code),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0] == "user_blurred":
+                        return False
+                conn.execute(
+                    """
+                    INSERT INTO feeder_regions (identity, proto, center_lat, center_lon, radius_km, source, updated_ts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(identity, proto) DO UPDATE SET
+                        center_lat=excluded.center_lat,
+                        center_lon=excluded.center_lon,
+                        radius_km=excluded.radius_km,
+                        source=excluded.source,
+                        updated_ts=excluded.updated_ts
+                    """,
+                    (ident, p_code, round(lat, 4), round(lon, 4), round(rad, 2), src, now_ts),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return True
+
+    def delete_feeder_region(self, identity: str, proto: int) -> bool:
+        ident = str(identity or "").strip()
+        p_code = _proto_key_to_code(proto)
+        if not ident or p_code is None:
+            return False
+        with self._region_lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cur = conn.execute(
+                    "DELETE FROM feeder_regions WHERE identity = ? AND proto = ? AND source = 'user_blurred'",
+                    (ident, p_code),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    def upsert_feeder_regions_payload(self, identity: str, payload: Any) -> int:
+        """
+        Processes a PUT_SDR_REGION JSON payload for a feeder identity.
+        Supports:
+          - {'ptc': {'center_lat': ..., 'center_lon': ..., 'radius_km': ...}, 'fred': {...}}
+          - {'proto': 'fred', 'center_lat': ..., 'center_lon': ..., 'radius_km': ...}
+          - {'fred': {'clear': True}} to remove an explicit user_blurred region.
+        """
+        if not isinstance(payload, dict):
+            return 0
+        updated = 0
+        if "proto" in payload and ("center_lat" in payload or "region_lat" in payload or payload.get("clear")):
+            entries = [(payload.get("proto"), payload)]
+        else:
+            entries = list(payload.items())
+
+        for p_key, rec in entries:
+            p_code = _proto_key_to_code(p_key)
+            if p_code is None:
+                continue
+            if rec is None or (isinstance(rec, dict) and rec.get("clear")):
+                if self.delete_feeder_region(identity, p_code):
+                    updated += 1
+                continue
+            if not isinstance(rec, dict):
+                continue
+            lat = rec.get("center_lat") if rec.get("center_lat") is not None else rec.get("region_lat")
+            lon = rec.get("center_lon") if rec.get("center_lon") is not None else rec.get("region_lon")
+            rad_km = rec.get("radius_km")
+            if rad_km is None and rec.get("region_radius_mi") is not None:
+                try:
+                    rad_km = float(rec["region_radius_mi"]) * MILES_TO_KM
+                except (ValueError, TypeError):
+                    rad_km = None
+            if rad_km is None:
+                rad_km = DEFAULT_AUTO_PTC_RADIUS_KM
+            if lat is not None and lon is not None:
+                if self.upsert_feeder_region(identity, p_code, lat, lon, rad_km, source="user_blurred"):
+                    updated += 1
+        return updated
+
+    def get_all_feeder_regions_map(self) -> Dict[Tuple[str, int], Tuple[float, float, float, str]]:
+        """Loads all private feeder regions into memory for server-side geo-filtering."""
+        out: Dict[Tuple[str, int], Tuple[float, float, float, str]] = {}
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute(
+                "SELECT identity, proto, center_lat, center_lon, radius_km, source FROM feeder_regions"
+            )
+            for ident, proto, lat, lon, rad_km, src in cur.fetchall():
+                out[(str(ident), int(proto))] = (float(lat), float(lon), float(rad_km), str(src or ""))
+        finally:
+            conn.close()
+        return out
+
+    @staticmethod
+    def resolve_feeder_region(
+        regions_map: Dict[Tuple[str, int], Tuple[float, float, float, str]],
+        identity: str,
+        proto: int = PKT_PROTO_FRED,
+    ) -> Optional[Tuple[float, float, float]]:
+        """
+        3-tier resolution for a feeder's regional footprint:
+          1. Explicit/stored region for (identity, proto) (e.g. dedicated FRED SDR region)
+          2. Fallback to (identity, PKT_PROTO_PTC) (explicit Grabber region or Tier-2 auto PTC WIU centroid)
+          3. Fallback to (identity, PKT_PROTO_ATCS) if configured
+          4. None -> unlocated (Tier-3: private to own identity only)
+        """
+        ident = str(identity or "")
+        for p_try in (proto, PKT_PROTO_PTC, PKT_PROTO_ATCS):
+            rec = regions_map.get((ident, p_try))
+            if rec is not None:
+                return rec[0], rec[1], rec[2]
+        return None
+
+    def _refresh_wiu_gps_cache(self, force: bool = False):
+        now = time.time()
+        if not force and (now - self._wiu_gps_cache_ts) < 30.0 and self._wiu_gps_cache:
+            return
+        cache: Dict[str, Tuple[float, float]] = {}
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cur = conn.execute("SELECT wiu_id, gps FROM wius WHERE gps IS NOT NULL AND gps != ''")
+                for wid, gps_s in cur.fetchall():
+                    pt = _parse_gps_latlon(gps_s)
+                    if pt is not None:
+                        cache[_normalize_wiu_id(wid)] = pt
+            finally:
+                conn.close()
+        except Exception:
+            return
+        self._wiu_gps_cache = cache
+        self._wiu_gps_cache_ts = now
+
+    def update_auto_regions_from_ptc_rows(self, rows: List[Tuple]):
+        """
+        Tier-2 automatic regional inference: extracts PTC WIU IDs from uploaded PTC rows,
+        cross-references Banc's wius table, computes a coarse quantized median centroid per
+        feeder identity, and stores it as a 'ptc_wiu_auto' region (never overriding explicit
+        'user_blurred' regions).
+        """
+        ptc_rows = [r for r in rows if len(r) >= 9 and int(r[8]) == PKT_PROTO_PTC]
+        if not ptc_rows:
+            return
+        self._refresh_wiu_gps_cache()
+        if not self._wiu_gps_cache:
+            return
+        now = time.time()
+        touched_idents = set()
+        for r in ptc_rows:
+            ident = str(r[2] or "").strip()
+            hex_s = str(r[3] or "")
+            if not ident or not hex_s:
+                continue
+            wid = extract_ptc_wiu_id_from_hex(hex_s)
+            if not wid:
+                continue
+            pt = self._wiu_gps_cache.get(wid)
+            if pt is None:
+                continue
+            obs = self._identity_wiu_obs.setdefault(ident, {})
+            obs[wid] = (pt[0], pt[1], now)
+            touched_idents.add(ident)
+
+        for ident in touched_idents:
+            obs = self._identity_wiu_obs.get(ident)
+            if not obs:
+                continue
+            # Keep recent WIU observations (last 24h)
+            fresh = {k: v for k, v in obs.items() if (now - v[2]) <= 86400.0}
+            self._identity_wiu_obs[ident] = fresh
+            if not fresh:
+                continue
+            lats = sorted(v[0] for v in fresh.values())
+            lons = sorted(v[1] for v in fresh.values())
+            mid = len(lats) // 2
+            med_lat = lats[mid] if (len(lats) % 2 == 1) else 0.5 * (lats[mid - 1] + lats[mid])
+            med_lon = lons[mid] if (len(lons) % 2 == 1) else 0.5 * (lons[mid - 1] + lons[mid])
+            q_lat, q_lon = quantize_geo_point(med_lat, med_lon, step_deg=AUTO_PTC_GRID_DEG)
+            self.upsert_feeder_region(
+                ident,
+                PKT_PROTO_PTC,
+                q_lat,
+                q_lon,
+                DEFAULT_AUTO_PTC_RADIUS_KM,
+                source="ptc_wiu_auto",
+            )
+
     def insert_rows(self, rows):
-        """Bulk insert rows, rapidly updating only timestamps and signal strength if hash exists."""
+        """Bulk insert rows, rapidly updating timestamps, signal strength, and protocol metadata if hash exists."""
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany("""
                 INSERT INTO packets (date_str, unix_ts, identity, hex_data, channel, signal_strength, pkt_hash, b1, b2, b3, stamp_received)
@@ -374,13 +747,32 @@ class DatabaseManager:
                 ON CONFLICT(pkt_hash) DO UPDATE SET 
                     date_str=excluded.date_str, 
                     stamp_received=excluded.stamp_received,
-                    signal_strength=excluded.signal_strength
+                    signal_strength=excluded.signal_strength,
+                    hex_data=excluded.hex_data,
+                    b1=excluded.b1,
+                    b2=excluded.b2,
+                    b3=excluded.b3
             """, rows)
             conn.commit()
+        try:
+            self.update_auto_regions_from_ptc_rows(rows)
+        except Exception:
+            pass
         return True
 
-    def get_recent_rows(self, limit=1000, since_ts=None):
-        """Fetches rows for the GET service, omitting the identity column."""
+    def get_recent_rows(
+        self,
+        limit=1000,
+        since_ts=None,
+        requester_identity: Optional[str] = None,
+        geo_filter: Optional[Tuple[float, float, float]] = None,
+    ):
+        """
+        Fetches rows for the GET service, strictly omitting the identity column.
+        When geo_filter=(lat, lon, radius_km) is provided, filters PKT_PROTO_FRED (b2=2)
+        rows server-side by Haversine overlap against each feeder's private region
+        (explicit blurred region -> auto PTC WIU centroid -> own-identity-only).
+        """
         cutoff = time.time() - self.retention_sec
         if since_ts is not None:
             try:
@@ -389,13 +781,53 @@ class DatabaseManager:
                     cutoff = s_val
             except (ValueError, TypeError):
                 pass
-        with sqlite3.connect(self.db_path) as conn:
+
+        if geo_filter is None:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT date_str, unix_ts, hex_data, channel, signal_strength, pkt_hash, b1, b2, b3, stamp_received 
+                    FROM packets WHERE stamp_received >= ? ORDER BY stamp_received DESC LIMIT ?
+                """, (cutoff, limit))
+                return cur.fetchall()
+            finally:
+                conn.close()
+
+        q_lat, q_lon = quantize_geo_point(geo_filter[0], geo_filter[1], step_deg=GEO_QUERY_GRID_DEG)
+        q_rad_km = max(MIN_GEO_QUERY_RADIUS_KM, min(2000.0, float(geo_filter[2])))
+        req_ident = str(requester_identity or "").strip()
+
+        regions_map = self.get_all_feeder_regions_map()
+        conn = sqlite3.connect(self.db_path)
+        try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT date_str, unix_ts, hex_data, channel, signal_strength, pkt_hash, b1, b2, b3, stamp_received 
+                SELECT date_str, unix_ts, hex_data, channel, signal_strength, pkt_hash, b1, b2, b3, stamp_received, identity
                 FROM packets WHERE stamp_received >= ? ORDER BY stamp_received DESC LIMIT ?
             """, (cutoff, limit))
-            return cur.fetchall()
+            raw_rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        filtered_rows = []
+        for row in raw_rows:
+            b2_val = int(row[7]) if row[7] is not None else PKT_PROTO_PTC
+            row_ident = str(row[10] or "").strip()
+            if b2_val == PKT_PROTO_FRED:
+                if req_ident and row_ident == req_ident:
+                    filtered_rows.append(row[:10])
+                    continue
+                feeder_reg = self.resolve_feeder_region(regions_map, row_ident, PKT_PROTO_FRED)
+                if feeder_reg is None:
+                    # Tier 3: unlocated FRED packets remain private to own identity
+                    continue
+                f_lat, f_lon, f_rad_km = feeder_reg
+                if haversine_km(q_lat, q_lon, f_lat, f_lon) <= (q_rad_km + f_rad_km):
+                    filtered_rows.append(row[:10])
+            else:
+                filtered_rows.append(row[:10])
+        return filtered_rows
 
     def get_identity_stats(self):
         """Returns total counts for all identities for periodic analysis."""
@@ -419,6 +851,20 @@ class DatabaseManager:
             count = cur.fetchone()[0]
         size_kb = os.path.getsize(self.db_path) / 1024.0 if os.path.exists(self.db_path) else 0
         return count, size_kb
+
+    def get_protocol_stats(self) -> Dict[int, int]:
+        """Returns row counts keyed by reserved protocol code b2 (0=PTC, 1=ATCS, 2=FRED/EOT-HOT)."""
+        counts = {PKT_PROTO_PTC: 0, PKT_PROTO_ATCS: 0, PKT_PROTO_FRED: 0}
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(b2, 0), COUNT(*) FROM packets GROUP BY COALESCE(b2, 0)")
+            for proto_id, cnt in cur.fetchall():
+                try:
+                    k = int(proto_id)
+                except (ValueError, TypeError):
+                    k = PKT_PROTO_PTC
+                counts[k] = counts.get(k, 0) + int(cnt)
+        return counts
 
     def save_layout(self, layout_name: str, layout_data: str, center_lat: Optional[float], center_lon: Optional[float], radius_km: float, uploaded_by: str = ""):
         now = time.time()
@@ -626,6 +1072,8 @@ class DatabaseManager:
             raise
         finally:
             conn.close()
+        if upserted > 0:
+            self._wiu_gps_cache_ts = 0.0
         return upserted
 
     def list_wius(self) -> List[dict]:
@@ -845,6 +1293,8 @@ class BancServer:
         self._seen_chat_relay_uids: deque = deque(maxlen=2000)
         self._seen_chat_relay_uid_set: set = set()
         self._chat_log_lock = threading.Lock()
+        # Anti-triangulation geo-query state per identity: {ident: (last_q_point, switch_ts_deque)}
+        self._geo_query_guard: Dict[str, Tuple[Tuple[float, float], deque]] = {}
 
         default_log_dir = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
         cfg_log_path = config.get("chat_log_path") or config.get("chat_log_file")
@@ -1336,7 +1786,15 @@ class BancServer:
         lines.append(f"  {C_BOLD}Active Conns:{C_RESET}   {C_GREEN}{self.active_connections:<12}{C_RESET}   {C_BOLD}Total Pkt/Min:{C_RESET} {C_CYAN}{rate_val}{C_RESET}")
         
         rows, size_kb = self.db.get_stats()
-        lines.append(f"  {C_BOLD}DB Rows:{C_RESET}        {C_GREEN}{rows:<12}{C_RESET}   {C_BOLD}DB Size:{C_RESET}       {C_YELLOW}{size_kb:.2f} KB{C_RESET}")
+        proto_counts = self.db.get_protocol_stats()
+        atcs_cnt = proto_counts.get(PKT_PROTO_ATCS, 0)
+        fred_cnt = proto_counts.get(PKT_PROTO_FRED, 0)
+        proto_suffix = (
+            f"  {C_DIM}(PTC:{proto_counts.get(PKT_PROTO_PTC, 0)} ATCS:{atcs_cnt} FRED:{fred_cnt}){C_RESET}"
+            if (atcs_cnt or fred_cnt)
+            else ""
+        )
+        lines.append(f"  {C_BOLD}DB Rows:{C_RESET}        {C_GREEN}{rows:<12}{C_RESET}   {C_BOLD}DB Size:{C_RESET}       {C_YELLOW}{size_kb:.2f} KB{C_RESET}{proto_suffix}")
         
         p_badge = f"{BG_PAUSED} PAUSED {C_RESET}" if self.put_paused else f"{BG_ACTIVE} ACTIVE {C_RESET}"
         g_badge = f"{BG_PAUSED} PAUSED {C_RESET}" if self.get_paused else f"{BG_ACTIVE} ACTIVE {C_RESET}"
@@ -1525,7 +1983,8 @@ async def client_handler(reader, writer, server: BancServer):
                 cols = line.split(",")
                 if len(cols) == 10:
                     try:
-                        tup = (cols[0], float(cols[1]), cols[2], cols[3], int(cols[4]), cols[5], int(cols[6]), float(cols[7]), int(cols[8]), cols[9], time.time())
+                        b2_norm, b3_norm = normalize_packet_proto(cols[8], cols[9])
+                        tup = (cols[0], float(cols[1]), cols[2], cols[3], int(cols[4]), cols[5], int(cols[6]), float(cols[7]), b2_norm, b3_norm, time.time())
                         rows.append(tup)
                     except ValueError:
                         pass
@@ -1541,13 +2000,67 @@ async def client_handler(reader, writer, server: BancServer):
 
         elif action == "GET":
             since_ts = None
+            geo_filter = None
             if extra:
                 try:
-                    since_ts = float(extra[0])
+                    raw_since = float(extra[0])
+                    since_ts = raw_since if raw_since > 0.0 else None
                 except (ValueError, TypeError):
                     since_ts = None
+
+                # Optional regional geo-filter for short-range RF telemetry (FRED):
+                #   Format A: GET:<id>:<tok>:<since_ts>:<lat>:<lon>:<radius_km>
+                #   Format B: GET:<id>:<tok>:<since_ts>:LAYOUT:<layout_name>
+                if len(extra) >= 3 and str(extra[1]).strip().upper() == "LAYOUT":
+                    l_name = ":".join(extra[2:]).strip()
+                    if l_name:
+                        loop = asyncio.get_running_loop()
+                        l_row = await loop.run_in_executor(None, server.db.get_layout, l_name)
+                        if l_row and l_row.get("center_lat") is not None and l_row.get("center_lon") is not None:
+                            geo_filter = (
+                                float(l_row["center_lat"]),
+                                float(l_row["center_lon"]),
+                                max(MIN_GEO_QUERY_RADIUS_KM, float(l_row.get("radius_km") or 0.0)),
+                            )
+                elif len(extra) >= 4:
+                    try:
+                        q_lat = float(extra[1])
+                        q_lon = float(extra[2])
+                        q_rad = float(extra[3])
+                        if -85.0 <= q_lat <= 85.0 and -180.0 <= q_lon <= 180.0 and not (q_lat == 0.0 and q_lon == 0.0):
+                            geo_filter = (q_lat, q_lon, max(MIN_GEO_QUERY_RADIUS_KM, min(2000.0, q_rad)))
+                    except (ValueError, TypeError):
+                        geo_filter = None
+
+            if geo_filter is not None:
+                q_lat, q_lon = quantize_geo_point(geo_filter[0], geo_filter[1], step_deg=GEO_QUERY_GRID_DEG)
+                q_rad = max(MIN_GEO_QUERY_RADIUS_KM, min(2000.0, float(geo_filter[2])))
+                now_g = time.time()
+                prev_state = server._geo_query_guard.get(identity)
+                if prev_state is not None:
+                    prev_pt, sw_times = prev_state
+                    while sw_times and (now_g - sw_times[0]) > 30.0:
+                        sw_times.popleft()
+                    if (q_lat, q_lon) != prev_pt:
+                        if len(sw_times) >= GEO_QUERY_MAX_SWITCHES_30S:
+                            # Anti-triangulation throttle: hold last quantized point
+                            q_lat, q_lon = prev_pt
+                        else:
+                            sw_times.append(now_g)
+                            server._geo_query_guard[identity] = ((q_lat, q_lon), sw_times)
+                else:
+                    server._geo_query_guard[identity] = ((q_lat, q_lon), deque())
+                geo_filter = (q_lat, q_lon, q_rad)
+
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, server.db.get_recent_rows, 5000, since_ts)
+            rows = await loop.run_in_executor(
+                None,
+                server.db.get_recent_rows,
+                5000,
+                since_ts,
+                identity,
+                geo_filter,
+            )
             
             out_csv = []
             for r in rows:
@@ -1555,6 +2068,33 @@ async def client_handler(reader, writer, server: BancServer):
                 
             await write_frame(writer, server.fernet, "\n".join(out_csv))
             server.packets_out += len(rows)
+
+        elif action in ("PUT_SDR_REGION", "SDR_REGION_PUT"):
+            if server.put_paused:
+                await write_frame(writer, server.fernet, "ERROR:PAUSED:PUT service is paused")
+                return
+            payload = await asyncio.wait_for(read_frame(reader, server.fernet), timeout=15.0)
+            try:
+                region_payload = json.loads(payload)
+            except Exception:
+                await write_frame(writer, server.fernet, "ERROR:INVALID_JSON:Region payload is not valid JSON")
+                return
+
+            is_mirrored_hop = "MIRROR" in [str(e).strip().upper() for e in extra]
+            loop = asyncio.get_running_loop()
+            updated = await loop.run_in_executor(
+                None,
+                server.db.upsert_feeder_regions_payload,
+                identity,
+                region_payload,
+            )
+            if updated > 0:
+                server.set_status_message(f"Updated {updated} private SDR region(s) for '{identity}'")
+                if server.mirrors and not is_mirrored_hop:
+                    relay_tok = mosfet_auth.generate_token(server.auth_secret)
+                    relay_header = f"PUT_SDR_REGION:{identity}:{relay_tok}:MIRROR"
+                    asyncio.create_task(server.relay_payload(relay_header, payload))
+            await write_frame(writer, server.fernet, json.dumps({"ok": True, "updated": updated}))
 
         elif action in ("PUT_LAYOUT", "LAYOUT_PUT"):
             layout_name = ":".join(extra) if extra else "layout.json"

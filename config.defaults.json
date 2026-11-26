@@ -1,5 +1,5 @@
 {
-  "version": "v26.1123.06",
+  "version": "v26.1125.10",
   "common": {
     "deployment_mode": "local",
     "packet_source": "flux",
@@ -12,7 +12,7 @@
       "ui_port": 23010,
       "auth_secret": "",
       "encryption_key": "",
-      "identity": "ApexNode_5bed6d51",
+      "identity": "ApexNode_f8df27ae",
       "banc_initial_history_sec": 60
     },
     "multicast": {
@@ -74,6 +74,8 @@
     "bias_t": true,
     "bias_tee": 1,
     "device": 0,
+    "atcs_device": 1,
+    "fred_device": 2,
     "sdr_mode": "auto",
     "rtl_sdr_bin": null,
     "rtl_tcp_bin": null,
@@ -100,6 +102,30 @@
         "zmq_port": 18081
       }
     ]
+  },
+  "latch": {
+    "enabled": true,
+    "device": 1,
+    "chans": "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6",
+    "zmq_port": 18201,
+    "chroma_port": 18299,
+    "ctrl_port": 18298,
+    "gain": "auto",
+    "ppm": 0,
+    "bias_tee": 0,
+    "sdr_mode": "auto"
+  },
+  "fred": {
+    "enabled": true,
+    "device": 2,
+    "chans": "EOT,DPU3,DPU4",
+    "zmq_port": 18301,
+    "chroma_port": 18399,
+    "ctrl_port": 18398,
+    "gain": "auto",
+    "ppm": 0,
+    "bias_tee": 0,
+    "sdr_mode": "auto"
   },
   "flux": {
     "sources": "127.0.0.1:18077, 127.0.0.1:18081",
@@ -138,7 +164,7 @@
       "banc_port": "none",
       "auth_secret": "",
       "encryption_key": "",
-      "identity": "ApexNode_5bed6d51",
+      "identity": "ApexNode_f8df27ae",
       "banc_initial_history_sec": 60
     }
   },
@@ -153,7 +179,7 @@
     "banc_port": 23009,
     "auth_secret": "",
     "encryption_key": "",
-    "identity": "ApexNode_5bed6d51"
+    "identity": "ApexNode_f8df27ae"
   },
   "creator": {
     "db_path": "wius.db",
@@ -162,7 +188,7 @@
     "banc_port": 23009,
     "auth_secret": "",
     "encryption_key": "",
-    "identity": "ApexNode_5bed6d51"
+    "identity": "ApexNode_f8df27ae"
   },
   "banc": {
     "port": 23009,

@@ -165,11 +165,16 @@ python ApexBOSChroma.py
 python ApexBOSChroma.py --wideband
 ```
 
-### 3. Standalone Direct SDR Mode (No Grabber Required)
+### 3. Standalone Direct SDR Mode (No Grabber Required — All 3 Bands)
 ```bash
 python ApexBOSChroma.py --standalone
+# Or launch directly on ATCS 935/896 MHz or FRED 457/452 MHz:
+python ApexBOSChroma.py --standalone --band atcs
+python ApexBOSChroma.py --standalone --band atcs_mcp
+python ApexBOSChroma.py --standalone --band fred
+python ApexBOSChroma.py --standalone --band fred452
 ```
-Opens your configured SDR directly (supporting RTL-SDR via `pyrtlsdr` / `rtl_tcp` / `rtl_sdr` pipe, **SDRplay RSP1B/RSP1A/RSPdx/RSPduo** via `rsp_tcp` standard 8-bit or `-E` 16-bit `CS16`, and **SoapySDR** `CS16` devices via `config.json`'s `grabber.sdr_mode`) at `2.304 MS/s` centered at `221.000 MHz`. Both 8-bit (`u8`) and 16-bit signed (`s16`) IQ streams from Grabber or Standalone mode are decoded with calibrated dBFS scaling and ADC clipping detection.
+Opens your configured SDR directly (supporting RTL-SDR via `pyrtlsdr` / `rtl_tcp` / `rtl_sdr` pipe, **SDRplay RSP1B/RSP1A/RSPdx/RSPduo** via `rsp_tcp` standard 8-bit or `-E` 16-bit `CS16`, and **SoapySDR** `CS16` devices via `config.json`'s `grabber.sdr_mode`) and supports live spectrum & waterfall monitoring across **all 3 bands** via the **`Band:`** toolbar button (or `--band`): **PTC 220 MHz**, **ATCS 935 MHz (BCP)**, **ATCS 896 MHz (MCP)**, **FRED 457 MHz (EOT + DPU Ch 3–4)**, and **FRED 452 MHz (HOT + DPU Ch 1–2 + RLC Ch 1–5)**. Both 8-bit (`u8`) and 16-bit signed (`s16`) IQ streams from Grabber or Standalone mode are decoded with calibrated dBFS scaling and ADC clipping detection.
 
 ### 4. Offline Mock PTC Mode (No Hardware Needed)
 ```bash
@@ -187,8 +192,9 @@ Generates realistic synthetic 220 MHz PTC bursts, live PPM/gain response, and en
 | `--chroma-port PORT` | `18099` | Grabber `XPUB` IQ tap port on `127.0.0.1`. |
 | `--ctrl-port PORT` | `18098` | Grabber `REP` control bridge port on `127.0.0.1`. |
 | `--wideband` | `False` | Automatically expand Grabber to `2.304 MS/s` wideband (Ch 97–176) upon connecting. |
-| `--standalone` | `False` | Open the RTL-SDR directly without attaching to Grabber. |
-| `--mock` | `False` | Run with synthetic 220 MHz PTC bursts and packet blips (no SDR required). |
+| `--standalone` | `False` | Open the SDR directly without attaching to Grabber/Latch/Fred. |
+| `--band BAND` | `ptc` | Active RF band profile: `ptc` (220 MHz), `atcs` (935 MHz BCP), `atcs_mcp` (896 MHz MCP), `fred` (457 MHz EOT/DPU3–4), or `fred452` (452 MHz HOT/DPU1–2/RLC1–5). |
+| `--mock` | `False` | Run with synthetic bursts and packet blips across all 3 bands (no SDR required). |
 | `--width PX` | `1280` | Initial resizable window width in pixels. |
 | `--height PX` | `760` | Initial resizable window height in pixels. |
 

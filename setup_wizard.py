@@ -35,6 +35,7 @@ if sys.platform.startswith('linux'):
     os.environ['SDL_VIDEO_X11_XSHM'] = '0'
     os.environ['SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR'] = '0'
 import json
+import math
 import time
 import hashlib
 import asyncio
@@ -47,8 +48,9 @@ import socket
 import ipaddress
 import subprocess
 import threading
+import urllib.request
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple, Set
+from typing import Dict, Any, List, Optional, Tuple, Set, Callable
 
 # Python 3.6 subprocess.run compatibility (capture_output and text were added in 3.7)
 if sys.version_info < (3, 7):
@@ -85,6 +87,7 @@ COLOR_BG = (14, 18, 24)
 COLOR_CARD = (20, 26, 36)
 COLOR_BORDER = (65, 85, 115)
 COLOR_ACCENT = (255, 185, 40)
+COLOR_YELLOW = (255, 220, 75)
 COLOR_GREEN = (50, 225, 110)
 COLOR_RED = (245, 50, 50)
 COLOR_TEXT = (225, 235, 248)
@@ -653,6 +656,8 @@ def run_cli_wizard(
     encryption_key: Optional[str] = None,
     device_index: Optional[int] = None,
     sdr_path: Optional[str] = None,
+    atcs_device_index: Optional[int] = None,
+    fred_device_index: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Runs the full interactive or automated CLI setup wizard."""
     print("=" * 78)
@@ -829,6 +834,12 @@ def run_cli_wizard(
         chans_input = None
         parsed_ports = None
         dev = 0
+        atcs_dev = config_loader.DEFAULT_ATCS_DEVICE
+        fred_dev = config_loader.DEFAULT_FRED_DEVICE
+        latch_enabled = False
+        latch_chans = "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6"
+        fred_enabled = False
+        fred_chans = "EOT,DPU3,DPU4"
         gain_val = "auto"
         ppm_val = 0
         sdr = {"mode": "auto", "rtl_sdr_bin": None, "rtl_tcp_bin": None, "rtlsdr_dll_dir": None}
@@ -1135,14 +1146,37 @@ def run_cli_wizard(
 
         # 6. SDR hardware
         print("\n--- Step 6: SDR Hardware & Interface ---")
+        ex_latch = (existing or {}).get("latch", {}) if isinstance((existing or {}).get("latch"), dict) else {}
+        ex_fred = (existing or {}).get("fred", {}) if isinstance((existing or {}).get("fred"), dict) else {}
         default_dev = int(ex_grab.get("device", 0)) if str(ex_grab.get("device", 0)).isdigit() else 0
+        raw_atcs_def = ex_latch.get("device", ex_grab.get("atcs_device", config_loader.DEFAULT_ATCS_DEVICE))
+        default_atcs_dev = int(raw_atcs_def) if str(raw_atcs_def).isdigit() else config_loader.DEFAULT_ATCS_DEVICE
+        raw_fred_def = ex_fred.get("device", ex_grab.get("fred_device", config_loader.DEFAULT_FRED_DEVICE))
+        default_fred_dev = int(raw_fred_def) if str(raw_fred_def).isdigit() else config_loader.DEFAULT_FRED_DEVICE
+
         if device_index is not None:
             dev = max(0, int(device_index))
         elif auto_defaults:
             dev = default_dev
         else:
-            dev_in = input(f"[?] RTL-SDR device index for the Grabber (--device; 0 = first dongle) (default: {default_dev}): ").strip()
+            dev_in = input(f"[?] SDR device index for PTC 220 MHz Grabber (--device; 0 = first dongle) (default: {default_dev}): ").strip()
             dev = max(0, int(dev_in)) if dev_in.isdigit() else default_dev
+
+        if atcs_device_index is not None:
+            atcs_dev = max(0, int(atcs_device_index))
+        elif auto_defaults:
+            atcs_dev = default_atcs_dev
+        else:
+            atcs_in = input(f"[?] SDR device index for ATCS 900 MHz (ApexBOSLatch --device) (default: {default_atcs_dev}): ").strip()
+            atcs_dev = max(0, int(atcs_in)) if atcs_in.isdigit() else default_atcs_dev
+
+        if fred_device_index is not None:
+            fred_dev = max(0, int(fred_device_index))
+        elif auto_defaults:
+            fred_dev = default_fred_dev
+        else:
+            fred_in = input(f"[?] SDR device index for EOT/HOT 450 MHz (ApexBOSFred --device) (default: {default_fred_dev}): ").strip()
+            fred_dev = max(0, int(fred_in)) if fred_in.isdigit() else default_fred_dev
 
         default_gain = str(ex_grab.get("gain", "auto"))
         if auto_defaults:
@@ -1261,8 +1295,78 @@ def run_cli_wizard(
             if do_inst:
                 ensure_pyrtlsdr(output_callback=lambda l: print(f"    {l}"))
 
-    # 7. Boot Services
-    print("\n--- Step 7: System Boot Automation ---")
+        # 7. Dedicated ATCS (ApexBOSLatch) Configuration (no scanner)
+        print("\n--- Step 7: ATCS 900 MHz (ApexBOSLatch) Configuration ---")
+        default_latch_en = bool(ex_latch.get("enabled", True))
+        default_latch_chans = str(ex_latch.get("chans") or "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6")
+        default_latch_gain = str(ex_latch.get("gain", gain_val) or gain_val).strip()
+        try:
+            default_latch_ppm = int(ex_latch.get("ppm", ppm_val))
+        except (ValueError, TypeError):
+            default_latch_ppm = ppm_val
+        if auto_defaults:
+            latch_enabled = default_latch_en
+            latch_chans = default_latch_chans
+            latch_gain_val = default_latch_gain
+            latch_ppm_val = default_latch_ppm
+        else:
+            en_def_s = "Y/n" if default_latch_en else "y/N"
+            en_in = input(f"[?] Include ApexBOSLatch (900 MHz ATCS) on Launcher? [{en_def_s}]: ").strip().lower()
+            latch_enabled = default_latch_en if not en_in else (en_in in ("y", "yes"))
+            if latch_enabled:
+                ch_in = input(
+                    f"[?] ATCS channels to monitor (BCP1-BCP6, MCP1-MCP6, or 1-6,11-16) (default: {default_latch_chans}): "
+                ).strip()
+                latch_chans = ch_in if ch_in else default_latch_chans
+                lg_in = input(f"[?] Latch SDR Tuner Gain (dB or 'auto') (default: {default_latch_gain}): ").strip()
+                latch_gain_val = lg_in if lg_in else default_latch_gain
+                lp_in = input(f"[?] Latch SDR Freq Correction PPM (default: {default_latch_ppm}): ").strip()
+                try:
+                    latch_ppm_val = int(lp_in) if lp_in else default_latch_ppm
+                except ValueError:
+                    latch_ppm_val = default_latch_ppm
+            else:
+                latch_chans = default_latch_chans
+                latch_gain_val = default_latch_gain
+                latch_ppm_val = default_latch_ppm
+
+        # 8. Dedicated EOT/HOT/DPU/RLC (ApexBOSFred) Configuration (no scanner)
+        print("\n--- Step 8: EOT/HOT/DPU/RLC 450 MHz (ApexBOSFred) Configuration ---")
+        default_fred_en = bool(ex_fred.get("enabled", True))
+        default_fred_chans = str(ex_fred.get("chans") or "EOT,DPU3,DPU4")
+        default_fred_gain = str(ex_fred.get("gain", gain_val) or gain_val).strip()
+        try:
+            default_fred_ppm = int(ex_fred.get("ppm", ppm_val))
+        except (ValueError, TypeError):
+            default_fred_ppm = ppm_val
+        if auto_defaults:
+            fred_enabled = default_fred_en
+            fred_chans = default_fred_chans
+            fred_gain_val = default_fred_gain
+            fred_ppm_val = default_fred_ppm
+        else:
+            en_def_s = "Y/n" if default_fred_en else "y/N"
+            en_in = input(f"[?] Include ApexBOSFred (450 MHz EOT/HOT/DPU/RLC) on Launcher? [{en_def_s}]: ").strip().lower()
+            fred_enabled = default_fred_en if not en_in else (en_in in ("y", "yes"))
+            if fred_enabled:
+                ch_in = input(
+                    f"[?] Fred channels (EOT,HOT,DPU1-4,RLC1-5 or 1-11) (default: {default_fred_chans}): "
+                ).strip()
+                fred_chans = ch_in if ch_in else default_fred_chans
+                fg_in = input(f"[?] Fred SDR Tuner Gain (dB or 'auto') (default: {default_fred_gain}): ").strip()
+                fred_gain_val = fg_in if fg_in else default_fred_gain
+                fp_in = input(f"[?] Fred SDR Freq Correction PPM (default: {default_fred_ppm}): ").strip()
+                try:
+                    fred_ppm_val = int(fp_in) if fp_in else default_fred_ppm
+                except ValueError:
+                    fred_ppm_val = default_fred_ppm
+            else:
+                fred_chans = default_fred_chans
+                fred_gain_val = default_fred_gain
+                fred_ppm_val = default_fred_ppm
+
+    # 9. Boot Services
+    print("\n--- Step 9: System Boot Automation ---")
     if auto_defaults:
         boot_in = "n"
     else:
@@ -1292,9 +1396,19 @@ def run_cli_wizard(
         channels=chans_input,
         ports=parsed_ports,
         device_index=dev,
+        atcs_device_index=atcs_dev,
+        fred_device_index=fred_dev,
+        latch_enabled=latch_enabled,
+        latch_chans=latch_chans,
+        fred_enabled=fred_enabled,
+        fred_chans=fred_chans,
         sdr=sdr,
         gain=gain_val,
         ppm=ppm_val,
+        latch_gain=latch_gain_val if deployment_mode != "engines_viewers" else None,
+        latch_ppm=latch_ppm_val if deployment_mode != "engines_viewers" else None,
+        fred_gain=fred_gain_val if deployment_mode != "engines_viewers" else None,
+        fred_ppm=fred_ppm_val if deployment_mode != "engines_viewers" else None,
         packet_source=packet_source,
         flux_mcast_group=flux_mcast_group,
         flux_mcast_port=flux_mcast_port,
@@ -1340,14 +1454,426 @@ def run_cli_wizard(
 
 STEP_TITLES = [
     "",
-    "Step 1 of 7: System Dependencies & Python Packages",
-    "Step 2 of 7: Deployment Topology Selection",
-    "Step 3 of 7: Banc Cloud & Network Configuration",
-    "Step 4 of 7: Security - Authentication Secret & Encryption Key",
-    "Step 5 of 7: Radio Channels & Multiprocessing Setup",
-    "Step 6 of 7: SDR Hardware - Device Index & rtl_tcp / DLL Paths",
-    "Step 7 of 7: Boot Automation & Desktop Shortcuts",
+    "Step 1 of 9: System Dependencies & Python Packages",
+    "Step 2 of 9: Deployment Topology Selection",
+    "Step 3 of 9: Banc Cloud & Network Configuration",
+    "Step 4 of 9: Security - Authentication Secret & Encryption Key",
+    "Step 5 of 9: PTC Radio Channels & Multiprocessing Setup",
+    "Step 6 of 9: PTC Grabber SDR Hardware & Paths",
+    "Step 7 of 9: ATCS 900 MHz (ApexBOSLatch) Setup",
+    "Step 8 of 9: EOT/HOT/DPU/RLC 450 MHz (ApexBOSFred) Setup",
+    "Step 9 of 9: Boot Automation & Desktop Shortcuts",
 ]
+
+
+class WizardTileMapManager:
+    """Lightweight Web Mercator tile fetcher & cache for the Setup Wizard RF area picker."""
+
+    def __init__(self, cache_dir: Optional[str] = None):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.cache_dir = cache_dir or os.path.join(base_dir, "map_cache")
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception:
+            pass
+        self.surface_cache: Dict[Tuple[str, int, int, int], Any] = {}
+        self.pending: set = set()
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def latlon_to_world_px(lat: float, lon: float, zoom: int) -> Tuple[float, float]:
+        lat_rad = math.radians(max(-85.0511, min(85.0511, float(lat))))
+        n = 2.0 ** int(zoom)
+        x = (float(lon) + 180.0) / 360.0 * n * 256.0
+        y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n * 256.0
+        return x, y
+
+    @staticmethod
+    def world_px_to_latlon(px: float, py: float, zoom: int) -> Tuple[float, float]:
+        n = 2.0 ** int(zoom)
+        lon = (float(px) / (n * 256.0)) * 360.0 - 180.0
+        val = max(-50.0, min(50.0, math.pi * (1.0 - 2.0 * float(py) / (n * 256.0))))
+        lat = math.degrees(math.atan(math.sinh(val)))
+        return max(-85.0511, min(85.0511, lat)), max(-180.0, min(180.0, lon))
+
+    @staticmethod
+    def miles_to_pixels(miles: float, lat: float, zoom: int) -> float:
+        meters = max(0.1, float(miles)) * 1609.344
+        cos_lat = max(0.15, math.cos(math.radians(max(-80.0, min(80.0, float(lat))))))
+        meters_per_px = (156543.03392 * cos_lat) / (2.0 ** int(zoom))
+        return max(4.0, meters / max(0.01, meters_per_px))
+
+    def _tile_filepath(self, z: int, x: int, y: int, layer: str = "osm") -> str:
+        ext = "jpg" if layer == "sat" else "png"
+        return os.path.join(self.cache_dir, f"{layer}_{z}_{x}_{y}.{ext}")
+
+    def _fetch_worker(self, z: int, x: int, y: int, layer: str = "osm"):
+        path = self._tile_filepath(z, x, y, layer)
+        if not os.path.exists(path):
+            if layer == "sat":
+                url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+            else:
+                url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+            req = urllib.request.Request(url, headers={"User-Agent": f"ApexBOSSetup/{VERSION} (MIT License)"})
+            try:
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    data = resp.read()
+                with open(path, "wb") as f:
+                    f.write(data)
+            except Exception:
+                pass
+        with self.lock:
+            self.pending.discard((layer, z, x, y))
+
+    def get_tile_surface(self, z: int, x: int, y: int, layer: str = "osm"):
+        import pygame
+        key = (layer, z, x, y)
+        if key in self.surface_cache:
+            return self.surface_cache[key]
+        path = self._tile_filepath(z, x, y, layer)
+        if os.path.exists(path):
+            try:
+                surf = pygame.image.load(path).convert()
+                self.surface_cache[key] = surf
+                return surf
+            except Exception:
+                pass
+        if os.environ.get("SDL_VIDEODRIVER", "").lower() == "dummy":
+            return None
+        with self.lock:
+            if key not in self.pending:
+                self.pending.add(key)
+                threading.Thread(target=self._fetch_worker, args=(z, x, y, layer), daemon=True).start()
+        return None
+
+
+class SdrRegionMapModal:
+    """
+    Optional privacy-preserving map picker modal for Grabber / Latch / Fred SDRs.
+    When the user clicks a map location, a one-time cryptographically random offset
+    (2.5-4.5 mi) is applied and the reported radius is padded to enclose the full RF
+    reception area. Only the blurred region dict is returned on Save; raw click GPS
+    is discarded immediately.
+    """
+
+    def __init__(
+        self,
+        tile_mgr: WizardTileMapManager,
+        target_key: str,
+        title: str,
+        existing_region: Optional[Dict[str, float]],
+        default_radius_mi: float,
+        min_radius_mi: float,
+        max_radius_mi: float,
+        on_save_cb: Callable[[Optional[Dict[str, float]]], None],
+        on_cancel_cb: Callable[[], None],
+        fonts: Tuple[Any, Any, Any],
+    ):
+        import pygame
+        self.tile_mgr = tile_mgr
+        self.target_key = target_key
+        self.title = title
+        self.min_radius_mi = float(min_radius_mi)
+        self.max_radius_mi = float(max_radius_mi)
+        self.on_save_cb = on_save_cb
+        self.on_cancel_cb = on_cancel_cb
+        self.font_h2, self.font_body, self.font_sm = fonts
+
+        self.layer = "osm"
+        self.is_panning = False
+        self.pan_has_moved = False
+        self.pan_start_mouse = (0, 0)
+        self.pan_start_world_px = (0.0, 0.0)
+
+        self.raw_pick_latlon: Optional[Tuple[float, float]] = None
+        if isinstance(existing_region, dict) and existing_region.get("region_lat") is not None:
+            self.blurred_region: Optional[Dict[str, float]] = dict(existing_region)
+            self.center_lat = float(existing_region["region_lat"])
+            self.center_lon = float(existing_region["region_lon"])
+            self.rx_radius_mi = max(
+                self.min_radius_mi,
+                min(self.max_radius_mi, float(existing_region.get("region_radius_mi", default_radius_mi)) - 3.0),
+            )
+            self.zoom = 9
+        else:
+            self.blurred_region = None
+            self.center_lat = 39.8283
+            self.center_lon = -98.5795
+            self.rx_radius_mi = float(default_radius_mi)
+            self.zoom = 4
+
+        self.modal_rect = pygame.Rect(30, 25, 800, 590)
+        self.map_rect = pygame.Rect(46, 86, 768, 392)
+        self.btn_rects: Dict[str, pygame.Rect] = {}
+        self._build_rects()
+
+    def _build_rects(self):
+        import pygame
+        mr = self.modal_rect
+        self.btn_rects = {
+            "zoom_in": pygame.Rect(mr.right - 216, mr.y + 16, 34, 28),
+            "zoom_out": pygame.Rect(mr.right - 176, mr.y + 16, 34, 28),
+            "layer": pygame.Rect(mr.right - 134, mr.y + 16, 118, 28),
+            "rad_minus": pygame.Rect(mr.x + 178, mr.bottom - 94, 32, 28),
+            "rad_plus": pygame.Rect(mr.x + 286, mr.bottom - 94, 32, 28),
+            "save": pygame.Rect(mr.right - 178, mr.bottom - 48, 162, 34),
+            "clear": pygame.Rect(mr.right - 278, mr.bottom - 48, 90, 34),
+            "cancel": pygame.Rect(mr.x + 16, mr.bottom - 48, 96, 34),
+        }
+
+    def apply_picked_location(self, lat: float, lon: float, rx_radius_mi: Optional[float] = None, rng: Optional[Any] = None) -> Dict[str, float]:
+        """Generates a fresh privacy-blurred circle from a clicked map coordinate."""
+        if rx_radius_mi is not None:
+            self.rx_radius_mi = max(self.min_radius_mi, min(self.max_radius_mi, float(rx_radius_mi)))
+        self.raw_pick_latlon = (float(lat), float(lon))
+        self.blurred_region = config_loader.blur_sdr_gps_for_privacy(
+            lat, lon, rx_radius_mi=self.rx_radius_mi, rng=rng
+        )
+        return dict(self.blurred_region)
+
+    def _adjust_radius(self, delta_mi: float):
+        new_r = max(self.min_radius_mi, min(self.max_radius_mi, round(self.rx_radius_mi + delta_mi, 1)))
+        if new_r == self.rx_radius_mi:
+            return
+        self.rx_radius_mi = new_r
+        if self.raw_pick_latlon is not None:
+            # Re-blur around current ephemeral click with new radius
+            self.blurred_region = config_loader.blur_sdr_gps_for_privacy(
+                self.raw_pick_latlon[0], self.raw_pick_latlon[1], rx_radius_mi=self.rx_radius_mi
+            )
+        elif self.blurred_region is not None:
+            # Adjust existing blurred radius without re-rolling center
+            self.blurred_region["region_radius_mi"] = round(min(80.0, self.rx_radius_mi + 3.5), 2)
+
+    def _zoom_at(self, mx: int, my: int, delta_z: int):
+        new_z = max(3, min(16, self.zoom + delta_z))
+        if new_z == self.zoom:
+            return
+        if self.map_rect.collidepoint(mx, my):
+            cx_px, cy_px = self.tile_mgr.latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+            dx = mx - self.map_rect.centerx
+            dy = my - self.map_rect.centery
+            h_lat, h_lon = self.tile_mgr.world_px_to_latlon(cx_px + dx, cy_px + dy, self.zoom)
+            self.zoom = new_z
+            nx, ny = self.tile_mgr.latlon_to_world_px(h_lat, h_lon, self.zoom)
+            self.center_lat, self.center_lon = self.tile_mgr.world_px_to_latlon(nx - dx, ny - dy, self.zoom)
+        else:
+            self.zoom = new_z
+
+    def _screen_to_latlon(self, mx: int, my: int) -> Tuple[float, float]:
+        cx_px, cy_px = self.tile_mgr.latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+        dx = mx - self.map_rect.centerx
+        dy = my - self.map_rect.centery
+        return self.tile_mgr.world_px_to_latlon(cx_px + dx, cy_px + dy, self.zoom)
+
+    def _latlon_to_screen(self, lat: float, lon: float) -> Tuple[int, int]:
+        cx_px, cy_px = self.tile_mgr.latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+        tx_px, ty_px = self.tile_mgr.latlon_to_world_px(lat, lon, self.zoom)
+        return int(round(self.map_rect.centerx + (tx_px - cx_px))), int(round(self.map_rect.centery + (ty_px - cy_px)))
+
+    def handle_event(self, event) -> bool:
+        import pygame
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.raw_pick_latlon = None
+                self.on_cancel_cb()
+                return True
+            if event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                self._zoom_at(self.map_rect.centerx, self.map_rect.centery, 1)
+                return True
+            if event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                self._zoom_at(self.map_rect.centerx, self.map_rect.centery, -1)
+                return True
+            return True
+
+        if event.type == pygame.MOUSEWHEEL:
+            mx, my = pygame.mouse.get_pos()
+            self._zoom_at(mx, my, 1 if event.y > 0 else -1)
+            return True
+
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            pos = event.pos
+            if event.button == 4:
+                self._zoom_at(pos[0], pos[1], 1)
+                return True
+            if event.button == 5:
+                self._zoom_at(pos[0], pos[1], -1)
+                return True
+            if event.button != 1:
+                return True
+
+            if self.btn_rects["zoom_in"].collidepoint(pos):
+                self._zoom_at(self.map_rect.centerx, self.map_rect.centery, 1)
+            elif self.btn_rects["zoom_out"].collidepoint(pos):
+                self._zoom_at(self.map_rect.centerx, self.map_rect.centery, -1)
+            elif self.btn_rects["layer"].collidepoint(pos):
+                self.layer = "sat" if self.layer == "osm" else "osm"
+            elif self.btn_rects["rad_minus"].collidepoint(pos):
+                self._adjust_radius(-2.0)
+            elif self.btn_rects["rad_plus"].collidepoint(pos):
+                self._adjust_radius(2.0)
+            elif self.btn_rects["save"].collidepoint(pos):
+                # Discard raw click immediately; persist ONLY the sanitized blurred region!
+                self.raw_pick_latlon = None
+                clean = config_loader.sanitize_sdr_region(self.blurred_region) if self.blurred_region else None
+                self.on_save_cb(clean)
+            elif self.btn_rects["clear"].collidepoint(pos):
+                self.raw_pick_latlon = None
+                self.blurred_region = None
+                self.on_save_cb(None)
+            elif self.btn_rects["cancel"].collidepoint(pos):
+                self.raw_pick_latlon = None
+                self.on_cancel_cb()
+            elif self.map_rect.collidepoint(pos):
+                self.is_panning = True
+                self.pan_has_moved = False
+                self.pan_start_mouse = pos
+                self.pan_start_world_px = self.tile_mgr.latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+            return True
+
+        if event.type == pygame.MOUSEMOTION and self.is_panning:
+            dx = event.pos[0] - self.pan_start_mouse[0]
+            dy = event.pos[1] - self.pan_start_mouse[1]
+            if abs(dx) > 4 or abs(dy) > 4:
+                self.pan_has_moved = True
+            if self.pan_has_moved:
+                nx = self.pan_start_world_px[0] - dx
+                ny = self.pan_start_world_px[1] - dy
+                self.center_lat, self.center_lon = self.tile_mgr.world_px_to_latlon(nx, ny, self.zoom)
+            return True
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.is_panning:
+            self.is_panning = False
+            if not self.pan_has_moved and self.map_rect.collidepoint(event.pos):
+                lat, lon = self._screen_to_latlon(event.pos[0], event.pos[1])
+                self.apply_picked_location(lat, lon)
+                if self.zoom < 8:
+                    self.center_lat, self.center_lon = lat, lon
+                    self.zoom = 8
+            return True
+
+        return True
+
+    def draw(self, screen):
+        import pygame
+        dim = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+        dim.fill((6, 10, 18, 200))
+        screen.blit(dim, (0, 0))
+
+        mr = self.modal_rect
+        pygame.draw.rect(screen, COLOR_CARD, mr, border_radius=8)
+        pygame.draw.rect(screen, COLOR_ACCENT, mr, 2, border_radius=8)
+
+        title_lbl = self.font_h2.render(self.title, True, COLOR_ACCENT)
+        screen.blit(title_lbl, (mr.x + 16, mr.y + 18))
+        sub_lbl = self.font_sm.render(
+            "Click map to pick approx. SDR area | Drag to pan | Scroll or +/- to zoom",
+            True, COLOR_TEXT_DIM,
+        )
+        screen.blit(sub_lbl, (mr.x + 16, mr.y + 52))
+
+        # Draw map viewport
+        map_r = self.map_rect
+        pygame.draw.rect(screen, (16, 24, 36), map_r)
+        prev_clip = screen.get_clip()
+        screen.set_clip(map_r)
+
+        cx_px, cy_px = self.tile_mgr.latlon_to_world_px(self.center_lat, self.center_lon, self.zoom)
+        n_tiles = 2 ** self.zoom
+        min_tx = int((cx_px - map_r.w / 2.0) // 256)
+        max_tx = int((cx_px + map_r.w / 2.0) // 256)
+        min_ty = max(0, int((cy_px - map_r.h / 2.0) // 256))
+        max_ty = min(n_tiles - 1, int((cy_px + map_r.h / 2.0) // 256))
+
+        any_tile = False
+        for tx in range(min_tx, max_tx + 1):
+            wrapped_tx = tx % n_tiles
+            for ty in range(min_ty, max_ty + 1):
+                surf = self.tile_mgr.get_tile_surface(self.zoom, wrapped_tx, ty, self.layer)
+                sx = int(round(map_r.centerx + (tx * 256.0 - cx_px)))
+                sy = int(round(map_r.centery + (ty * 256.0 - cy_px)))
+                if surf is not None:
+                    screen.blit(surf, (sx, sy))
+                    any_tile = True
+                else:
+                    pygame.draw.rect(screen, (20, 30, 44), (sx, sy, 256, 256))
+                    pygame.draw.rect(screen, (32, 46, 64), (sx, sy, 256, 256), 1)
+
+        if not any_tile:
+            # Helpful lat/lon graticule fallback while loading or offline
+            hint = self.font_sm.render(
+                f"Map center: {self.center_lat:.3f}, {self.center_lon:.3f} (Zoom {self.zoom})",
+                True, COLOR_TEXT_DIM,
+            )
+            screen.blit(hint, (map_r.x + 12, map_r.y + 10))
+
+        # Draw blurred anonymous region circle (the ONLY data sent to Banc)
+        if self.blurred_region is not None:
+            b_lat = float(self.blurred_region["region_lat"])
+            b_lon = float(self.blurred_region["region_lon"])
+            b_rad_mi = float(self.blurred_region["region_radius_mi"])
+            bx, by = self._latlon_to_screen(b_lat, b_lon)
+            rad_px = int(round(self.tile_mgr.miles_to_pixels(b_rad_mi, b_lat, self.zoom)))
+            rad_px = max(8, min(1400, rad_px))
+            overlay = pygame.Surface((map_r.w, map_r.h), pygame.SRCALPHA)
+            pygame.draw.circle(overlay, (0, 212, 255, 52), (bx - map_r.x, by - map_r.y), rad_px)
+            pygame.draw.circle(overlay, (0, 212, 255, 220), (bx - map_r.x, by - map_r.y), rad_px, 2)
+            screen.blit(overlay, map_r.topleft)
+            pygame.draw.circle(screen, COLOR_ACCENT, (bx, by), 4)
+            lbl_b = self.font_sm.render(f"Anonymous Banc Region (~{b_rad_mi:.1f} mi)", True, COLOR_ACCENT)
+            screen.blit(lbl_b, (bx + 8, by - 16))
+
+        # Draw subtle local preview of user's clicked point (never persisted!)
+        if self.raw_pick_latlon is not None:
+            px, py = self._latlon_to_screen(self.raw_pick_latlon[0], self.raw_pick_latlon[1])
+            rx_px = int(round(self.tile_mgr.miles_to_pixels(self.rx_radius_mi, self.raw_pick_latlon[0], self.zoom)))
+            rx_px = max(5, min(1200, rx_px))
+            pygame.draw.circle(screen, COLOR_YELLOW, (px, py), rx_px, 1)
+            pygame.draw.circle(screen, COLOR_YELLOW, (px, py), 4)
+
+        screen.set_clip(prev_clip)
+        pygame.draw.rect(screen, COLOR_BORDER, map_r, 1)
+
+        # Controls below map
+        r_lbl = self.font_body.render("RF Rx Radius:", True, COLOR_TEXT)
+        screen.blit(r_lbl, (mr.x + 16, mr.bottom - 90))
+        rad_val_lbl = self.font_h2.render(f"{self.rx_radius_mi:.0f} mi", True, COLOR_ACCENT)
+        screen.blit(rad_val_lbl, (mr.x + 218, mr.bottom - 90))
+
+        if self.blurred_region is not None:
+            info_txt = (
+                f"Saved Blurred Center: {self.blurred_region['region_lat']:.3f}, "
+                f"{self.blurred_region['region_lon']:.3f}  |  Banc Enclosing Radius: "
+                f"{self.blurred_region['region_radius_mi']:.1f} mi"
+            )
+            info_col = COLOR_GREEN
+        else:
+            info_txt = "No location picked yet — click anywhere on the map (or Cancel for Auto)."
+            info_col = COLOR_TEXT_DIM
+        screen.blit(self.font_sm.render(info_txt, True, info_col), (mr.x + 335, mr.bottom - 87))
+
+        priv_txt = (
+            "Privacy: Raw click GPS is discarded immediately. A one-time random 2.5-4.5 mi offset is applied "
+            "and never shown to other users."
+        )
+        screen.blit(self.font_sm.render(priv_txt, True, COLOR_TEXT_DIM), (mr.x + 16, mr.bottom - 66))
+
+        # Buttons
+        btn_specs = [
+            ("zoom_in", "+", COLOR_BTN_HOVER, COLOR_TEXT),
+            ("zoom_out", "-", COLOR_BTN_HOVER, COLOR_TEXT),
+            ("layer", "View: Street" if self.layer == "osm" else "View: Satellite", COLOR_BTN_HOVER, COLOR_TEXT),
+            ("rad_minus", "-", COLOR_BTN_HOVER, COLOR_TEXT),
+            ("rad_plus", "+", COLOR_BTN_HOVER, COLOR_TEXT),
+            ("cancel", "Cancel", COLOR_BORDER, COLOR_TEXT),
+            ("clear", "Clear", (110, 48, 48), COLOR_TEXT),
+            ("save", "Save Blurred Area", COLOR_ACCENT if self.blurred_region else COLOR_BORDER, (10, 10, 10) if self.blurred_region else COLOR_TEXT_DIM),
+        ]
+        for b_key, b_txt, b_bg, b_fg in btn_specs:
+            r = self.btn_rects[b_key]
+            pygame.draw.rect(screen, b_bg, r, border_radius=4)
+            lbl = self.font_sm.render(b_txt, True, b_fg)
+            screen.blit(lbl, lbl.get_rect(center=r.center))
 
 
 class PygameSetupWizard:
@@ -1370,7 +1896,7 @@ class PygameSetupWizard:
         self.font_sm = pygame.font.SysFont("Consolas,DejaVu Sans Mono,monospace", 11)
 
         self.step = 1
-        self.total_steps = 7
+        self.total_steps = 9
 
         # Existing configuration provides defaults when re-running the wizard
         self.existing = load_existing_config()
@@ -1478,6 +2004,31 @@ class PygameSetupWizard:
         self.select_all_active: bool = False
 
         self.device_index = int(ex_grab.get("device", 0)) if str(ex_grab.get("device", 0)).isdigit() else 0
+        ex_latch_g = (self.existing or {}).get("latch", {}) if isinstance((self.existing or {}).get("latch"), dict) else {}
+        ex_fred_g = (self.existing or {}).get("fred", {}) if isinstance((self.existing or {}).get("fred"), dict) else {}
+        raw_atcs_g = ex_latch_g.get("device", ex_grab.get("atcs_device", config_loader.DEFAULT_ATCS_DEVICE))
+        raw_fred_g = ex_fred_g.get("device", ex_grab.get("fred_device", config_loader.DEFAULT_FRED_DEVICE))
+        self.atcs_device_index = int(raw_atcs_g) if str(raw_atcs_g).isdigit() else config_loader.DEFAULT_ATCS_DEVICE
+        self.fred_device_index = int(raw_fred_g) if str(raw_fred_g).isdigit() else config_loader.DEFAULT_FRED_DEVICE
+        self.latch_enabled = bool(ex_latch_g.get("enabled", True))
+        self.fred_enabled = bool(ex_fred_g.get("enabled", True))
+        self.fields["latch_chans"] = str(ex_latch_g.get("chans") or "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6")
+        self.fields["latch_gain"] = str(ex_latch_g.get("gain", ex_grab.get("gain", "auto")))
+        self.fields["latch_ppm"] = str(ex_latch_g.get("ppm", ex_grab.get("ppm", ex_grab.get("frequency_correction", 0))))
+        self.fields["fred_chans"] = str(ex_fred_g.get("chans") or "EOT,DPU3,DPU4")
+        self.fields["fred_gain"] = str(ex_fred_g.get("gain", ex_grab.get("gain", "auto")))
+        self.fields["fred_ppm"] = str(ex_fred_g.get("ppm", ex_grab.get("ppm", ex_grab.get("frequency_correction", 0))))
+        self.grabber_region: Optional[Dict[str, float]] = config_loader.sanitize_sdr_region(
+            ex_grab, default_radius_mi=config_loader.DEFAULT_PTC_RX_RADIUS_MI
+        )
+        self.latch_region: Optional[Dict[str, float]] = config_loader.sanitize_sdr_region(
+            ex_latch_g, default_radius_mi=config_loader.DEFAULT_ATCS_RX_RADIUS_MI
+        )
+        self.fred_region: Optional[Dict[str, float]] = config_loader.sanitize_sdr_region(
+            ex_fred_g, default_radius_mi=config_loader.DEFAULT_FRED_RX_RADIUS_MI
+        )
+        self.region_map_modal: Optional[SdrRegionMapModal] = None
+        self._tile_mgr: Optional[WizardTileMapManager] = None
         self.existing_sdr = config_loader._sdr_from_cfg(ex_grab)
         self.sdr_mode = str(ex_grab.get("sdr_mode") or self.existing_sdr.get("mode") or "auto").strip().lower()
         if self.sdr_mode not in ("auto", "pipe", "tcp", "rtlsdr", "rsptcp", "soapy", "stdin"):
@@ -1553,6 +2104,36 @@ class PygameSetupWizard:
             "dev_plus": (170, 140, 40, 36),
             "sdr_gain": (260, 140, 230, 36),
             "sdr_ppm": (530, 140, 260, 36),
+            "grabber_map_btn": (50, 502, 185, 32),
+            "grabber_map_clear": (244, 502, 68, 32),
+            # Dedicated Step 7 (ATCS Latch) widgets
+            "latch_enable_cb": (45, 128, 520, 28),
+            "atcs_dev_minus": (50, 196, 40, 34),
+            "atcs_dev_val": (95, 196, 70, 34),
+            "atcs_dev_plus": (170, 196, 40, 34),
+            "latch_gain": (260, 196, 230, 34),
+            "latch_ppm": (530, 196, 265, 34),
+            "latch_chans": (50, 268, 745, 34),
+            "latch_preset_bcp": (50, 310, 220, 30),
+            "latch_preset_mcp": (285, 310, 220, 30),
+            "latch_map_btn": (50, 372, 175, 32),
+            "latch_same_grabber": (235, 372, 155, 32),
+            "latch_map_clear": (400, 372, 62, 32),
+            # Dedicated Step 8 (EOT/HOT/DPU/RLC Fred) widgets
+            "fred_enable_cb": (45, 128, 560, 28),
+            "fred_dev_minus": (50, 196, 40, 34),
+            "fred_dev_val": (95, 196, 70, 34),
+            "fred_dev_plus": (170, 196, 40, 34),
+            "fred_gain": (260, 196, 230, 34),
+            "fred_ppm": (530, 196, 265, 34),
+            "fred_chans": (50, 268, 745, 34),
+            "fred_preset_457": (50, 310, 185, 30),
+            "fred_preset_452": (245, 310, 200, 30),
+            "fred_preset_eot": (455, 310, 130, 30),
+            "fred_preset_all": (595, 310, 200, 30),
+            "fred_map_btn": (50, 372, 175, 32),
+            "fred_same_grabber": (235, 372, 155, 32),
+            "fred_map_clear": (400, 372, 62, 32),
             "sdr_mode_auto": (50, 205, 100, 32),
             "sdr_mode_pipe": (156, 205, 100, 32),
             "sdr_mode_tcp": (262, 205, 100, 32),
@@ -1583,6 +2164,90 @@ class PygameSetupWizard:
         import pygame
         return pygame.Rect(35 + (n - 1) * 85, 195, 75, 38)
 
+    # ----- optional privacy-blurred SDR region helpers ----------------------
+    def _get_tile_mgr(self) -> WizardTileMapManager:
+        if self._tile_mgr is None:
+            self._tile_mgr = WizardTileMapManager()
+        return self._tile_mgr
+
+    def set_sdr_region_from_gps(
+        self,
+        target: str,
+        lat: float,
+        lon: float,
+        rx_radius_mi: Optional[float] = None,
+        rng: Optional[Any] = None,
+    ) -> Dict[str, float]:
+        """Applies one-time privacy blur to (lat, lon) and stores ONLY the blurred region."""
+        defaults = {
+            "grabber": config_loader.DEFAULT_PTC_RX_RADIUS_MI,
+            "latch": config_loader.DEFAULT_ATCS_RX_RADIUS_MI,
+            "fred": config_loader.DEFAULT_FRED_RX_RADIUS_MI,
+        }
+        rad = float(rx_radius_mi) if rx_radius_mi is not None else defaults.get(target, 12.0)
+        blurred = config_loader.blur_sdr_gps_for_privacy(lat, lon, rx_radius_mi=rad, rng=rng)
+        setattr(self, f"{target}_region", blurred)
+        return dict(blurred)
+
+    def copy_grabber_region_to(self, target: str) -> Optional[Dict[str, float]]:
+        """Copies Grabber's already-blurred RF area center to Latch or Fred (adjusting radius for Fred)."""
+        if not self.grabber_region:
+            self.status_msg = "Set Grabber RF Area on Step 6 first (or click Map to pick directly)."
+            return None
+        copied = dict(self.grabber_region)
+        if target == "fred":
+            # Keep Grabber's blurred center, cap enclosing radius to Fred's ~12-16 mi RF footprint
+            copied["region_radius_mi"] = round(min(float(copied.get("region_radius_mi", 16.0)), 16.0), 2)
+        setattr(self, f"{target}_region", copied)
+        self.status_msg = ""
+        return dict(copied)
+
+    def clear_sdr_region(self, target: str):
+        setattr(self, f"{target}_region", None)
+
+    def _open_region_map_modal(self, target: str):
+        specs = {
+            "grabber": ("PTC Grabber — Optional Approx. RF Area", config_loader.DEFAULT_PTC_RX_RADIUS_MI, 6.0, 45.0),
+            "latch": ("ATCS Latch — Optional Approx. RF Area", config_loader.DEFAULT_ATCS_RX_RADIUS_MI, 6.0, 40.0),
+            "fred": ("Fred (450 MHz EOT/HOT/DPU) — Optional RF Area", config_loader.DEFAULT_FRED_RX_RADIUS_MI, 6.0, 24.0),
+        }
+        title, def_r, min_r, max_r = specs.get(target, specs["fred"])
+        existing = getattr(self, f"{target}_region", None)
+        if existing is None and target != "grabber" and self.grabber_region is not None:
+            # Start map centered near Grabber's already-blurred area for convenience without overwriting yet
+            seed_view = dict(self.grabber_region)
+            seed_view["region_radius_mi"] = round(def_r + 3.0, 2)
+        else:
+            seed_view = existing
+
+        def _on_save(res: Optional[Dict[str, float]]):
+            setattr(self, f"{target}_region", res)
+            self.region_map_modal = None
+            self.status_msg = ""
+
+        def _on_cancel():
+            self.region_map_modal = None
+
+        self.region_map_modal = SdrRegionMapModal(
+            tile_mgr=self._get_tile_mgr(),
+            target_key=target,
+            title=title,
+            existing_region=seed_view,
+            default_radius_mi=def_r,
+            min_radius_mi=min_r,
+            max_radius_mi=max_r,
+            on_save_cb=_on_save,
+            on_cancel_cb=_on_cancel,
+            fonts=(self.font_h2, self.font_body, self.font_sm),
+        )
+
+    @staticmethod
+    def _format_region_summary(reg: Optional[Dict[str, float]], auto_txt: str) -> Tuple[str, bool]:
+        if isinstance(reg, dict) and reg.get("region_lat") is not None and reg.get("region_lon") is not None:
+            rad = float(reg.get("region_radius_mi", 12.0))
+            return f"Blurred ~{rad:.1f} mi @ {float(reg['region_lat']):.2f}, {float(reg['region_lon']):.2f}", True
+        return auto_txt, False
+
     # ----- main loop -------------------------------------------------------
     def run(self) -> Optional[Dict[str, Any]]:
         import pygame
@@ -1593,6 +2258,9 @@ class PygameSetupWizard:
             for event in events:
                 if event.type == pygame.QUIT:
                     return None
+                if self.region_map_modal is not None:
+                    self.region_map_modal.handle_event(event)
+                    continue
                 elif event.type == pygame.KEYDOWN:
                     self._handle_keydown(event)
                 elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -1686,6 +2354,19 @@ class PygameSetupWizard:
         ex_eng_conns = (self.existing or {}).get("engine", {}).get("connections", {})
         banc_init_hist = int(ex_eng_conns.get("banc_initial_history_sec", 60))
 
+        latch_gain_str = self.fields.get("latch_gain", gain_str).strip() or gain_str
+        latch_ppm_raw = self.fields.get("latch_ppm", str(ppm_int)).strip()
+        try:
+            latch_ppm_int = int(latch_ppm_raw) if latch_ppm_raw else ppm_int
+        except ValueError:
+            latch_ppm_int = ppm_int
+        fred_gain_str = self.fields.get("fred_gain", gain_str).strip() or gain_str
+        fred_ppm_raw = self.fields.get("fred_ppm", str(ppm_int)).strip()
+        try:
+            fred_ppm_int = int(fred_ppm_raw) if fred_ppm_raw else ppm_int
+        except ValueError:
+            fred_ppm_int = ppm_int
+
         cfg = config_loader.generate_unified_config(
             deployment_mode=dep_mode_val,
             banc_location=banc_loc_val,
@@ -1698,9 +2379,19 @@ class PygameSetupWizard:
             channels=chans_val,
             ports=ports_list,
             device_index=dev_idx,
+            atcs_device_index=getattr(self, "atcs_device_index", config_loader.DEFAULT_ATCS_DEVICE),
+            fred_device_index=getattr(self, "fred_device_index", config_loader.DEFAULT_FRED_DEVICE),
+            latch_enabled=(getattr(self, "latch_enabled", True) if dep_mode_val != "engines_viewers" else False),
+            latch_chans=self.fields.get("latch_chans", "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6").strip() or "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6",
+            fred_enabled=(getattr(self, "fred_enabled", True) if dep_mode_val != "engines_viewers" else False),
+            fred_chans=self.fields.get("fred_chans", "EOT,DPU3,DPU4").strip() or "EOT,DPU3,DPU4",
             sdr=sdr_val,
             gain=gain_str,
             ppm=ppm_int,
+            latch_gain=latch_gain_str if dep_mode_val != "engines_viewers" else None,
+            latch_ppm=latch_ppm_int if dep_mode_val != "engines_viewers" else None,
+            fred_gain=fred_gain_str if dep_mode_val != "engines_viewers" else None,
+            fred_ppm=fred_ppm_int if dep_mode_val != "engines_viewers" else None,
             packet_source=pkt_src_val,
             flux_mcast_group=flux_grp,
             flux_mcast_port=flux_prt,
@@ -1710,6 +2401,9 @@ class PygameSetupWizard:
             sdr_mode=mode_val if dep_mode_val != "engines_viewers" else None,
             rtl_tcp_host=tcp_h if dep_mode_val != "engines_viewers" else None,
             rtl_tcp_port=tcp_p if dep_mode_val != "engines_viewers" else None,
+            grabber_region=self.grabber_region if dep_mode_val != "engines_viewers" else None,
+            latch_region=self.latch_region if dep_mode_val != "engines_viewers" else None,
+            fred_region=self.fred_region if dep_mode_val != "engines_viewers" else None,
         )
         finalize_install(cfg, self.autostart_boot)
         return cfg
@@ -1984,6 +2678,32 @@ class PygameSetupWizard:
                     return False, "Enter a valid RTL-TCP server port (1-65535)."
             if self.fields["sdr_path"].strip() and self.sdr.get("error"):
                 return False, self.sdr["error"]
+        if self.step == 7 and getattr(self, "latch_enabled", True):
+            lg = self.fields.get("latch_gain", "auto").strip().lower()
+            if lg and lg != "auto":
+                try:
+                    float(lg)
+                except ValueError:
+                    return False, "Latch Tuner Gain must be 'auto' or a number in dB (e.g. 28.0)."
+            lp = self.fields.get("latch_ppm", "0").strip()
+            if lp:
+                try:
+                    int(lp)
+                except ValueError:
+                    return False, "Latch Freq Correction (PPM) must be an integer (e.g. 0, -15, 20)."
+        if self.step == 8 and getattr(self, "fred_enabled", True):
+            fg = self.fields.get("fred_gain", "auto").strip().lower()
+            if fg and fg != "auto":
+                try:
+                    float(fg)
+                except ValueError:
+                    return False, "Fred Tuner Gain must be 'auto' or a number in dB (e.g. 28.0)."
+            fp = self.fields.get("fred_ppm", "0").strip()
+            if fp:
+                try:
+                    int(fp)
+                except ValueError:
+                    return False, "Fred Freq Correction (PPM) must be an integer (e.g. 0, -15, 20)."
         return True, ""
 
     def _handle_mouse(self, event):
@@ -2017,9 +2737,9 @@ class PygameSetupWizard:
                                 target=lambda: setattr(self, "local_identities", collect_local_identities(h, [self.node_identity])),
                                 daemon=True,
                             ).start()
-                        self.step = 7
+                        self.step = 9
                         return
-                    elif self.step >= 7:
+                    elif self.step >= 9:
                         self.completed = True
                         return
 
@@ -2055,7 +2775,7 @@ class PygameSetupWizard:
             self._set_active(None)
             self.status_msg = ""
             if self.deployment_mode == "engines_viewers":
-                if self.step >= 7:
+                if self.step >= 9:
                     self.step = 3
                     return
                 elif self.step == 3:
@@ -2314,10 +3034,94 @@ class PygameSetupWizard:
             elif self._rect("sdr_path").collidepoint(pos):
                 self._set_active("sdr_path")
                 self.cursor_pos = self._calc_cursor_pos("sdr_path", pos[0])
+            elif self._rect("grabber_map_btn").collidepoint(pos):
+                self._set_active(None)
+                self._open_region_map_modal("grabber")
+            elif self.grabber_region is not None and self._rect("grabber_map_clear").collidepoint(pos):
+                self._set_active(None)
+                self.clear_sdr_region("grabber")
             else:
                 self._set_active(None)
 
         elif self.step == 7:
+            if self._rect("latch_enable_cb").collidepoint(pos):
+                self.latch_enabled = not self.latch_enabled
+                self._set_active(None)
+            elif self.latch_enabled:
+                if self._rect("atcs_dev_minus").collidepoint(pos):
+                    self.atcs_device_index = max(0, self.atcs_device_index - 1)
+                elif self._rect("atcs_dev_plus").collidepoint(pos):
+                    self.atcs_device_index = min(15, self.atcs_device_index + 1)
+                elif self._rect("latch_gain").collidepoint(pos):
+                    self._set_active("latch_gain")
+                    self.cursor_pos = self._calc_cursor_pos("latch_gain", pos[0])
+                elif self._rect("latch_ppm").collidepoint(pos):
+                    self._set_active("latch_ppm")
+                    self.cursor_pos = self._calc_cursor_pos("latch_ppm", pos[0])
+                elif self._rect("latch_map_btn").collidepoint(pos):
+                    self._set_active(None)
+                    self._open_region_map_modal("latch")
+                elif self._rect("latch_same_grabber").collidepoint(pos):
+                    self._set_active(None)
+                    self.copy_grabber_region_to("latch")
+                elif self.latch_region is not None and self._rect("latch_map_clear").collidepoint(pos):
+                    self._set_active(None)
+                    self.clear_sdr_region("latch")
+                elif self._rect("latch_chans").collidepoint(pos):
+                    self._set_active("latch_chans")
+                    self.cursor_pos = self._calc_cursor_pos("latch_chans", pos[0])
+                elif self._rect("latch_preset_bcp").collidepoint(pos):
+                    self.fields["latch_chans"] = "BCP1,BCP2,BCP3,BCP4,BCP5,BCP6"
+                    self._set_active(None)
+                elif self._rect("latch_preset_mcp").collidepoint(pos):
+                    self.fields["latch_chans"] = "MCP1,MCP2,MCP3,MCP4,MCP5,MCP6"
+                    self._set_active(None)
+                else:
+                    self._set_active(None)
+
+        elif self.step == 8:
+            if self._rect("fred_enable_cb").collidepoint(pos):
+                self.fred_enabled = not self.fred_enabled
+                self._set_active(None)
+            elif self.fred_enabled:
+                if self._rect("fred_dev_minus").collidepoint(pos):
+                    self.fred_device_index = max(0, self.fred_device_index - 1)
+                elif self._rect("fred_dev_plus").collidepoint(pos):
+                    self.fred_device_index = min(15, self.fred_device_index + 1)
+                elif self._rect("fred_gain").collidepoint(pos):
+                    self._set_active("fred_gain")
+                    self.cursor_pos = self._calc_cursor_pos("fred_gain", pos[0])
+                elif self._rect("fred_ppm").collidepoint(pos):
+                    self._set_active("fred_ppm")
+                    self.cursor_pos = self._calc_cursor_pos("fred_ppm", pos[0])
+                elif self._rect("fred_map_btn").collidepoint(pos):
+                    self._set_active(None)
+                    self._open_region_map_modal("fred")
+                elif self._rect("fred_same_grabber").collidepoint(pos):
+                    self._set_active(None)
+                    self.copy_grabber_region_to("fred")
+                elif self.fred_region is not None and self._rect("fred_map_clear").collidepoint(pos):
+                    self._set_active(None)
+                    self.clear_sdr_region("fred")
+                elif self._rect("fred_chans").collidepoint(pos):
+                    self._set_active("fred_chans")
+                    self.cursor_pos = self._calc_cursor_pos("fred_chans", pos[0])
+                elif self._rect("fred_preset_457").collidepoint(pos):
+                    self.fields["fred_chans"] = "EOT,DPU3,DPU4"
+                    self._set_active(None)
+                elif self._rect("fred_preset_452").collidepoint(pos):
+                    self.fields["fred_chans"] = "HOT,DPU1,DPU2,RLC1,RLC2,RLC3,RLC4,RLC5"
+                    self._set_active(None)
+                elif self._rect("fred_preset_eot").collidepoint(pos):
+                    self.fields["fred_chans"] = "EOT"
+                    self._set_active(None)
+                elif self._rect("fred_preset_all").collidepoint(pos):
+                    self.fields["fred_chans"] = "EOT,HOT,DPU1,DPU2,DPU3,DPU4,RLC1,RLC2,RLC3,RLC4,RLC5"
+                    self._set_active(None)
+                else:
+                    self._set_active(None)
+
+        elif self.step == 9:
             if self._rect("boot_cb").collidepoint(pos):
                 self.autostart_boot = not self.autostart_boot
             elif self._rect("firewall_copy").collidepoint(pos):
@@ -2832,7 +3636,7 @@ class PygameSetupWizard:
         pygame.draw.line(self.screen, COLOR_BORDER, (0, self.height - 70), (self.width, self.height - 70), 1)
 
         btn_next = self._rect("next")
-        next_txt = "Finish" if (self.step == self.total_steps or (self.deployment_mode == "engines_viewers" and self.step == 7)) else "Next Step >"
+        next_txt = "Finish" if (self.step == self.total_steps or (self.deployment_mode == "engines_viewers" and self.step == 9)) else "Next Step >"
         pygame.draw.rect(self.screen, COLOR_ACCENT, btn_next, border_radius=4)
         lbl_next = self.font_h2.render(next_txt, True, (10, 10, 10))
         self.screen.blit(lbl_next, lbl_next.get_rect(center=btn_next.center))
@@ -2842,6 +3646,9 @@ class PygameSetupWizard:
             pygame.draw.rect(self.screen, COLOR_BORDER, btn_back, border_radius=4)
             lbl_back = self.font_body.render("< Back", True, COLOR_TEXT)
             self.screen.blit(lbl_back, lbl_back.get_rect(center=btn_back.center))
+
+        if self.region_map_modal is not None:
+            self.region_map_modal.draw(self.screen)
 
     def _draw_step1(self):
         import pygame
@@ -3240,7 +4047,7 @@ class PygameSetupWizard:
             self.sdr_env = config_loader.detect_sdr_environment(self.sdr.get("rtlsdr_dll_dir"))
         env = self.sdr_env
 
-        l1 = self.font_h2.render("Device Index:", True, COLOR_TEXT)
+        l1 = self.font_h2.render("PTC Grabber Device Index:", True, COLOR_TEXT)
         self.screen.blit(l1, (50, 112))
         self._draw_button("dev_minus", "-", COLOR_BTN_HOVER)
         pygame.draw.rect(self.screen, (24, 32, 45), self._rect("dev_val"), border_radius=4)
@@ -3355,7 +4162,164 @@ class PygameSetupWizard:
         mode_lbl = self.font_h2.render(f"Grabber will use: {mode_desc}, dev = {self.device_index}, gain = {gain_disp}, ppm = {ppm_disp}", True, COLOR_ACCENT)
         self.screen.blit(mode_lbl, (50, max(y + 4, 465)))
 
+        # Optional privacy-blurred RF Area picker for Grabber SDR
+        self._draw_button("grabber_map_btn", "Set RF Area (Map)...", COLOR_BTN_HOVER)
+        g_sum, g_set = self._format_region_summary(self.grabber_region, "RF Area: Auto (optional — click Map to set)")
+        if g_set:
+            self._draw_button("grabber_map_clear", "Clear", (110, 48, 48))
+            sum_x = 324
+        else:
+            sum_x = 248
+        self.screen.blit(self.font_sm.render(g_sum, True, COLOR_GREEN if g_set else COLOR_TEXT_DIM), (sum_x, 511))
+
     def _draw_step7(self):
+        import pygame
+        intro = self.font_body.render("Configure optional 900 MHz ATCS (ApexBOSLatch) demodulator on a dedicated SDR:", True, COLOR_TEXT)
+        self.screen.blit(intro, (35, 98))
+
+        # Include / Exclude Checkbox
+        box_r = pygame.Rect(45, 132, 20, 20)
+        pygame.draw.rect(self.screen, (24, 32, 45), box_r, border_radius=3)
+        pygame.draw.rect(self.screen, COLOR_ACCENT if self.latch_enabled else COLOR_BORDER, box_r, 1, border_radius=3)
+        if self.latch_enabled:
+            pygame.draw.rect(self.screen, COLOR_ACCENT, (box_r.x + 3, box_r.y + 3, 14, 14), border_radius=2)
+        cb_lbl = self.font_h2.render(
+            "Include ApexBOSLatch (900 MHz ATCS) on Launcher" if self.latch_enabled else "Exclude ApexBOSLatch (ATCS disabled — hidden from Launcher)",
+            True, COLOR_GREEN if self.latch_enabled else COLOR_TEXT_DIM,
+        )
+        self.screen.blit(cb_lbl, (76, 132))
+
+        if not self.latch_enabled:
+            note = self.font_body.render("Unchecked: ApexBOSLatch will be excluded. Click Next Step to continue.", True, COLOR_TEXT_DIM)
+            self.screen.blit(note, (50, 195))
+            return
+
+        l_dev = self.font_h2.render("ATCS Device Index:", True, COLOR_TEXT)
+        self.screen.blit(l_dev, (50, 172))
+        self._draw_button("atcs_dev_minus", "-", COLOR_BTN_HOVER)
+        pygame.draw.rect(self.screen, (24, 32, 45), self._rect("atcs_dev_val"), border_radius=4)
+        pygame.draw.rect(self.screen, COLOR_BORDER, self._rect("atcs_dev_val"), 1, border_radius=4)
+        adv = self.font_h2.render(str(self.atcs_device_index), True, COLOR_ACCENT)
+        self.screen.blit(adv, adv.get_rect(center=self._rect("atcs_dev_val").center))
+        self._draw_button("atcs_dev_plus", "+", COLOR_BTN_HOVER)
+
+        l_lgain = self.font_h2.render("Tuner Gain (dB or 'auto'):", True, COLOR_TEXT)
+        self.screen.blit(l_lgain, (260, 172))
+        self._draw_field("latch_gain", placeholder="e.g. auto, 28.0")
+
+        l_lppm = self.font_h2.render("Freq Correction (PPM):", True, COLOR_TEXT)
+        self.screen.blit(l_lppm, (530, 172))
+        self._draw_field("latch_ppm", placeholder="e.g. 0")
+
+        l_ch = self.font_h2.render("ATCS Channels to Monitor (BCP1-BCP6, MCP1-MCP6, or 1-6 / 11-16):", True, COLOR_TEXT)
+        self.screen.blit(l_ch, (50, 244))
+        self._draw_field("latch_chans", placeholder="e.g. BCP1,BCP2,BCP3,BCP4,BCP5,BCP6")
+        self._draw_button("latch_preset_bcp", "Preset: BCP 1-6 (935 MHz)", COLOR_BTN_HOVER)
+        self._draw_button("latch_preset_mcp", "Preset: MCP 1-6 (896 MHz)", COLOR_BTN_HOVER)
+
+        # Optional privacy-blurred RF Area picker for Latch SDR
+        l_reg_hdr = self.font_sm.render("Optional RF Area (Privacy-Blurred for Banc):", True, COLOR_TEXT_DIM)
+        self.screen.blit(l_reg_hdr, (50, 352))
+        self._draw_button("latch_map_btn", "Set RF Area (Map)...", COLOR_BTN_HOVER)
+        self._draw_button("latch_same_grabber", "Same as Grabber", COLOR_BTN_HOVER if self.grabber_region else COLOR_CARD, COLOR_TEXT if self.grabber_region else COLOR_TEXT_DIM)
+        l_sum, l_set = self._format_region_summary(self.latch_region, "RF Area: Auto (inherits Grabber / PTC)")
+        if l_set:
+            self._draw_button("latch_map_clear", "Clear", (110, 48, 48))
+            l_sum_x = 472
+        else:
+            l_sum_x = 402
+        self.screen.blit(self.font_sm.render(l_sum, True, COLOR_GREEN if l_set else COLOR_TEXT_DIM), (l_sum_x, 381))
+
+        card = pygame.Rect(45, 418, 760, 124)
+        pygame.draw.rect(self.screen, COLOR_CARD, card, border_radius=6)
+        pygame.draw.rect(self.screen, COLOR_BORDER, card, 1, border_radius=6)
+        info_lines = [
+            "Pre-FCC 900 MHz ATCS Channel Plan (F-1..F-6):",
+            "  BCP1-BCP6 (935.8875, 935.9375, 935.9875, 936.8875, 936.9375, 936.9875 MHz)",
+            "  MCP1-MCP6 (896.8875, 896.9375, 896.9875, 897.8875, 897.9375, 897.9875 MHz)",
+            "Note: If both BCP & MCP are listed on an RTL-SDR, Latch automatically selects the",
+            "larger frequency group (preferring MCP on a tie). ZMQ PUB :18201 | Chroma :18299/:18298.",
+        ]
+        for idx_l, txt_l in enumerate(info_lines):
+            c_l = COLOR_ACCENT if idx_l == 0 else COLOR_TEXT_DIM
+            self.screen.blit(self.font_sm.render(txt_l, True, c_l), (60, 430 + idx_l * 20))
+
+    def _draw_step8(self):
+        import pygame
+        intro = self.font_body.render("Configure optional 450 MHz EOT/HOT/DPU/RLC (ApexBOSFred) demodulator on a dedicated SDR:", True, COLOR_TEXT)
+        self.screen.blit(intro, (35, 98))
+
+        # Include / Exclude Checkbox
+        box_r = pygame.Rect(45, 132, 20, 20)
+        pygame.draw.rect(self.screen, (24, 32, 45), box_r, border_radius=3)
+        pygame.draw.rect(self.screen, COLOR_ACCENT if self.fred_enabled else COLOR_BORDER, box_r, 1, border_radius=3)
+        if self.fred_enabled:
+            pygame.draw.rect(self.screen, COLOR_ACCENT, (box_r.x + 3, box_r.y + 3, 14, 14), border_radius=2)
+        cb_lbl = self.font_h2.render(
+            "Include ApexBOSFred (450 MHz EOT/HOT/DPU/RLC) on Launcher" if self.fred_enabled else "Exclude ApexBOSFred (Fred disabled — hidden from Launcher)",
+            True, COLOR_GREEN if self.fred_enabled else COLOR_TEXT_DIM,
+        )
+        self.screen.blit(cb_lbl, (76, 132))
+
+        if not self.fred_enabled:
+            note = self.font_body.render("Unchecked: ApexBOSFred will be excluded. Click Next Step to continue.", True, COLOR_TEXT_DIM)
+            self.screen.blit(note, (50, 195))
+            return
+
+        l_dev = self.font_h2.render("Fred Device Index:", True, COLOR_TEXT)
+        self.screen.blit(l_dev, (50, 172))
+        self._draw_button("fred_dev_minus", "-", COLOR_BTN_HOVER)
+        pygame.draw.rect(self.screen, (24, 32, 45), self._rect("fred_dev_val"), border_radius=4)
+        pygame.draw.rect(self.screen, COLOR_BORDER, self._rect("fred_dev_val"), 1, border_radius=4)
+        fdv = self.font_h2.render(str(self.fred_device_index), True, COLOR_ACCENT)
+        self.screen.blit(fdv, fdv.get_rect(center=self._rect("fred_dev_val").center))
+        self._draw_button("fred_dev_plus", "+", COLOR_BTN_HOVER)
+
+        l_fgain = self.font_h2.render("Tuner Gain (dB or 'auto'):", True, COLOR_TEXT)
+        self.screen.blit(l_fgain, (260, 172))
+        self._draw_field("fred_gain", placeholder="e.g. auto, 28.0")
+
+        l_fppm = self.font_h2.render("Freq Correction (PPM):", True, COLOR_TEXT)
+        self.screen.blit(l_fppm, (530, 172))
+        self._draw_field("fred_ppm", placeholder="e.g. 0")
+
+        l_ch = self.font_h2.render("Channels to Monitor (mnemonics or IDs: EOT, HOT, DPU1-4, RLC1-5, 1-11):", True, COLOR_TEXT)
+        self.screen.blit(l_ch, (50, 244))
+        self._draw_field("fred_chans", placeholder="e.g. EOT,DPU3,DPU4 or HOT,DPU1,RLC1,4,7")
+        self._draw_button("fred_preset_457", "457 MHz (EOT+DPU3/4)", COLOR_BTN_HOVER)
+        self._draw_button("fred_preset_452", "452 MHz (HOT+DPU+RLC)", COLOR_BTN_HOVER)
+        self._draw_button("fred_preset_eot", "EOT Only", COLOR_BTN_HOVER)
+        self._draw_button("fred_preset_all", "All 11 (Wideband SDR)", COLOR_BTN_HOVER)
+
+        # Optional privacy-blurred RF Area picker for Fred SDR (10-16 mi regional EOT/HOT scoping)
+        f_reg_hdr = self.font_sm.render("Optional RF Area (10-16 mi EOT/HOT Scoping for Banc):", True, COLOR_TEXT_DIM)
+        self.screen.blit(f_reg_hdr, (50, 352))
+        self._draw_button("fred_map_btn", "Set RF Area (Map)...", COLOR_BTN_HOVER)
+        self._draw_button("fred_same_grabber", "Same as Grabber", COLOR_BTN_HOVER if self.grabber_region else COLOR_CARD, COLOR_TEXT if self.grabber_region else COLOR_TEXT_DIM)
+        f_sum, f_set = self._format_region_summary(self.fred_region, "RF Area: Auto (uses Grabber / PTC WIU)")
+        if f_set:
+            self._draw_button("fred_map_clear", "Clear", (110, 48, 48))
+            f_sum_x = 472
+        else:
+            f_sum_x = 402
+        self.screen.blit(self.font_sm.render(f_sum, True, COLOR_GREEN if f_set else COLOR_TEXT_DIM), (f_sum_x, 381))
+
+        card = pygame.Rect(45, 418, 760, 128)
+        pygame.draw.rect(self.screen, COLOR_CARD, card, border_radius=6)
+        pygame.draw.rect(self.screen, COLOR_BORDER, card, 1, border_radius=6)
+        info_lines = [
+            "450 MHz Railroad Telemetry Channel Plan:",
+            "  457 MHz Group (25 kHz):  EOT (457.9375), DPU3 (457.9250), DPU4 (457.9500)",
+            "  452 MHz Group (44 kHz):  HOT (452.9375), DPU1 (452.9250), DPU2 (452.9500),",
+            "                           RLC1-5 (452.93125, .94375, .95625, .96250, .96875)",
+            "Note: On an RTL-SDR, if channels span > 2 MHz, Fred selects the larger frequency",
+            "group (preferring the EOT 457 MHz group on a tie). ZMQ PUB :18301 | Chroma :18399/:18398.",
+        ]
+        for idx_l, txt_l in enumerate(info_lines):
+            c_l = COLOR_ACCENT if idx_l == 0 else COLOR_TEXT_DIM
+            self.screen.blit(self.font_sm.render(txt_l, True, c_l), (60, 428 + idx_l * 19))
+
+    def _draw_step9(self):
         import pygame
         txt = self.font_body.render("Configure automatic startup services, firewall permissions, and shortcuts:", True, COLOR_TEXT)
         self.screen.blit(txt, (35, 105))
@@ -3434,11 +4398,15 @@ def _arg_value(flag: str) -> Optional[str]:
 def main():
     if "--cli" in sys.argv or os.environ.get("SDL_VIDEODRIVER") == "dummy":
         dev = _arg_value("--device")
+        atcs_dev = _arg_value("--atcs-device")
+        fred_dev = _arg_value("--fred-device")
         run_cli_wizard(
             auto_defaults=("--yes" in sys.argv),
             auth_secret=_arg_value("--auth-secret"),
             encryption_key=_arg_value("--encryption-key"),
             device_index=int(dev) if dev and dev.isdigit() else None,
+            atcs_device_index=int(atcs_dev) if atcs_dev and atcs_dev.isdigit() else None,
+            fred_device_index=int(fred_dev) if fred_dev and fred_dev.isdigit() else None,
             sdr_path=_arg_value("--sdr-path"),
         )
     else:

@@ -1,0 +1,325 @@
+[
+    {
+        "type": "u16",
+        "name": "ADDR"
+    },
+    {
+        "type": "calc",
+        "name": "_node_id_",
+        "expression": "ADDR"
+    },
+    {
+        "type": "u8",
+        "name": "TRID"
+    },
+    {
+        "type": "int_bits",
+        "name": "TP",
+        "length": 2,
+        "format": "i",
+        "lookup": {
+            "0": "CM",
+            "1": "ST",
+            "2": "LK",
+            "3": "LR"
+        }
+    },
+    {
+        "type": "calc",
+        "name": "tp_label",
+        "expression": "{'CM': 'CMD', 'ST': 'STAT', 'LK': 'LINK', 'LR': 'LINK-ACK'}.get(TP, TP)"
+    },
+    {
+        "type": "int_bits",
+        "name": "OR",
+        "length": 1,
+        "format": "i",
+        "lookup": {
+            "0": "LD",
+            "1": "RM"
+        }
+    },
+    {
+        "type": "calc",
+        "name": "role",
+        "expression": "'REMOTE' if OR == 'RM' else 'LEAD'"
+    },
+    {
+        "type": "int_bits",
+        "name": "RP",
+        "length": 2,
+        "format": "i",
+        "lookup": {
+            "0": "DI",
+            "1": "RP",
+            "2": "RO",
+            "3": "DI"
+        }
+    },
+    {
+        "type": "calc",
+        "name": "rp_label",
+        "expression": "{'DI': 'Direct', 'RP': 'Repeat', 'RO': 'Offboard'}.get(RP, RP)"
+    },
+    {
+        "type": "int_bits",
+        "name": "NRM",
+        "length": 3,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "SEQ",
+        "length": 5,
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "_sequence_",
+        "expression": "SEQ"
+    },
+    {
+        "type": "int_bits",
+        "name": "REV",
+        "length": 2,
+        "format": "i",
+        "lookup": {
+            "0": "CT",
+            "1": "FO",
+            "2": "RE",
+            "3": "CT"
+        }
+    },
+    {
+        "type": "calc",
+        "name": "rev_label",
+        "expression": "{'CT': 'Cntr', 'FO': 'Fwd', 'RE': 'Rev'}.get(REV, REV)"
+    },
+    {
+        "type": "int_bits",
+        "name": "_rsv_b4",
+        "length": 1,
+        "format": "i"
+    },
+    {
+        "type": "u8",
+        "name": "Power_raw"
+    },
+    {
+        "type": "calc",
+        "name": "Power",
+        "expression": "'IDLE' if Power_raw == 0 else (('N' + str(Power_raw)) if 1 <= Power_raw <= 8 else ('IDLMD' if Power_raw == 9 else ('SETOT' if Power_raw == 10 else ('BSTUP' if Power_raw == 11 else (('B' + format((Power_raw - 16) * 0.25, '.2f')) if 16 <= Power_raw <= 48 else (('B' + format(min(8.0, (Power_raw - 128) * 0.10), '.2f')) if 128 <= Power_raw <= 208 else 'IDLE'))))))"
+    },
+    {
+        "type": "calc",
+        "name": "power_label",
+        "expression": "'Idle' if Power == 'IDLE' else ('IdleMode' if Power == 'IDLMD' else ('Set-Out' if Power == 'SETOT' else ('DynSetup' if Power == 'BSTUP' else (('Notch ' + Power[1:]) if Power.startswith('N') else (('DynBrk ' + Power[1:]) if Power.startswith('B') else Power)))))"
+    },
+    {
+        "type": "int_bits",
+        "name": "_rsv_b6",
+        "length": 4,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "PRK",
+        "length": 1,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "Sand",
+        "length": 1,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "BVIN",
+        "length": 1,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "MTR",
+        "length": 1,
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "flags_csv",
+        "expression": "', '.join(filter(None, ['Motoring' if MTR else '', 'Valve In' if BVIN else '', 'Sand' if Sand else '', 'ParkBrk' if PRK else '']))"
+    },
+    {
+        "type": "calc",
+        "name": "flags_part",
+        "expression": "(' [' + flags_csv + ']') if flags_csv else ''"
+    },
+    {
+        "type": "branch",
+        "condition": "TP == 'CM'",
+        "rules": [
+            {
+                "type": "u8",
+                "name": "BPRED",
+                "lookup": {
+                    "0": "REL",
+                    "255": "EMER"
+                }
+            },
+            {
+                "type": "calc",
+                "name": "bpred_label",
+                "expression": "'Rel' if BPRED == 'REL' else ('EMER' if BPRED == 'EMER' else ('-' + str(BPRED) + 'psi'))"
+            },
+            {
+                "type": "u8",
+                "name": "IB",
+                "lookup": {
+                    "253": "B",
+                    "254": "FULL",
+                    "255": "EMER"
+                }
+            },
+            {
+                "type": "calc",
+                "name": "ib_label",
+                "expression": "'Bail' if IB == 'B' else (IB if IB in ('FULL', 'EMER') else (str(IB) + 'psi'))"
+            },
+            {
+                "type": "skip",
+                "length": "end"
+            },
+            {
+                "type": "printf",
+                "name": "_scroll_ptc_",
+                "format": "[DPU {role}] {tp_label} #{ADDR} (Tr:{TRID}, {rp_label}, {NRM} rem) | {power_label} {rev_label}{flags_part} | BP:{bpred_label} Ind:{ib_label} | Seq:{SEQ}"
+            }
+        ]
+    },
+    {
+        "type": "branch",
+        "condition": "TP == 'ST'",
+        "rules": [
+            {
+                "type": "u8",
+                "name": "BP"
+            },
+            {
+                "type": "u8",
+                "name": "ER"
+            },
+            {
+                "type": "u8",
+                "name": "MR"
+            },
+            {
+                "type": "u8",
+                "name": "BC"
+            },
+            {
+                "type": "u8",
+                "name": "AF"
+            },
+            {
+                "type": "i8",
+                "name": "TRE"
+            },
+            {
+                "type": "calc",
+                "name": "tre_str",
+                "expression": "('+' + str(TRE)) if TRE >= 0 else str(TRE)"
+            },
+            {
+                "type": "int_bits",
+                "name": "_rsv_al",
+                "length": 3,
+                "format": "i"
+            },
+            {
+                "type": "int_bits",
+                "name": "AL_BPDR",
+                "length": 1,
+                "format": "i"
+            },
+            {
+                "type": "int_bits",
+                "name": "AL_BPRS",
+                "length": 1,
+                "format": "i"
+            },
+            {
+                "type": "int_bits",
+                "name": "AL_PCS",
+                "length": 1,
+                "format": "i"
+            },
+            {
+                "type": "int_bits",
+                "name": "AL_PEN",
+                "length": 1,
+                "format": "i"
+            },
+            {
+                "type": "int_bits",
+                "name": "AL_EMR",
+                "length": 1,
+                "format": "i"
+            },
+            {
+                "type": "calc",
+                "name": "AL",
+                "expression": "list(filter(None, ['EMR' if AL_EMR else '', 'PEN' if AL_PEN else '', 'PCS' if AL_PCS else '', 'BPRS' if AL_BPRS else '', 'BPDR' if AL_BPDR else '']))"
+            },
+            {
+                "type": "calc",
+                "name": "alarm_part",
+                "expression": "(' | ALARM:' + ','.join(AL)) if AL else ''"
+            },
+            {
+                "type": "skip",
+                "length": "end"
+            },
+            {
+                "type": "printf",
+                "name": "_scroll_ptc_",
+                "format": "[DPU {role}] {tp_label} #{ADDR} (Tr:{TRID}, {rp_label}, {NRM} rem) | {power_label} {rev_label}{flags_part} | BP:{BP} ER:{ER} MR:{MR} BC:{BC} psi Flow:{AF} Eff:{tre_str}{alarm_part} | Seq:{SEQ}"
+            }
+        ]
+    },
+    {
+        "type": "branch",
+        "condition": "TP == 'LK'",
+        "rules": [
+            {
+                "type": "skip",
+                "length": "end"
+            },
+            {
+                "type": "calc",
+                "name": "link_action",
+                "expression": "'UNLINK (0 rem)' if NRM == 0 else ('LINK (' + str(NRM) + ' rem)')"
+            },
+            {
+                "type": "printf",
+                "name": "_scroll_ptc_",
+                "format": "[DPU {role}] {tp_label} #{ADDR} (Tr:{TRID}, {rp_label}) | {link_action} | Seq:{SEQ}"
+            }
+        ]
+    },
+    {
+        "type": "branch",
+        "condition": "TP == 'LR'",
+        "rules": [
+            {
+                "type": "skip",
+                "length": "end"
+            },
+            {
+                "type": "printf",
+                "name": "_scroll_ptc_",
+                "format": "[DPU {role}] {tp_label} #{ADDR} (Tr:{TRID}, {rp_label}, {NRM} rem) | Handshake OK | Seq:{SEQ}"
+            }
+        ]
+    }
+]

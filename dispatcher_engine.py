@@ -361,11 +361,8 @@ class BaseElement:
                 self.add_rssi_sample(rssi)
         return matched
 
-    def check_ctc_match(self, parsed_pkt: dict) -> bool:
+    def _extract_ctc_tokens(self, parsed_pkt: dict) -> set:
         pkt_ctc = parsed_pkt.get("_ctc_id_") or parsed_pkt.get("ctc_id")
-        if not pkt_ctc and not self.ctc_rules:
-            return False
-
         active_tokens = set()
         if pkt_ctc:
             for tok in re.split(r"[,;\s]+", str(pkt_ctc).strip()):
@@ -385,6 +382,31 @@ class BaseElement:
                 active_tokens.add(str(k).lower())
             elif isinstance(v, str):
                 active_tokens.add(v.lower())
+        return active_tokens
+
+    def _ctc_id_matches_packet(self, parsed_pkt: dict) -> Optional[bool]:
+        """Returns True if self.ctc_id matches packet CTC/MCP ID, False if both are set and differ, else None."""
+        el_cid = str(self.ctc_id or "").strip().lower()
+        pkt_ids = [
+            str(x).strip().lower()
+            for x in (parsed_pkt.get("_ctc_id_"), parsed_pkt.get("ctc_id"), parsed_pkt.get("mcp_addr"))
+            if x is not None and str(x).strip()
+        ]
+        if not el_cid or not pkt_ids:
+            return None
+        return any(el_cid == pid or el_cid.lstrip("0") == pid.lstrip("0") for pid in pkt_ids)
+
+    def check_ctc_match(self, parsed_pkt: dict) -> bool:
+        pkt_ctc = parsed_pkt.get("_ctc_id_") or parsed_pkt.get("ctc_id")
+        if not pkt_ctc and not self.ctc_rules:
+            return False
+
+        # For ATCS packets, if this element is scoped to a specific ctc_id, do not match a different station's tokens
+        cid_match = self._ctc_id_matches_packet(parsed_pkt)
+        if parsed_pkt.get("protocol") == "atcs" and cid_match is False:
+            return False
+
+        active_tokens = self._extract_ctc_tokens(parsed_pkt)
 
         matched = False
         if self.ctc_rules:
@@ -392,8 +414,11 @@ class BaseElement:
                 matched = True
 
         if not matched and pkt_ctc:
+            if parsed_pkt.get("protocol") == "atcs" and self.ctc_rules:
+                # Scoped ATCS element with explicit ctc_rules only fires ctc_active when its rule matches
+                return False
             c_val = str(pkt_ctc).strip().lower()
-            if self.ctc_id and c_val == self.ctc_id.strip().lower():
+            if self.ctc_id and (cid_match is True or c_val == self.ctc_id.strip().lower()):
                 matched = True
             elif not self.ctc_id and c_val == self.id.strip().lower():
                 matched = True
@@ -550,9 +575,38 @@ class TrackSegment(BaseElement):
     _is_dimmed: bool = field(default=False, repr=False)
 
     def process_packet(self, parsed_pkt: dict, engine: "DispatcherEngine"):
-        self.check_ctc_match(parsed_pkt)
+        ctc_hit = self.check_ctc_match(parsed_pkt)
         self.update_rssi_from_packet(parsed_pkt)
         if not self._matches_wiu(parsed_pkt.get("_node_id_")):
+            if parsed_pkt.get("protocol") == "atcs":
+                cid_match = self._ctc_id_matches_packet(parsed_pkt)
+                if cid_match is True or (cid_match is None and ctc_hit):
+                    ts = parsed_pkt.get("timestamp", time.time())
+                    self._last_packet_ts = ts
+                    self._packets_received += 1
+                    raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+                    if raw_hex:
+                        self._last_raw_hex = str(raw_hex)
+                    if parsed_pkt.get("rssi") is not None:
+                        self.add_rssi_sample(parsed_pkt["rssi"])
+                    hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
+                    occ_val = None
+                    if self.ctc_rules:
+                        occ_val = bool(ctc_hit)
+                    elif "occupied" in hints:
+                        occ_val = bool(hints["occupied"])
+                    if occ_val is not None:
+                        prev_occ = self._hw_occupied
+                        self._hw_occupied = occ_val
+                        self._raw_occ_val = 1 if occ_val else 0
+                        if self._hw_occupied:
+                            self._inferred_occupied = False
+                            if not prev_occ:
+                                engine.record_train_sighting(self.id, ts)
+                        else:
+                            self._estimated_speed_mph = None
+                            self._train_direction = None
+                            self._train_name = None
             return
         self._last_packet_ts = parsed_pkt.get("timestamp", time.time())
         self._packets_received += 1
@@ -671,9 +725,41 @@ class Turnout(BaseElement):
     _is_dimmed: bool = field(default=False, repr=False)
 
     def process_packet(self, parsed_pkt: dict, engine: "DispatcherEngine"):
-        self.check_ctc_match(parsed_pkt)
+        ctc_hit = self.check_ctc_match(parsed_pkt)
         self.update_rssi_from_packet(parsed_pkt)
         if not self._matches_wiu(parsed_pkt.get("_node_id_")):
+            if parsed_pkt.get("protocol") == "atcs":
+                cid_match = self._ctc_id_matches_packet(parsed_pkt)
+                if cid_match is True or (cid_match is None and ctc_hit):
+                    ts = parsed_pkt.get("timestamp", time.time())
+                    self._last_packet_ts = ts
+                    self._packets_received += 1
+                    raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+                    if raw_hex:
+                        self._last_raw_hex = str(raw_hex)
+                    if parsed_pkt.get("rssi") is not None:
+                        self.add_rssi_sample(parsed_pkt["rssi"])
+                    hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
+                    toks = self._extract_ctc_tokens(parsed_pkt)
+                    sw_hint = str(hints.get("switch") or "").lower()
+                    if sw_hint == "reverse" or (not sw_hint and any(t in toks for t in ("k12", "k14", "c12", "c14"))):
+                        self._state = 1
+                        self._out_of_corr = False
+                    elif sw_hint == "normal" or (not sw_hint and any(t in toks for t in ("k11", "k13", "c11", "c13"))):
+                        self._state = 0
+                        self._out_of_corr = False
+                    if "occupied" in hints:
+                        prev_occ = self._hw_occupied
+                        self._hw_occupied = bool(hints["occupied"])
+                        self._raw_occ_val = 1 if self._hw_occupied else 0
+                        if self._hw_occupied:
+                            self._inferred_occupied = False
+                            if not prev_occ:
+                                engine.record_train_sighting(self.id, ts)
+                        else:
+                            self._estimated_speed_mph = None
+                            self._train_direction = None
+                            self._train_name = None
             return
         ts = parsed_pkt.get("timestamp", time.time())
         self._last_packet_ts = ts
@@ -775,9 +861,35 @@ class Signal(BaseElement):
     _hw_occupied: bool = field(default=False, repr=False)
 
     def process_packet(self, parsed_pkt: dict, engine: "DispatcherEngine"):
-        self.check_ctc_match(parsed_pkt)
+        ctc_hit = self.check_ctc_match(parsed_pkt)
         self.update_rssi_from_packet(parsed_pkt)
         if not self._matches_wiu(parsed_pkt.get("_node_id_")):
+            if parsed_pkt.get("protocol") == "atcs":
+                cid_match = self._ctc_id_matches_packet(parsed_pkt)
+                if cid_match is True or (cid_match is None and ctc_hit):
+                    ts = parsed_pkt.get("timestamp", time.time())
+                    self._last_packet_ts = ts
+                    self._packets_received += 1
+                    raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+                    if raw_hex:
+                        self._last_raw_hex = str(raw_hex)
+                    if parsed_pkt.get("rssi") is not None:
+                        self.add_rssi_sample(parsed_pkt["rssi"])
+                    hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
+                    new_lamp = None
+                    if self.ctc_rules:
+                        new_lamp = "green" if ctc_hit else "red"
+                    elif hints.get("signal"):
+                        new_lamp = str(hints["signal"]).lower()
+                    if new_lamp:
+                        was_perm = self.is_permissive
+                        self._prev_lamp_aspect = self._lamp_aspect
+                        self._raw_aspect_str = new_lamp
+                        self._lamp_aspect = new_lamp
+                        self._last_reported_color = self.base_color
+                        if was_perm and self.is_restricted:
+                            self._dropped_to_red_ts = ts
+                            engine.notify_signal_dropped(self, ts)
             return
         ts = parsed_pkt.get("timestamp", time.time())
         self._last_packet_ts = ts
@@ -1552,6 +1664,22 @@ class DispatcherEngine:
 
         self.parsers: List[PacketParser] = []
         self.reload_parsers()
+        self.atcs_decoder = None
+        self.dsu_decoder = None
+        self.rlc_decoder = None
+        self._aux_recent_seen: Dict[Tuple[str, str, int], float] = {}
+        try:
+            import ApexBOSLatch as _latch_mod
+            self.atcs_decoder = _latch_mod.AtcsRulesDecoder(config_dir=self.config_dir)
+        except Exception:
+            self.atcs_decoder = None
+        try:
+            import ApexBOSFred as _fred_mod
+            self.dsu_decoder = _fred_mod.DsuPacketDecoder(config_dir=self.config_dir)
+            self.rlc_decoder = _fred_mod.RlcRulesDecoder(config_dir=self.config_dir)
+        except Exception:
+            self.dsu_decoder = None
+            self.rlc_decoder = None
 
         self.signal_tables_cache: Dict[str, Dict[int, str]] = {}
         self.rrdata: Dict[str, str] = {}
@@ -1761,8 +1889,23 @@ class DispatcherEngine:
         return msg
 
     def reload_all_lookups(self) -> str:
-        """Reload parsers, rrdata, thanks.txt, signal tables, and re-evaluate the layout state."""
+        """Reload parsers, rrdata, thanks.txt, signal tables, ATCS/RLC rules, and re-evaluate the layout state."""
         msg = self.reload_parsers()
+        if getattr(self, "atcs_decoder", None) is not None:
+            try:
+                self.atcs_decoder.reload(force=True)
+            except Exception:
+                pass
+        if getattr(self, "dsu_decoder", None) is not None:
+            try:
+                self.dsu_decoder.reload(force=True)
+            except Exception:
+                pass
+        if getattr(self, "rlc_decoder", None) is not None:
+            try:
+                self.rlc_decoder.reload(force=True)
+            except Exception:
+                pass
         n_sig = 0
         for d in [self.config_dir, os.getcwd(), os.path.join(os.getcwd(), "config")]:
             try:
@@ -2296,10 +2439,53 @@ class DispatcherEngine:
 
         self._sorted_element_ids = sorted(self.elements.keys())
         self._refresh_wius_from_layout()
+        self.layout_geo_footprint = self._compute_layout_geo_footprint()
 
         # Load cached packet history for this layout, if available, upon startup / layout load
         if self.layout_filepath and self.load_packet_cache_enabled:
             self.load_packet_cache_from_temp(self.layout_filepath)
+
+    def _compute_layout_geo_footprint(self) -> Optional[Tuple[float, float, float]]:
+        """
+        Computes the active public layout's geographic centroid and max radius (km):
+          (center_lat, center_lon, radius_km)
+        Used by Banc consumers for privacy-preserving server-side regional filtering of
+        short-range 450 MHz EOT/HOT/DPU/RLC telemetry. Returns None if layout has no GPS.
+        """
+        pts: List[Tuple[float, float]] = []
+        for el in self.elements.values():
+            gps = getattr(el, "gps", None)
+            if isinstance(gps, (list, tuple)) and len(gps) >= 2:
+                try:
+                    lat, lon = float(gps[0]), float(gps[1])
+                    if -85.0 <= lat <= 85.0 and -180.0 <= lon <= 180.0 and not (lat == 0.0 and lon == 0.0):
+                        pts.append((lat, lon))
+                except (ValueError, TypeError):
+                    pass
+
+        if not pts and isinstance(getattr(self, "raw_layout_data", None), dict):
+            for k in ("gps", "center_gps"):
+                gps = self.raw_layout_data.get(k)
+                if isinstance(gps, (list, tuple)) and len(gps) >= 2:
+                    try:
+                        lat, lon = float(gps[0]), float(gps[1])
+                        if -85.0 <= lat <= 85.0 and -180.0 <= lon <= 180.0 and not (lat == 0.0 and lon == 0.0):
+                            pts.append((lat, lon))
+                    except (ValueError, TypeError):
+                        pass
+
+        if not pts:
+            return None
+
+        c_lat = sum(p[0] for p in pts) / len(pts)
+        c_lon = sum(p[1] for p in pts) / len(pts)
+        max_km = 0.0
+        for lat, lon in pts:
+            d_km = haversine_miles((c_lat, c_lon), (lat, lon)) * 1.609344
+            if d_km > max_km:
+                max_km = d_km
+        # Ensure at least a 10 km floor around single-point or compact layouts
+        return (round(c_lat, 5), round(c_lon, 5), round(max(10.0, max_km), 2))
 
     def load_layout(self, filepath: str):
         with open(filepath, "r", encoding="utf-8") as f:
@@ -3257,6 +3443,7 @@ class DispatcherEngine:
     def _evaluate_system_logic(self, now: float, force: bool = True):
         if not force and self.train_logic_interval_sec > 0:
             if (now - self.last_train_eval_ts) < self.train_logic_interval_sec:
+                self.train_scroller.prune_rf_trains(now=now)
                 self._refresh_green_paths_and_crossings(now)
                 return
         self.last_train_eval_ts = now
@@ -3362,7 +3549,13 @@ class DispatcherEngine:
         if getattr(self, "address_table_enabled", False):
             parts.append(f"at:{self.address_table.total_packets}")
         if getattr(self, "train_scroller_enabled", False):
-            ts_summary = ";".join(f"{k}:{v.get('status')}:{v.get('is_dimmed')}:{v.get('speed_str')}:{v.get('is_receiving_packets')}:{v.get('assigned_name')}:{v.get('assigned_id')}" for k, v in sorted(self.train_scroller.trains.items()))
+            ts_summary = ";".join(
+                f"{k}:{v.get('train_source')}:{v.get('status')}:{v.get('is_dimmed')}:{v.get('speed_str')}:"
+                f"{v.get('direction')}:{v.get('is_receiving_packets')}:{v.get('assigned_name')}:{v.get('assigned_id')}:"
+                f"{v.get('rssi_avg')}:{v.get('rssi_trend')}:{v.get('psi')}:{v.get('motion')}:{v.get('light_str')}:"
+                f"{v.get('packets_received')}"
+                for k, v in sorted(self.train_scroller.trains.items())
+            )
             parts.append(f"ts:{len(self.train_scroller.trains)}:{ts_summary}")
         if getattr(self, "chat_enabled", False) or (hasattr(self, "chat_panel") and len(self.chat_panel.messages) > 0):
             parts.append(f"chat:{self.chat_panel.total_messages}:{len(self.chat_panel.messages)}")
@@ -3483,6 +3676,95 @@ class DispatcherEngine:
         parsed_data = None
         if isinstance(raw_packet, dict) and (raw_packet.get("is_valid", True) or "_save_" in raw_packet or "_type_" in raw_packet or "_node_id_" in raw_packet):
             parsed_data = dict(raw_packet.get("data", raw_packet))
+        # Unified hook for ApexBOSLatch (ATCS 900 MHz) and ApexBOSFred (450 MHz EOT/HOT/DPU/RLC)
+        # Arriving identically via Flux Multicast, Banc Cloud (hex-encoded envelope or raw + b2/b3), or direct ZMQ
+        if not parsed_data and isinstance(raw_packet, (bytes, bytearray)):
+            env_obj = None
+            if len(raw_packet) > 2 and raw_packet[:2] in (b"A{", b"E{"):
+                try:
+                    cand_env = json.loads(bytes(raw_packet[1:]).decode("utf-8"))
+                    if isinstance(cand_env, dict) and cand_env.get("protocol") in ("atcs", "eot", "hot", "dpu", "dsu", "rlc"):
+                        env_obj = cand_env
+                except Exception:
+                    env_obj = None
+            elif meta:
+                meta_b2 = int(meta.get("b2", 0) or 0)
+                meta_proto = str(meta.get("protocol") or meta.get("b3") or "").strip().strip('"').lower()
+                if meta_b2 == 1 or meta_proto == "atcs":
+                    # Raw 12-byte ATCS payload fallback when stored without JSON envelope in Banc
+                    try:
+                        if len(raw_packet) >= 12:
+                            import ApexBOSLatch as _latch_mod
+                            w0 = int.from_bytes(raw_packet[0:4], "big")
+                            w1 = int.from_bytes(raw_packet[4:8], "big")
+                            w2 = int.from_bytes(raw_packet[8:12], "big")
+                            env_obj = _latch_mod.parse_atcs_frame_words([w0, w1, w2])
+                            if isinstance(env_obj, dict):
+                                env_obj["channel"] = int(meta.get("channel") or 0)
+                                env_obj["rssi"] = float(meta.get("rssi", -75.0))
+                    except Exception:
+                        env_obj = None
+                elif meta_b2 == 2 or meta_proto in ("eot", "hot", "dpu", "dsu", "rlc", "fred"):
+                    # Raw EOT/HOT/DPU/DSU/RLC payload fallback when stored without JSON envelope in Banc
+                    try:
+                        import ApexBOSFred as _fred_mod
+                        ch_m = int(meta.get("channel") or 1)
+                        if meta_proto in ("eot", "hot") or (meta_proto == "fred" and len(raw_packet) == 6):
+                            if len(raw_packet) >= 6:
+                                data45 = int.from_bytes(raw_packet[:6], "big") & ((1 << 45) - 1)
+                                env_obj = _fred_mod.parse_fred_data45(data45, channel_id=ch_m)
+                        elif meta_proto in ("dpu", "dsu"):
+                            env_obj = _fred_mod.parse_dpu_payload(bytes(raw_packet), ch_m)
+                        elif meta_proto == "rlc":
+                            env_obj = _fred_mod.parse_rlc_payload(bytes(raw_packet), ch_m)
+                        if isinstance(env_obj, dict):
+                            env_obj["channel"] = ch_m
+                            env_obj["rssi"] = float(meta.get("rssi", -75.0))
+                    except Exception:
+                        env_obj = None
+
+            if isinstance(env_obj, dict) and env_obj.get("protocol") in ("atcs", "eot", "hot", "dpu", "dsu", "rlc"):
+                # Dedup identical aux frames arriving via both Flux multicast and direct local ZMQ
+                # (Skip wall-clock suppression for BANC so rapid startup history bursts are never dropped)
+                is_banc_src = bool(meta and meta.get("source") == "BANC")
+                if not is_banc_src:
+                    aux_key = (
+                        str(env_obj.get("protocol")),
+                        str(env_obj.get("hex") or ""),
+                        int(env_obj.get("channel") or 0),
+                    )
+                    now_mono = time.monotonic()
+                    prev_mono = self._aux_recent_seen.get(aux_key)
+                    if prev_mono is not None and (now_mono - prev_mono) < max(0.05, min(0.35, float(self.dedup_ttl or 0.35))):
+                        self.suppressed_frames_count += 1
+                        self.last_ingest_status = "DUPLICATE_SEQ"
+                        return None
+                    self._aux_recent_seen[aux_key] = now_mono
+                    if len(self._aux_recent_seen) > 256:
+                        cutoff = now_mono - 2.0
+                        self._aux_recent_seen = {k: v for k, v in self._aux_recent_seen.items() if v >= cutoff}
+
+                proto_env = str(env_obj.get("protocol") or "").lower()
+                if proto_env == "atcs" and self.atcs_decoder is not None:
+                    # Always apply Engine's local config/atcs_rules.json (or default Spec 200 fallback)
+                    parsed_data = self.atcs_decoder.decode(env_obj)
+                elif proto_env in ("dpu", "dsu") and self.dsu_decoder is not None:
+                    # Full DSU/DPU header, routing, power, brake, telemetry & alarm decoding
+                    parsed_data = self.dsu_decoder.decode(env_obj)
+                elif proto_env == "rlc" and self.rlc_decoder is not None:
+                    # Look for config/rlc_rules.json; if missing, use existing fallback decoding
+                    parsed_data = self.rlc_decoder.decode(env_obj)
+                else:
+                    parsed_data = dict(env_obj)
+                parsed_data.setdefault("is_valid", True)
+                if "hex" in parsed_data and parsed_data["hex"]:
+                    orig_raw_hex = str(parsed_data["hex"]).upper()
+                if "rssi" in parsed_data and (not meta or "rssi" not in meta):
+                    meta = dict(meta or {})
+                    meta["rssi"] = parsed_data["rssi"]
+                if "channel" in parsed_data and (not meta or "channel" not in meta):
+                    meta = dict(meta or {})
+                    meta["channel"] = parsed_data["channel"]
         if not parsed_data:
             for cand in candidates:
                 for idx, parser_obj in enumerate(self.parsers):
@@ -3584,7 +3866,8 @@ class DispatcherEngine:
                 overwrite_gps=(pkt_gps is not None or (pkt_lat is not None and pkt_lon is not None)),
                 refresh_on_seen=True,
             )
-        self.scroller.add_packet(parsed_data)
+        if not parsed_data.get("_hide_scroller_"):
+            self.scroller.add_packet(parsed_data)
         self.train_scroller.check_packet(parsed_data)
         self._dispatch_packet_to_elements(parsed_data)
 
@@ -4339,7 +4622,7 @@ class DispatcherEngine:
                     if (getattr(el, "wiu_id", None) is not None or getattr(el, "radio_id", None) is not None) and getattr(el, "rssi_avg", None) is not None
                 },
             ) if getattr(self, "address_table_enabled", False) else None,
-            "train_scroller": self.train_scroller.to_state_dict() if getattr(self, "train_scroller_enabled", False) else None,
+            "train_scroller": self.train_scroller.to_state_dict(now=time.time()) if getattr(self, "train_scroller_enabled", False) else None,
             "chat": self.chat_panel.to_state_dict(active_identity=self.get_active_chat_identity()) if (getattr(self, "chat_enabled", False) or len(self.chat_panel.messages) > 0) else None,
             "chat_identity": self.get_active_chat_identity(),
         }

@@ -1,7 +1,7 @@
 {
-  "version": "v26.1116.33",
+  "version": "v26.1123.06",
   "layout_filename": "arrow_layout.json",
-  "updated_at": "2026-11-16 23:39:15",
+  "updated_at": "2026-11-25 15:01:08",
   "element_overrides": {
     "SYS_CHAT": {
       "width": 1228,
@@ -12,8 +12,8 @@
     "SYS_ADDRESS_TABLE": {
       "x": 62.0,
       "y": -10.5,
-      "width": 699,
-      "height": 1012
+      "width": 938,
+      "height": 1008
     },
     "SYS_PACKET_SCROLLER": {
       "x": -16.5,
@@ -24,13 +24,13 @@
     "SYS_TRAIN_SCROLLER": {
       "x": 16.5,
       "y": 17.0,
-      "width": 726,
-      "height": 196
+      "width": 1012,
+      "height": 365
     }
   },
   "view_state": {
-    "cam_x": 381.89,
-    "cam_y": 382.2,
+    "cam_x": 416.11,
+    "cam_y": 321.75,
     "zoom": 0.675
   }
 }

@@ -73,6 +73,10 @@ from train_logic import (
     TrainInferenceManager,
     get_signal_gps,
     get_element_gps_any,
+    fade_rgb_by_age,
+    RF_TRAIN_TIMEOUT_SEC,
+    sort_train_board_rows,
+    cycle_train_board_sort,
 )
 
 from version import VERSION, __version__
@@ -3851,6 +3855,14 @@ class ApexBOSCreatorApp:
         self.train_assign_buffers: Dict[str, str] = {"assigned_id": "", "assigned_name": ""}
         self._train_scroller_row_rects: List[Tuple[pygame.Rect, dict]] = []
         self._train_scroller_del_rects: List[Tuple[pygame.Rect, str]] = []
+        self._train_board_scroll_offset: int = 0
+        self._train_board_panel_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self._train_board_sort_rects: List[Tuple[pygame.Rect, str]] = []
+        self._train_board_btn_rects: Dict[str, pygame.Rect] = {}
+        self._train_board_sort_col: Optional[str] = None
+        self._train_board_sort_desc: bool = False
+        self._train_board_avail_rows: int = 8
+        self._train_board_total_items: int = 0
         self._last_engine_eval_ts: float = 0.0
 
         self.crank_engine()
@@ -5445,6 +5457,11 @@ class ApexBOSCreatorApp:
                         if r.collidepoint(mx, my):
                             self.inplace_editor.cycle_field_by_wheel(idx, 1 if event.y > 0 else -1)
                             break
+                elif self._train_board_panel_rect.width > 0 and self._train_board_panel_rect.collidepoint(mx, my):
+                    page_step = max(1, self._train_board_avail_rows)
+                    delta = -2 if event.y > 0 else 2
+                    max_scroll = max(0, self._train_board_total_items - page_step)
+                    self._train_board_scroll_offset = max(0, min(max_scroll, self._train_board_scroll_offset + delta))
                 else:
                     factor = 1.14 if event.y > 0 else (1.0 / 1.14)
                     self.zoom_at_cursor((mx, my), factor)
@@ -6990,7 +7007,22 @@ class ApexBOSCreatorApp:
             return
 
         if event.button == 1:
-            # Check Train Scroller delete and assignment row interactions
+            # Check Train Board sort & header buttons, delete, and assignment row interactions
+            for b_key, b_rect in self._train_board_btn_rects.items():
+                if b_rect.collidepoint(mx, my):
+                    if b_key == "recent":
+                        self._train_board_sort_col, self._train_board_sort_desc = cycle_train_board_sort(
+                            self._train_board_sort_col, self._train_board_sort_desc, "recent"
+                        )
+                        self._train_board_scroll_offset = 0
+                    return
+            for col_rect, col_key in self._train_board_sort_rects:
+                if col_rect.collidepoint(mx, my):
+                    self._train_board_sort_col, self._train_board_sort_desc = cycle_train_board_sort(
+                        self._train_board_sort_col, self._train_board_sort_desc, col_key
+                    )
+                    self._train_board_scroll_offset = 0
+                    return
             for del_rect, tkey in self._train_scroller_del_rects:
                 if del_rect.collidepoint(mx, my):
                     self.delete_train(tkey)
@@ -7439,6 +7471,8 @@ class ApexBOSCreatorApp:
     def draw_layout_state(self, state: dict, flash_on: bool):
         self._train_scroller_row_rects.clear()
         self._train_scroller_del_rects.clear()
+        self._train_board_sort_rects.clear()
+        self._train_board_btn_rects.clear()
         elements = state.get("elements", {})
         drawn_pairs = set()
         line_w = max(2 if self.zoom < 0.45 else 3, int(5 * self.zoom))
@@ -7866,40 +7900,112 @@ class ApexBOSCreatorApp:
 
             elif etype in SYSTEM_LIST_TYPES:
                 if etype == "train_scroller":
-                    def_w = el.get("width") or 430
-                    def_h = el.get("height") or 150
-                    w, h = max(380, int(def_w * self.zoom)), max(130, int(def_h * self.zoom))
+                    def_w = max(660, int(el.get("width") or 680))
+                    def_h = int(el.get("height") or 165)
+                    w, h = max(460, int(def_w * self.zoom)), max(130, int(def_h * self.zoom))
+                    self._train_board_panel_rect = pygame.Rect(sx, sy, w, h)
                     panel = pygame.Surface((w, h), pygame.SRCALPHA)
                     panel.fill(COLOR_HUD_BG)
                     bd_col = COLOR_SELECT_RING if eid in self.selected_ids else COLOR_HUD_BORDER
                     pygame.draw.rect(panel, bd_col, (0, 0, w, h), 2, border_radius=6)
-                    
-                    trains = list(self.engine.train_scroller.trains.values())
-                    hdr = f"[TRAINS] {disp_tag} ({len(trains)} active)"
+
+                    self.engine.train_scroller.prune_rf_trains()
+                    trains = sort_train_board_rows(
+                        list(self.engine.train_scroller.trains.values()),
+                        sort_col=self._train_board_sort_col,
+                        sort_desc=self._train_board_sort_desc,
+                    )
+                    avail_rows = max(1, (h - 52) // 19)
+                    self._train_board_avail_rows = avail_rows
+                    self._train_board_total_items = len(trains)
+                    max_scroll = max(0, len(trains) - avail_rows)
+                    self._train_board_scroll_offset = max(0, min(max_scroll, self._train_board_scroll_offset))
+
+                    hdr = f"[TRAIN BOARD] {disp_tag} ({len(trains)} active)"
                     panel.blit(self.font_md.render(hdr, True, COLOR_CROSSING_OPEN), (10, 8))
-                    
-                    col_hdr = f"{'STATUS':<10} {'TRAIN / NAME':<17} {'SPEED':<10} {'DIR':<5} {'RX':<6} {'LOCATION'}"
-                    panel.blit(self.font_sm_bold.render(col_hdr, True, (140, 180, 220)), (10, 28))
+
+                    # Recent Activity sort toggle button in header
+                    m_pos_hdr = pygame.mouse.get_pos()
+                    rec_active = (self._train_board_sort_col == "recent")
+                    rec_lbl = ("Recent v" if self._train_board_sort_desc else "Recent ^") if rec_active else "Recent"
+                    ts_rec = self.font_sm_bold.render(rec_lbl, True, (255, 235, 130) if rec_active else (235, 245, 255))
+                    bw_rec = ts_rec.get_width() + 10
+                    bx_rec = w - 8 - bw_rec
+                    if bx_rec > 185:
+                        rec_local = pygame.Rect(bx_rec, 5, bw_rec, 19)
+                        rec_scr = pygame.Rect(sx + bx_rec, sy + 5, bw_rec, 19)
+                        rec_hov = rec_scr.collidepoint(m_pos_hdr)
+                        pygame.draw.rect(panel, (42, 92, 132) if rec_active else ((20, 85, 125) if rec_hov else (32, 42, 58)), rec_local, border_radius=4)
+                        pygame.draw.rect(panel, (255, 210, 75) if rec_active else ((0, 210, 255) if rec_hov else COLOR_HUD_BORDER), rec_local, 1, border_radius=4)
+                        panel.blit(ts_rec, (bx_rec + 5, 7))
+                        self._train_board_btn_rects["recent"] = rec_scr
+
+                    ts_cols = [
+                        (10,  90,  "SOURCE",       "source"),
+                        (102, 130, "TRAIN / NAME", "name"),
+                        (234, 66,  "SPD/PWR",      "spd_pwr"),
+                        (302, 40,  "DIR",          "dir"),
+                        (344, 52,  "SIG",          "sig"),
+                        (398, 46,  "TRD",          "trd"),
+                        (446, 36,  "PSI",          None),
+                        (484, 40,  "MOT",          None),
+                        (526, 34,  "LGT",          None),
+                        (562, 100, "LOC / INFO",   None),
+                    ]
+                    for cx, cw, clbl, sort_k in ts_cols:
+                        if cx + 22 < w - 26:
+                            is_sorted = (sort_k is not None and self._train_board_sort_col == sort_k)
+                            arrow = (" v" if self._train_board_sort_desc else " ^") if is_sorted else ""
+                            disp_hdr = f"{clbl}{arrow}"
+                            hit_w = min(cw, max(24, (w - 26) - cx))
+                            hdr_scr = pygame.Rect(sx + cx - 2, sy + 26, hit_w, 16)
+                            is_hdr_hov = (sort_k is not None and hdr_scr.collidepoint(m_pos_hdr))
+                            if sort_k is not None:
+                                self._train_board_sort_rects.append((hdr_scr, sort_k))
+                            if is_sorted:
+                                pygame.draw.rect(panel, (28, 66, 98), (cx - 2, 26, hit_w, 16), border_radius=3)
+                                h_col = (255, 225, 95)
+                            elif is_hdr_hov:
+                                pygame.draw.rect(panel, (24, 46, 70), (cx - 2, 26, hit_w, 16), border_radius=3)
+                                h_col = (120, 230, 255)
+                            else:
+                                h_col = (140, 180, 220)
+                            panel.blit(self.font_sm_bold.render(disp_hdr, True, h_col), (cx, 28))
                     pygame.draw.line(panel, (55, 75, 105), (10, 43), (w - 10, 43), 1)
 
                     if not trains:
-                        panel.blit(self.font_sm.render("No trains currently tracked. Simulate by lining paths or toggling signals.", True, COLOR_TEXT_DIM), (10, 52))
+                        panel.blit(self.font_sm.render("No trains on board (PTC Inferred / HOT/EOT/DPU / EMP).", True, COLOR_TEXT_DIM), (10, 52))
                     else:
-                        max_r = int(el.get("extra_info") or 10)
-                        for drawn_idx, trn in enumerate(trains[:max_r]):
+                        now_wall = time.time()
+                        right_lim = w - 28
+                        vis_trains = trains[self._train_board_scroll_offset : self._train_board_scroll_offset + avail_rows]
+                        for drawn_idx, trn in enumerate(vis_trains):
                             row_y = 46 + drawn_idx * 19
                             if row_y + 18 > h - 4:
                                 break
                             st = trn.get("status", "Confirmed")
-                            is_dimmed = trn.get("is_dimmed", False)
+                            src = str(trn.get("train_source") or "PTC Inferred")
+                            is_rf = bool(trn.get("is_rf_train", False))
+                            is_dimmed = bool(trn.get("is_dimmed", False))
+                            last_rx_ts = float(trn.get("last_packet_ts") or trn.get("updated_ts") or now_wall)
+                            age_sec = max(0.0, now_wall - last_rx_ts)
+                            fade_max = float(trn.get("rf_timeout_sec") or RF_TRAIN_TIMEOUT_SEC) if is_rf else 180.0
+
                             disp_name = trn.get("assigned_name") or trn.get("train_name", "TRN")
                             if trn.get("assigned_id"):
                                 disp_name = f"{disp_name} (#{trn['assigned_id']})"
-                            spd_txt = trn.get("speed_str") or (f"{trn.get('speed_mph', 0.0):.1f} MPH" if trn.get("speed_mph") is not None else "Unk.")
-                            dir_txt = str(trn.get("direction", "E"))
-                            is_rx = trn.get("is_receiving_packets", False)
-                            rx_txt = "● RX" if is_rx else "---"
-                            loc_txt = str(trn.get("last_location", "") or trn.get("current_element_id", ""))
+                            spd_txt = trn.get("speed_str") or (f"{trn.get('speed_mph', 0.0):.1f}MPH" if trn.get("speed_mph") is not None else "Unk.")
+                            spd_txt = spd_txt.replace(" MPH", "MPH")
+                            dir_txt = str(trn.get("direction") or "---")
+                            rssi_avg = trn.get("rssi_avg")
+                            sig_txt = f"{rssi_avg:.0f}dB" if rssi_avg is not None else "---"
+                            trend_code = str(trn.get("rssi_trend") or "NONE").upper()
+                            trd_txt = str(trn.get("rssi_trend_label") or "---")
+                            psi_val = trn.get("psi")
+                            psi_txt = str(int(psi_val)) if psi_val is not None else "---"
+                            mot_txt = str(trn.get("motion") or "---")
+                            lgt_txt = str(trn.get("light_str") or "---")
+                            loc_txt = str(trn.get("last_location", "") or trn.get("current_element_id", "") or "")
 
                             # Row interaction
                             row_screen_rect = pygame.Rect(sx + 10, sy + row_y, w - 38, 18)
@@ -7922,26 +8028,59 @@ class ApexBOSCreatorApp:
                                 panel.blit(row_hl, (10, row_y))
                                 pygame.draw.rect(panel, (80, 200, 255, 230), (10, row_y, w - 38, 18), 1, border_radius=3)
 
-                            if is_dimmed:
-                                col = (130, 135, 145)
-                                st_col = (120, 125, 135)
-                            elif st == "Potential":
-                                col = (255, 215, 130)
-                                st_col = (255, 185, 40)
-                            elif st == "Inferred":
-                                col = (160, 220, 255)
-                                st_col = (75, 205, 255)
+                            if src == "HOT/EOT/DPU":
+                                src_badge, base_src_col, base_col = "HOT/EOT/DPU", (75, 245, 195), (195, 255, 235)
+                            elif src == "HOT/EOT":
+                                src_badge, base_src_col, base_col = "HOT/EOT", (255, 105, 180), (255, 195, 225)
+                            elif src == "DPU":
+                                src_badge, base_src_col, base_col = "DPU", (255, 165, 65), (255, 215, 155)
+                            elif src == "EMP":
+                                src_badge, base_src_col, base_col = "EMP", (185, 135, 255), (220, 195, 255)
                             else:
-                                col = (180, 255, 190)
-                                st_col = (90, 255, 130)
+                                src_badge = "PTC Inf" if st != "Confirmed" else "PTC Cnf"
+                                if st == "Potential":
+                                    base_src_col, base_col = (255, 185, 40), (255, 215, 130)
+                                elif st == "Inferred":
+                                    base_src_col, base_col = (75, 205, 255), (160, 220, 255)
+                                else:
+                                    base_src_col, base_col = (90, 255, 130), (180, 255, 190)
 
-                            st_badge = f"{st[:9]:<10}"
-                            panel.blit(self.font_sm_bold.render(st_badge, True, st_col), (10, row_y))
-                            rem_row = f"{disp_name[:16]:<17} {spd_txt:<10} {dir_txt:<5} "
-                            panel.blit(self.font_sm.render(rem_row, True, col), (85, row_y))
-                            rx_col = (0, 255, 130) if is_rx else (110, 115, 125)
-                            panel.blit(self.font_sm_bold.render(f"{rx_txt:<6}", True, rx_col), (290, row_y))
-                            panel.blit(self.font_sm.render(loc_txt[:18], True, col), (340, row_y))
+                            if is_dimmed:
+                                st_col, col = (120, 125, 135), (130, 135, 145)
+                            else:
+                                st_col = fade_rgb_by_age(base_src_col, age_sec, fade_max)
+                                col = fade_rgb_by_age(base_col, age_sec, fade_max)
+
+                            trd_col = fade_rgb_by_age(
+                                (70, 245, 135) if trend_code == "TOWARDS" else ((255, 125, 85) if trend_code == "AWAY" else (145, 155, 170)),
+                                age_sec, fade_max,
+                            )
+                            mot_col = fade_rgb_by_age(
+                                (80, 245, 140) if mot_txt == "MOV" else ((255, 195, 70) if mot_txt == "STOP" else (125, 130, 140)),
+                                age_sec, fade_max,
+                            )
+                            lgt_col = fade_rgb_by_age((255, 235, 95) if lgt_txt == "ON" else (125, 130, 140), age_sec, fade_max)
+
+                            panel.blit(self.font_sm_bold.render(src_badge[:11], True, st_col), (10, row_y))
+                            if 102 + 20 < right_lim:
+                                panel.blit(self.font_sm.render(disp_name[:18], True, col), (102, row_y))
+                            if 234 + 20 < right_lim:
+                                panel.blit(self.font_sm.render(spd_txt[:9], True, col), (234, row_y))
+                            if 302 + 16 < right_lim:
+                                panel.blit(self.font_sm.render(dir_txt[:4], True, col), (302, row_y))
+                            if 344 + 20 < right_lim:
+                                panel.blit(self.font_sm.render(sig_txt[:7], True, col), (344, row_y))
+                            if 398 + 20 < right_lim:
+                                panel.blit(self.font_sm_bold.render(trd_txt[:5], True, trd_col), (398, row_y))
+                            if 446 + 18 < right_lim:
+                                panel.blit(self.font_sm.render(psi_txt[:4], True, col), (446, row_y))
+                            if 484 + 18 < right_lim:
+                                panel.blit(self.font_sm_bold.render(mot_txt[:4], True, mot_col), (484, row_y))
+                            if 526 + 16 < right_lim:
+                                panel.blit(self.font_sm_bold.render(lgt_txt[:3], True, lgt_col), (526, row_y))
+                            if 562 + 24 < right_lim and loc_txt:
+                                rem_chars = max(6, int((right_lim - 562) / 6.5))
+                                panel.blit(self.font_sm.render(loc_txt[:rem_chars], True, col), (562, row_y))
 
                     self.screen.blit(panel, (sx, sy))
                 elif etype == "chat":
@@ -8129,7 +8268,7 @@ class ApexBOSCreatorApp:
             [
                 ("tool_packet_scroller", "+PktList"),
                 ("tool_address_table", "+WIUList"),
-                ("tool_train_scroller", "+TrnList"),
+                ("tool_train_scroller", "+TrnBoard"),
                 ("tool_chat", "+Chat"),
                 ("tool_ptc_datetime", "+PTC-Clock"),
             ],

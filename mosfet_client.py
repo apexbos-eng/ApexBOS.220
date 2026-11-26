@@ -814,10 +814,21 @@ class BancClient:
         writer.write(struct.pack(">I", len(enc_data)) + enc_data)
         await writer.drain()
 
-    async def get_packets(self, timeout=15.0, since_ts: Optional[float] = None):
+    async def get_packets(
+        self,
+        timeout=15.0,
+        since_ts: Optional[float] = None,
+        geo_filter: Optional[Any] = None,
+    ):
         """
         Connects to Banc, authenticates, and retrieves the recent packets.
         Returns a list of dictionaries representing the database rows.
+
+        Optional geo_filter enables server-side regional scoping for short-range
+        RF telemetry (e.g. 450 MHz EOT/HOT/DPU/RLC) without disclosing feeder identity
+        or exact location:
+          - (center_lat, center_lon, radius_km) tuple/list (e.g. from loaded layout)
+          - str layout_name stored on Banc
         """
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(self.host, self.port), timeout=5.0
@@ -827,8 +838,25 @@ class BancClient:
             # 1. Format and send Header (Identity & Token)
             token = mosfet_auth.generate_token(self.auth_secret)
             header_str = f"GET:{self.identity}:{token}"
-            if since_ts is not None and float(since_ts) > 0.0:
-                header_str += f":{float(since_ts):.3f}"
+            has_since = since_ts is not None and float(since_ts) > 0.0
+            geo_suffix = ""
+            if isinstance(geo_filter, (tuple, list)) and len(geo_filter) >= 3:
+                try:
+                    g_lat = float(geo_filter[0])
+                    g_lon = float(geo_filter[1])
+                    g_rad = max(0.0, float(geo_filter[2]))
+                    if -85.0 <= g_lat <= 85.0 and -180.0 <= g_lon <= 180.0 and not (g_lat == 0.0 and g_lon == 0.0):
+                        geo_suffix = f":{g_lat:.4f}:{g_lon:.4f}:{g_rad:.2f}"
+                except (ValueError, TypeError):
+                    geo_suffix = ""
+            elif isinstance(geo_filter, str) and geo_filter.strip():
+                safe_layout = geo_filter.strip().replace("\r", "").replace("\n", "")
+                geo_suffix = f":LAYOUT:{safe_layout}"
+
+            if has_since:
+                header_str += f":{float(since_ts):.3f}{geo_suffix}"
+            elif geo_suffix:
+                header_str += f":0{geo_suffix}"
             await self._write_frame(writer, header_str)
 
             # 2. Wait for the encrypted payload response
@@ -841,6 +869,15 @@ class BancClient:
                 cols = line.split(",")
                 # ApexBOSBanc.py GET returns: date_str, unix_ts, hex_data, channel, signal_strength, pkt_hash, b1, b2, b3, stamp_received
                 if len(cols) == 10:
+                    b2_val = int(cols[7])
+                    b3_raw = cols[8]
+                    b3_clean = b3_raw.strip().strip('"').strip("'").lower()
+                    if b2_val == 1 or b3_clean == "atcs":
+                        proto_name = "atcs"
+                    elif b2_val == 2 or b3_clean in ("eot", "hot", "dpu", "rlc", "fred"):
+                        proto_name = b3_clean if b3_clean in ("eot", "hot", "dpu", "rlc", "fred") else "fred"
+                    else:
+                        proto_name = "ptc"
                     parsed_rows.append({
                         "date_str": cols[0],
                         "unix_ts": float(cols[1]),
@@ -849,8 +886,9 @@ class BancClient:
                         "signal_strength": cols[4],
                         "pkt_hash": int(cols[5]),
                         "b1": float(cols[6]),
-                        "b2": int(cols[7]),
-                        "b3": cols[8],
+                        "b2": b2_val,
+                        "b3": b3_raw,
+                        "protocol": proto_name,
                         "stamp_received": float(cols[9])
                     })
             return parsed_rows
@@ -999,6 +1037,37 @@ class BancClient:
 
     def get_wius_sync(self, timeout: float = 10.0) -> List[Dict]:
         return _run_sync(self.get_wius(timeout=timeout))
+
+    async def put_sdr_region(self, regions: Dict[str, Any], timeout: float = 10.0) -> dict:
+        """
+        Privately registers blurred per-SDR reception regions with Banc Cloud
+        for server-side regional filtering of short-range RF telemetry (EOT/HOT/DPU/RLC).
+        Never exposes feeder identity or coordinates to other Banc subscribers.
+        """
+        if not isinstance(regions, dict):
+            raise ValueError("regions must be a dictionary")
+        payload_str = json.dumps(regions)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.host, self.port), timeout=5.0
+        )
+        try:
+            token = mosfet_auth.generate_token(self.auth_secret)
+            header_str = f"PUT_SDR_REGION:{self.identity}:{token}"
+            await self._write_frame(writer, header_str)
+            await self._write_frame(writer, payload_str)
+            resp_str = await asyncio.wait_for(self._read_frame(reader), timeout=timeout)
+            if resp_str.startswith("ERROR:"):
+                raise RuntimeError(resp_str)
+            return json.loads(resp_str)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def put_sdr_region_sync(self, regions: Dict[str, Any], timeout: float = 10.0) -> dict:
+        return _run_sync(self.put_sdr_region(regions, timeout=timeout))
 
     async def send_chat_message(
         self,

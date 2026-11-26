@@ -58,6 +58,12 @@ from typing import Dict, Optional, Tuple, Any, List
 import pygame
 import mosfet_client
 from banc_coverage_modal import BancCoverageMapModal
+from train_logic import (
+    fade_rgb_by_age,
+    RF_TRAIN_TIMEOUT_SEC,
+    sort_train_board_rows,
+    cycle_train_board_sort,
+)
 from version import VERSION, __version__
 DEFAULT_MCAST_GROUP = "224.1.1.1"
 DEFAULT_MCAST_PORT = 5007
@@ -1853,6 +1859,14 @@ class DispatcherPygameRenderer:
         self.train_assign_buffers: Dict[str, str] = {"assigned_id": "", "assigned_name": ""}
         self._train_scroller_row_rects: List[Tuple[pygame.Rect, dict]] = []
         self._train_scroller_del_rects: List[Tuple[pygame.Rect, str]] = []
+        self.train_board_scroll_offset: int = 0
+        self.train_board_panel_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self.train_board_btn_rects: Dict[str, pygame.Rect] = {}
+        self.train_board_sort_rects: List[Tuple[pygame.Rect, str]] = []
+        self.train_board_sort_col: Optional[str] = None
+        self.train_board_sort_desc: bool = False
+        self.train_board_avail_rows: int = 8
+        self.train_board_total_items: int = 0
         self.hovered_train: Optional[dict] = None
         self.hovered_train_rect: Optional[pygame.Rect] = None
         self.hovered_wiu_row: Optional[dict] = None
@@ -3317,8 +3331,10 @@ class DispatcherPygameRenderer:
         self.prefs.save()
 
     def get_panel_base_size(self, sys_key: str, panel: dict) -> Tuple[int, int]:
-        def_w = int(panel.get("width") or (580 if sys_key == "packet_scroller" else (460 if sys_key == "chat" else (450 if sys_key == "address_table" else 430))))
-        def_h = int(panel.get("height") or (195 if sys_key == "packet_scroller" else (220 if sys_key == "chat" else 150)))
+        def_w = int(panel.get("width") or (580 if sys_key == "packet_scroller" else (460 if sys_key == "chat" else (450 if sys_key == "address_table" else 680))))
+        def_h = int(panel.get("height") or (195 if sys_key == "packet_scroller" else (220 if sys_key == "chat" else 165)))
+        if sys_key == "train_scroller" and def_w < 640:
+            def_w = 680
         return self.prefs.get_size(panel["id"], def_w, def_h)
 
     @staticmethod
@@ -3598,6 +3614,13 @@ class DispatcherPygameRenderer:
                     delta = -step if event.y > 0 else step
                     max_scroll = max(0, getattr(self, "addr_table_total_items", 0) - page_step)
                     self.wiu_scroll_offset = max(0, min(max_scroll, self.wiu_scroll_offset + delta))
+                elif self.train_board_panel_rect.width > 0 and self.train_board_panel_rect.collidepoint(mx, my):
+                    self.last_scrolled_panel = "train_board"
+                    page_step = max(1, getattr(self, "train_board_avail_rows", 8))
+                    step = 2 if not (pygame.key.get_mods() & pygame.KMOD_SHIFT) else page_step
+                    delta = -step if event.y > 0 else step
+                    max_scroll = max(0, getattr(self, "train_board_total_items", 0) - page_step)
+                    self.train_board_scroll_offset = max(0, min(max_scroll, self.train_board_scroll_offset + delta))
                 elif self.chat_panel_rect.width > 0 and self.chat_panel_rect.collidepoint(mx, my):
                     self.last_scrolled_panel = "chat"
                     step = 2 if not (pygame.key.get_mods() & pygame.KMOD_SHIFT) else max(1, self.chat_avail_rows - 1)
@@ -4415,6 +4438,33 @@ class DispatcherPygameRenderer:
                         self.chat_active_field = None
             elif self.chat_active_field is not None:
                 self.chat_active_field = None
+
+            for b_key, b_rect in getattr(self, "train_board_btn_rects", {}).items():
+                if b_rect.collidepoint(mx, my):
+                    self.last_scrolled_panel = "train_board"
+                    page_step = max(1, getattr(self, "train_board_avail_rows", 8))
+                    max_scroll = max(0, getattr(self, "train_board_total_items", 0) - page_step)
+                    if b_key == "recent":
+                        self.train_board_sort_col, self.train_board_sort_desc = cycle_train_board_sort(
+                            self.train_board_sort_col, self.train_board_sort_desc, "recent"
+                        )
+                        self.train_board_scroll_offset = 0
+                    elif b_key == "top":
+                        self.train_board_scroll_offset = 0
+                    elif b_key == "pgup":
+                        self.train_board_scroll_offset = max(0, self.train_board_scroll_offset - page_step)
+                    elif b_key == "pgdn":
+                        self.train_board_scroll_offset = min(max_scroll, self.train_board_scroll_offset + page_step)
+                    return
+
+            for col_rect, col_key in getattr(self, "train_board_sort_rects", []):
+                if col_rect.collidepoint(mx, my):
+                    self.last_scrolled_panel = "train_board"
+                    self.train_board_sort_col, self.train_board_sort_desc = cycle_train_board_sort(
+                        self.train_board_sort_col, self.train_board_sort_desc, col_key
+                    )
+                    self.train_board_scroll_offset = 0
+                    return
 
             for del_rect, tkey in getattr(self, "_train_scroller_del_rects", []):
                 if del_rect.collidepoint(mx, my):
@@ -5738,63 +5788,176 @@ class DispatcherPygameRenderer:
             self.screen.blit(panel_surf, (px, py))
 
         train_scroller = state.get("train_scroller")
+        self.train_board_panel_rect = pygame.Rect(0, 0, 0, 0)
+        self.train_board_btn_rects = {}
+        self.train_board_sort_rects = []
         if train_scroller:
             lx, ly = self.get_elem_logical_pos(train_scroller)
             px, py = self.logical_to_screen(lx, ly)
             base_w, base_h = self.get_panel_base_size("train_scroller", train_scroller)
-            w, h = max(240, int(base_w * self.zoom)), max(85, int(base_h * self.zoom))
-            max_chars = max(32, int((base_w - 24) / 7.0))
+            w, h = max(360, int(base_w * self.zoom)), max(95, int(base_h * self.zoom))
+            self.train_board_panel_rect = pygame.Rect(px, py, w, h)
             panel_surf = pygame.Surface((w, h), pygame.SRCALPHA)
             panel_surf.fill(COLOR_HUD_BG)
             border_col = COLOR_SELECT_RING if self.selected_id == train_scroller["id"] else COLOR_HUD_BORDER
             pygame.draw.rect(panel_surf, border_col, (0, 0, w, h), 2, border_radius=6)
 
-            title = self.get_elem_label(train_scroller) if train_scroller.get("label") else "TRAIN SCROLLER"
-            panel_surf.blit(self.font_md.render(title, True, COLOR_CROSSING_OPEN), (10, 7))
-            hdr = f"{'STATUS':<11} {'TRAIN / NAME':<17} {'SPEED':<10} {'DIR':<5} {'RX':<6} {'LOCATION'}"
-            panel_surf.blit(self.font_sm_bold.render(hdr[:max_chars], True, COLOR_LANDMARK), (10, 28))
-
-            avail_rows = max(1, (h - 52) // 19)
-            max_r = min(avail_rows, int(train_scroller.get("extra_info") or 200))
-            drawn_idx = 0
-            self._train_scroller_row_rects = []
-            self._train_scroller_del_rects = []
-            self.hovered_train = None
-            self.hovered_train_rect = None
-
-            m_pos = pygame.mouse.get_pos()
-            can_hover = (not self.train_assign_active and not self.show_coverage_map)
-            if can_hover and self.readonly_inspector_id and self.inspector_rect.width > 0:
-                if self.inspector_rect.collidepoint(m_pos):
-                    can_hover = False
+            # Filter visible trains, then apply active column / recent-activity sort (or pinned board_order)
+            filtered_trains = []
             for trn in train_scroller.get("trains", []):
-                if not self.show_inferred_trains:
+                if not self.show_inferred_trains and not trn.get("is_rf_train"):
                     le = trn.get("last_element_id") or trn.get("current_element_id")
                     if le and le in state.get("elements", {}):
                         el_st = state["elements"][le]
                         if el_st.get("inferred_occupied") and not el_st.get("hw_occupied"):
                             continue
-                if drawn_idx >= max_r or (46 + (drawn_idx + 1) * 19 > h - 4):
+                filtered_trains.append(trn)
+            filtered_trains = sort_train_board_rows(
+                filtered_trains,
+                sort_col=self.train_board_sort_col,
+                sort_desc=self.train_board_sort_desc,
+            )
+
+            avail_rows = max(1, (h - 52) // 19)
+            total_items = len(filtered_trains)
+            self.train_board_avail_rows = avail_rows
+            self.train_board_total_items = total_items
+            max_scroll = max(0, total_items - avail_rows)
+            self.train_board_scroll_offset = max(0, min(max_scroll, self.train_board_scroll_offset))
+
+            raw_lbl = self.get_elem_label(train_scroller) if train_scroller.get("label") else ""
+            title_base = "TRAIN BOARD" if (not raw_lbl or raw_lbl.strip().upper() == "TRAIN SCROLLER") else raw_lbl
+            curr_page = (self.train_board_scroll_offset // avail_rows) + 1 if avail_rows > 0 else 1
+            total_pages = max(1, (total_items + avail_rows - 1) // avail_rows) if avail_rows > 0 else 1
+            if total_items > avail_rows:
+                title = f"{title_base} ({total_items}) [Pg {curr_page}/{total_pages}]"
+            else:
+                title = f"{title_base}  (Total: {total_items})"
+
+            # Right-aligned header buttons: [Recent v/^] always available + [Top] [<PgUp] [PgDn>] when multi-page
+            m_pos = pygame.mouse.get_pos()
+            bx_cur = w - 8
+            hdr_btns: List[Tuple[str, str, bool]] = []
+            if total_items > avail_rows:
+                hdr_btns.extend([
+                    ("pgdn", "PgDn>", self.train_board_scroll_offset < max_scroll),
+                    ("pgup", "<PgUp", self.train_board_scroll_offset > 0),
+                    ("top", "Top", self.train_board_scroll_offset > 0),
+                ])
+            rec_active = (self.train_board_sort_col == "recent")
+            rec_lbl = ("Recent v" if self.train_board_sort_desc else "Recent ^") if rec_active else "Recent"
+            hdr_btns.append(("recent", rec_lbl, rec_active))
+            for b_key, b_lbl, is_active in hdr_btns:
+                ts_b = self.font_sm_bold.render(b_lbl, True, (255, 235, 130) if (b_key == "recent" and is_active) else (235, 245, 255))
+                bw_btn = ts_b.get_width() + 10
+                bx_cur -= bw_btn
+                if bx_cur < 185:
+                    break
+                local_r = pygame.Rect(bx_cur, 5, bw_btn, 19)
+                scr_r = pygame.Rect(px + bx_cur, py + 5, bw_btn, 19)
+                is_hov = scr_r.collidepoint(m_pos)
+                if b_key == "recent" and is_active:
+                    bg_b = (42, 92, 132)
+                    border_b = (255, 210, 75)
+                elif is_active or is_hov:
+                    bg_b = (20, 85, 125)
+                    border_b = (0, 210, 255)
+                else:
+                    bg_b = (32, 42, 58)
+                    border_b = COLOR_HUD_BORDER
+                pygame.draw.rect(panel_surf, bg_b, local_r, border_radius=4)
+                pygame.draw.rect(panel_surf, border_b, local_r, 1, border_radius=4)
+                panel_surf.blit(ts_b, (bx_cur + 5, 7))
+                self.train_board_btn_rects[b_key] = scr_r
+                bx_cur -= 4
+
+            panel_surf.blit(self.font_md.render(title, True, COLOR_CROSSING_OPEN), (10, 7))
+
+            # Column layout: SOURCE | TRAIN / NAME | SPD/PWR | DIR | SIG | TRD | PSI | MOT | LGT | LOC/INFO | [x]
+            # Sortable columns: source, name, spd_pwr, dir, sig, trd
+            ts_cols = [
+                (10,  90,  "SOURCE",       "source"),
+                (102, 130, "TRAIN / NAME", "name"),
+                (234, 66,  "SPD/PWR",      "spd_pwr"),
+                (302, 40,  "DIR",          "dir"),
+                (344, 52,  "SIG",          "sig"),
+                (398, 46,  "TRD",          "trd"),
+                (446, 36,  "PSI",          None),
+                (484, 40,  "MOT",          None),
+                (526, 34,  "LGT",          None),
+                (562, 100, "LOC / INFO",   None),
+            ]
+            for cx, cw, clbl, sort_k in ts_cols:
+                if cx + 22 < w - 26:
+                    is_sorted = (sort_k is not None and self.train_board_sort_col == sort_k)
+                    arrow = (" v" if self.train_board_sort_desc else " ^") if is_sorted else ""
+                    disp_hdr = f"{clbl}{arrow}"
+                    hit_w = min(cw, max(24, (w - 26) - cx))
+                    hdr_scr_rect = pygame.Rect(px + cx - 2, py + 26, hit_w, 16)
+                    is_hdr_hov = (sort_k is not None and hdr_scr_rect.collidepoint(m_pos))
+                    if sort_k is not None:
+                        self.train_board_sort_rects.append((hdr_scr_rect, sort_k))
+                    if is_sorted:
+                        pygame.draw.rect(panel_surf, (28, 66, 98), (cx - 2, 26, hit_w, 16), border_radius=3)
+                        hdr_col = (255, 225, 95)
+                    elif is_hdr_hov:
+                        pygame.draw.rect(panel_surf, (24, 46, 70), (cx - 2, 26, hit_w, 16), border_radius=3)
+                        hdr_col = (120, 230, 255)
+                    else:
+                        hdr_col = COLOR_LANDMARK
+                    panel_surf.blit(self.font_sm_bold.render(disp_hdr, True, hdr_col), (cx, 28))
+            pygame.draw.line(panel_surf, (55, 75, 105), (10, 43), (w - 10, 43), 1)
+
+            drawn_idx = 0
+            self._train_scroller_row_rects = []
+            self._train_scroller_del_rects = []
+            self.hovered_train = None
+            self.hovered_train_rect = None
+            now_wall = time.time()
+
+            can_hover = (not self.train_assign_active and not self.show_coverage_map)
+            if can_hover and self.readonly_inspector_id and self.inspector_rect.width > 0:
+                if self.inspector_rect.collidepoint(m_pos):
+                    can_hover = False
+            visible_trains = filtered_trains[self.train_board_scroll_offset : self.train_board_scroll_offset + avail_rows]
+            for trn in visible_trains:
+                if 46 + (drawn_idx + 1) * 19 > h - 4:
                     break
                 st = trn.get("status", "Confirmed")
-                is_dimmed = trn.get("is_dimmed", False)
+                src = str(trn.get("train_source") or "PTC Inferred")
+                is_rf = bool(trn.get("is_rf_train", False))
+                is_dimmed = bool(trn.get("is_dimmed", False))
+
+                # Smooth color fading based on elapsed time since last received packet
+                last_rx_ts = float(trn.get("last_packet_ts") or trn.get("updated_ts") or now_wall)
+                age_sec = max(0.0, now_wall - last_rx_ts)
+                fade_max = float(trn.get("rf_timeout_sec") or RF_TRAIN_TIMEOUT_SEC) if is_rf else 180.0
+
                 disp_name = trn.get("assigned_name") or trn.get("train_name", "TRN")
                 if trn.get("assigned_id"):
                     disp_name = f"{disp_name} (#{trn['assigned_id']})"
-                spd_txt = trn.get("speed_str") or (f"{trn.get('speed_mph', 0.0):.1f} MPH" if trn.get("speed_mph") is not None else "Unk.")
-                dir_txt = str(trn.get("direction", "E"))
-                is_rx = trn.get("is_receiving_packets", False)
-                rx_txt = "● RX" if is_rx else "---"
-                loc_txt = trn.get("last_location", "") or trn.get("current_element_id", "")
+                spd_txt = trn.get("speed_str") or (f"{trn.get('speed_mph', 0.0):.1f}MPH" if trn.get("speed_mph") is not None else "Unk.")
+                spd_txt = spd_txt.replace(" MPH", "MPH")
+                dir_txt = str(trn.get("direction") or "---")
+                rssi_avg = trn.get("rssi_avg")
+                sig_txt = f"{rssi_avg:.0f}dB" if rssi_avg is not None else "---"
+                trend_code = str(trn.get("rssi_trend") or "NONE").upper()
+                trd_txt = str(trn.get("rssi_trend_label") or "---")
+                psi_val = trn.get("psi")
+                psi_txt = str(int(psi_val)) if psi_val is not None else "---"
+                mot_txt = str(trn.get("motion") or "---")
+                lgt_txt = str(trn.get("light_str") or "---")
+                loc_txt = str(trn.get("last_location", "") or trn.get("current_element_id", "") or "")
 
                 row_y = 46 + drawn_idx * 19
-                self._train_scroller_row_rects.append((pygame.Rect(px + 10, py + row_y, w - 38, 18), trn))
-                
+                row_screen_rect = pygame.Rect(px + 10, py + row_y, w - 38, 18)
+                self._train_scroller_row_rects.append((row_screen_rect, trn))
+
                 # Delete train row button [x]
                 del_btn_rect = pygame.Rect(px + w - 24, py + row_y + 1, 16, 16)
                 t_del_key = trn.get("train_key") or trn.get("train_name")
                 self._train_scroller_del_rects.append((del_btn_rect, t_del_key))
-                is_del_h = del_btn_rect.collidepoint(pygame.mouse.get_pos())
+                is_del_h = del_btn_rect.collidepoint(m_pos)
                 del_c = (255, 75, 75) if is_del_h else (160, 80, 80)
                 del_surf = self.font_sm_bold.render("x", True, del_c)
                 del_x = (w - 24) + (16 - del_surf.get_width()) // 2
@@ -5802,7 +5965,6 @@ class DispatcherPygameRenderer:
                 panel_surf.blit(del_surf, (del_x, del_y))
 
                 # Highlight row if hovered
-                row_screen_rect = pygame.Rect(px + 10, py + row_y, w - 38, 18)
                 is_row_hovered = can_hover and row_screen_rect.collidepoint(m_pos) and not is_del_h
                 if is_row_hovered:
                     self.hovered_train = trn
@@ -5812,29 +5974,80 @@ class DispatcherPygameRenderer:
                     panel_surf.blit(row_hl, (10, row_y))
                     pygame.draw.rect(panel_surf, (80, 200, 255, 230), (10, row_y, w - 38, 18), 1, border_radius=3)
 
-                if is_dimmed:
-                    col = (130, 135, 145)
-                    st_col = (120, 125, 135)
-                elif st == "Potential":
-                    col = (255, 215, 130)
-                    st_col = (255, 185, 40)
-                elif st == "Inferred":
-                    col = (160, 220, 255)
-                    st_col = (75, 205, 255)
+                # Base source & text colors
+                if src == "HOT/EOT/DPU":
+                    src_badge = "HOT/EOT/DPU"
+                    base_src_col = (75, 245, 195)
+                    base_col = (195, 255, 235)
+                elif src == "HOT/EOT":
+                    src_badge = "HOT/EOT"
+                    base_src_col = (255, 105, 180)
+                    base_col = (255, 195, 225)
+                elif src == "DPU":
+                    src_badge = "DPU"
+                    base_src_col = (255, 165, 65)
+                    base_col = (255, 215, 155)
+                elif src == "EMP":
+                    src_badge = "EMP"
+                    base_src_col = (185, 135, 255)
+                    base_col = (220, 195, 255)
                 else:
-                    col = (180, 255, 190)
-                    st_col = (90, 255, 130)
+                    src_badge = "PTC Inf" if st != "Confirmed" else "PTC Cnf"
+                    if st == "Potential":
+                        base_src_col = (255, 185, 40)
+                        base_col = (255, 215, 130)
+                    elif st == "Inferred":
+                        base_src_col = (75, 205, 255)
+                        base_col = (160, 220, 255)
+                    else:
+                        base_src_col = (90, 255, 130)
+                        base_col = (180, 255, 190)
 
-                st_badge = f"{st[:9]:<10}"
-                panel_surf.blit(self.font_sm_bold.render(st_badge, True, st_col), (10, row_y))
+                if is_dimmed:
+                    st_col = (120, 125, 135)
+                    col = (130, 135, 145)
+                else:
+                    st_col = fade_rgb_by_age(base_src_col, age_sec, fade_max)
+                    col = fade_rgb_by_age(base_col, age_sec, fade_max)
 
-                rem_row = f"{disp_name[:16]:<17} {spd_txt:<10} {dir_txt:<5} "
-                panel_surf.blit(self.font_sm_thin.render(rem_row, True, col), (85, row_y))
+                if trend_code == "TOWARDS":
+                    trd_col = fade_rgb_by_age((70, 245, 135), age_sec, fade_max)
+                elif trend_code == "AWAY":
+                    trd_col = fade_rgb_by_age((255, 125, 85), age_sec, fade_max)
+                else:
+                    trd_col = fade_rgb_by_age((145, 155, 170), age_sec, fade_max)
 
-                rx_col = (0, 255, 130) if is_rx else (110, 115, 125)
-                panel_surf.blit(self.font_sm_bold.render(f"{rx_txt:<6}", True, rx_col), (305, row_y))
+                mot_col = fade_rgb_by_age(
+                    (80, 245, 140) if mot_txt == "MOV" else ((255, 195, 70) if mot_txt == "STOP" else (125, 130, 140)),
+                    age_sec, fade_max,
+                )
+                lgt_col = fade_rgb_by_age(
+                    (255, 235, 95) if lgt_txt == "ON" else (125, 130, 140),
+                    age_sec, fade_max,
+                )
 
-                panel_surf.blit(self.font_sm_thin.render(loc_txt[:max(12, max_chars - 43)], True, col), (355, row_y))
+                # Draw columns within panel bounds (leaving space for [x] button)
+                right_lim = w - 28
+                panel_surf.blit(self.font_sm_bold.render(src_badge[:11], True, st_col), (10, row_y))
+                if 102 + 20 < right_lim:
+                    panel_surf.blit(self.font_sm_thin.render(disp_name[:18], True, col), (102, row_y))
+                if 234 + 20 < right_lim:
+                    panel_surf.blit(self.font_sm_thin.render(spd_txt[:9], True, col), (234, row_y))
+                if 302 + 16 < right_lim:
+                    panel_surf.blit(self.font_sm_thin.render(dir_txt[:4], True, col), (302, row_y))
+                if 344 + 20 < right_lim:
+                    panel_surf.blit(self.font_sm_thin.render(sig_txt[:7], True, col), (344, row_y))
+                if 398 + 20 < right_lim:
+                    panel_surf.blit(self.font_sm_bold.render(trd_txt[:5], True, trd_col), (398, row_y))
+                if 446 + 18 < right_lim:
+                    panel_surf.blit(self.font_sm_thin.render(psi_txt[:4], True, col), (446, row_y))
+                if 484 + 18 < right_lim:
+                    panel_surf.blit(self.font_sm_bold.render(mot_txt[:4], True, mot_col), (484, row_y))
+                if 526 + 16 < right_lim:
+                    panel_surf.blit(self.font_sm_bold.render(lgt_txt[:3], True, lgt_col), (526, row_y))
+                if 562 + 24 < right_lim and loc_txt:
+                    rem_chars = max(6, int((right_lim - 562) / 6.5))
+                    panel_surf.blit(self.font_sm_thin.render(loc_txt[:rem_chars], True, col), (562, row_y))
                 drawn_idx += 1
             self._draw_panel_resize_grip(panel_surf, train_scroller["id"], px, py)
             self.screen.blit(panel_surf, (px, py))
@@ -6077,6 +6290,55 @@ class DispatcherPygameRenderer:
                     break
 
         if not target_id or target_id not in elements:
+            # For standalone RF trains (HOT/EOT, DPU, HOT/EOT/DPU, EMP) without a layout track element,
+            # render a floating RF telemetry card next to the hovered Train Scroller row.
+            if trn.get("is_rf_train") and self.hovered_train_rect:
+                rr = self.hovered_train_rect
+                src_lbl = str(trn.get("train_source") or "HOT/EOT/DPU")
+                disp_name = trn.get("assigned_name") or trn.get("train_name", "RF-TRN")
+                rssi_a = trn.get("rssi_avg")
+                sig_s = f"{rssi_a:.1f} dBFS" if rssi_a is not None else "N/A"
+                trd_s = f"{trn.get('rssi_trend_label', '---')} ({trn.get('rssi_delta_db', 0.0):+.1f}dB)" if rssi_a is not None else "---"
+                psi_s = f"{trn['psi']} PSI" if trn.get("psi") is not None else "---"
+                mot_s = str(trn.get("motion") or "---")
+                lgt_s = str(trn.get("light_str") or "---")
+                age_s = max(0.0, time.time() - float(trn.get("last_packet_ts") or trn.get("updated_ts") or time.time()))
+                rem_s = max(0.0, float(trn.get("rf_timeout_sec") or RF_TRAIN_TIMEOUT_SEC) - age_s)
+                lines = [
+                    f"{disp_name}  [{src_lbl}]  (Click to rename, [x] to delete)",
+                    f"SIG: {sig_s} {trd_s} | BP: {psi_s} | MOT: {mot_s} | LGT: {lgt_s}",
+                ]
+                extra = []
+                if trn.get("eot_unit_id") is not None:
+                    extra.append(f"EOT:#{int(trn['eot_unit_id']):05d}")
+                if trn.get("hot_seen"):
+                    extra.append(f"HOT:{trn.get('hot_cmd') or 'RX'}")
+                if trn.get("dpu_trid") is not None and trn.get("dpu_trid") != 0:
+                    extra.append(f"DPU Tr:{trn['dpu_trid']}")
+                if trn.get("dpu_addrs"):
+                    extra.append(f"ADDR:{','.join(str(a) for a in trn['dpu_addrs'][:3])}")
+                if trn.get("dpu_power"):
+                    extra.append(f"Pwr:{trn['dpu_power']} {trn.get('dpu_rev') or ''}".strip())
+                if trn.get("dpu_alarms"):
+                    extra.append(f"ALARM:{','.join(trn['dpu_alarms'])}")
+                extra.append(f"LastRX:{int(age_s)}s (Exp:{int(rem_s//60)}m{int(rem_s%60):02d}s)")
+                lines.append(" | ".join(extra))
+
+                surfs = [self.font_sm_bold.render(lines[0], True, (255, 255, 255))] + [
+                    self.font_sm_thin.render(ln, True, (190, 235, 255)) for ln in lines[1:]
+                ]
+                bw = max(s.get_width() for s in surfs) + 20
+                bh = sum(s.get_height() + 3 for s in surfs) + 14
+                bx = max(10, min(self.width - bw - 10, rr.left))
+                by = rr.bottom + 6 if (rr.bottom + bh + 12 < self.height) else max(35, rr.top - bh - 6)
+                card = pygame.Surface((bw, bh), pygame.SRCALPHA)
+                card.fill((14, 22, 34, 238))
+                pygame.draw.rect(card, (75, 230, 195, 235), (0, 0, bw, bh), 2, border_radius=6)
+                cy = 7
+                for s in surfs:
+                    card.blit(s, (10, cy))
+                    cy += s.get_height() + 3
+                self.screen.blit(card, (bx, by))
             return
 
         target_el = elements[target_id]

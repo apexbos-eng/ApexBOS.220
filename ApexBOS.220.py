@@ -949,14 +949,29 @@ class DispatcherHostMonitor:
         self._safe_addstr(4, 0, row4, c_green if s["decoded_total"] > 0 else c_white)
 
         active_wius = len(self.engine.address_table.wius)
-        active_trains = len(self.engine.train_scroller.trains)
+        trains_vals = list(self.engine.train_scroller.trains.values())
+        active_trains = len(trains_vals)
+        ptc_trns = sum(1 for t in trains_vals if t.get("train_source", "PTC Inferred") == "PTC Inferred")
+        rf_trns = sum(1 for t in trains_vals if t.get("train_source") in ("HOT/EOT", "DPU", "HOT/EOT/DPU"))
+        emp_trns = sum(1 for t in trains_vals if t.get("train_source") == "EMP")
+        if active_trains > 0:
+            src_bits = []
+            if ptc_trns:
+                src_bits.append(f"PTC:{ptc_trns}")
+            if rf_trns:
+                src_bits.append(f"RF:{rf_trns}")
+            if emp_trns:
+                src_bits.append(f"EMP:{emp_trns}")
+            trn_lbl = f"{active_trains} ({'/'.join(src_bits)})" if src_bits else str(active_trains)
+        else:
+            trn_lbl = "0"
         active_cols = len(self.engine.active_collisions)
         row5 = (
             f" ENGINE TX  | State Frames Broadcast: {self.engine.transmitted_frames_count}  "
             f"|  Suppressed: {self.engine.suppressed_frames_count}  "
             f"|  Dedup TTL: {self.engine.dedup_ttl:.2f}s  "
             f"|  Elements: {len(self.engine.elements)}  |  Active WIUs: {active_wius}  "
-            f"|  Tracked Trains: {active_trains}  |  Active Collisions: {active_cols}"
+            f"|  Tracked Trains: {trn_lbl}  |  Active Collisions: {active_cols}"
         )
         self._safe_addstr(5, 0, row5, c_red if active_cols > 0 else c_yellow)
 
@@ -1342,11 +1357,103 @@ async def mcast_listener(monitor: DispatcherHostMonitor, config: dict):
                 elif len(raw_data) > 6 and raw_data[:2] == b"CH" and raw_data[5:6] == b":" and raw_data[2:5].isdigit():
                     meta = {"channel": int(raw_data[2:5])}
                     raw_data = bytes(raw_data[6:])
+                if len(raw_data) > 2 and raw_data[:2] in (b"A{", b"E{"):
+                    meta = dict(meta or {})
+                    meta["protocol"] = "atcs" if raw_data[:1] == b"A" else "fred"
             monitor.ingest_packet(raw_data, source="MCAST", meta=meta)
     except asyncio.CancelledError:
         pass
     except Exception as exc:
         monitor.log_message("ERROR", f"Multicast listener stopped with error: {exc}")
+
+
+async def aux_zmq_listener(monitor: DispatcherHostMonitor, config: dict, probe_interval: float = 2.5):
+    """
+    Auto-detects running ApexBOSLatch (ATCS 900 MHz) and ApexBOSFred (EOT/HOT 450 MHz)
+    on their configured ZMQ PUB ports and streams their packets into DispatcherEngine
+    alongside PTC Multicast/Banc without disturbing PTC operation.
+    """
+    try:
+        import zmq
+        import config_loader
+    except ImportError:
+        return
+
+    aux_cfg = config_loader.get_aux_demod_ports(config)
+    targets = [
+        ("ATCS", "ApexBOSLatch", int(aux_cfg["atcs"]["zmq_port"])),
+        ("FRED", "ApexBOSFred", int(aux_cfg["fred"]["zmq_port"])),
+    ]
+
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.SUB)
+    sock.setsockopt(zmq.SUBSCRIBE, b"")
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+
+    connected: Dict[str, str] = {}
+    last_probe = 0.0
+    try:
+        while True:
+            # In pure Banc mode, ATCS and EOT/HOT/DPU/RLC arrive via Banc alongside PTC
+            if getattr(monitor, "packet_source", "mcast") == "banc":
+                await asyncio.sleep(0.5)
+                continue
+            now_m = time.monotonic()
+            if (now_m - last_probe) >= probe_interval:
+                last_probe = now_m
+                for tag, label, port in targets:
+                    ep = f"tcp://127.0.0.1:{port}"
+                    is_open = await asyncio.to_thread(config_loader.is_tcp_port_open, "127.0.0.1", port, 0.12)
+                    if is_open and tag not in connected:
+                        try:
+                            sock.connect(ep)
+                            connected[tag] = ep
+                            monitor.log_message("INFO", f"Auto-detected {label} ({tag}) on {ep}")
+                        except Exception as exc:
+                            monitor.log_message("WARN", f"Failed attaching to {label} on {ep}: {exc}")
+
+            if connected:
+                # Drain any queued ZMQ packets non-blockingly
+                drained = 0
+                while drained < 64:
+                    try:
+                        frames = sock.recv_multipart(flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                    except Exception:
+                        break
+                    if not frames:
+                        break
+                    drained += 1
+                    first = frames[0]
+                    meta: Dict[str, Any] = {}
+                    for fr in frames[1:]:
+                        if fr.startswith(b"{") and fr.endswith(b"}"):
+                            try:
+                                j = json.loads(fr.decode("utf-8"))
+                                if isinstance(j, dict):
+                                    if j.get("channel") is not None:
+                                        meta["channel"] = j["channel"]
+                                    if j.get("rssi") is not None:
+                                        meta["rssi"] = float(j["rssi"])
+                                    elif j.get("rssi_dbfs") is not None:
+                                        meta["rssi"] = float(j["rssi_dbfs"])
+                            except Exception:
+                                pass
+                    src_tag = "ATCS" if first.startswith(b"A{") else ("FRED" if first.startswith(b"E{") else "AUX")
+                    monitor.ingest_packet(first, source=src_tag, meta=meta or None)
+
+            await asyncio.sleep(0.05)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        monitor.log_message("WARN", f"Aux ATCS/EOT-HOT listener stopped: {exc}")
+    finally:
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1618,7 +1725,21 @@ async def banc_listener(monitor: DispatcherHostMonitor, config: dict):
                     monitor.last_seen_banc_time = last_seen_time
 
                 query_since = last_seen_time if last_seen_time > 0.0 else None
-                rows = await client.get_packets(timeout=5.0, since_ts=query_since)
+                geo_filter = getattr(getattr(monitor, "engine", None), "layout_geo_footprint", None)
+                if geo_filter is None:
+                    try:
+                        import config_loader as _cfg_loader
+                        _sdr_regs = _cfg_loader.extract_sdr_regions_from_config(config)
+                        _reg = _sdr_regs.get("fred") or _sdr_regs.get("ptc") or _sdr_regs.get("atcs")
+                        if _reg:
+                            geo_filter = (
+                                float(_reg["center_lat"]),
+                                float(_reg["center_lon"]),
+                                float(_reg["radius_km"]),
+                            )
+                    except Exception:
+                        geo_filter = None
+                rows = await client.get_packets(timeout=5.0, since_ts=query_since, geo_filter=geo_filter)
                 if rows:
                     def get_row_time(r):
                         try:
@@ -1633,9 +1754,12 @@ async def banc_listener(monitor: DispatcherHostMonitor, config: dict):
 
                     for row in sorted_rows:
                         row_t = get_row_time(row)
+                        hex_s = str(row.get("hex_data", ""))
                         pkt_key = (
                             row.get("pkt_hash"),
-                            str(row.get("hex_data", ""))[:32],
+                            int(row.get("b2", 0) or 0),
+                            hex_s[:32],
+                            hex_s[-32:],
                             row.get("channel", 0),
                         )
 
@@ -1680,6 +1804,16 @@ async def banc_listener(monitor: DispatcherHostMonitor, config: dict):
                             ch_val = 0
 
                         row_t = get_row_time(row)
+                        b2_val = int(row.get("b2", 0) or 0)
+                        b3_val = str(row.get("b3", "") or "").strip().strip('"').strip("'")
+                        proto_val = str(row.get("protocol") or "").strip().lower()
+                        if not proto_val:
+                            if b2_val == 1 or b3_val.upper() == "ATCS":
+                                proto_val = "atcs"
+                            elif b2_val == 2 or b3_val.upper() in ("EOT", "HOT", "DPU", "RLC", "FRED"):
+                                proto_val = b3_val.lower() if b3_val.upper() in ("EOT", "HOT", "DPU", "RLC") else "fred"
+                            else:
+                                proto_val = "ptc"
                         meta = {
                             "rssi": rssi_val,
                             "channel": ch_val,
@@ -1688,6 +1822,9 @@ async def banc_listener(monitor: DispatcherHostMonitor, config: dict):
                             "stamp_received": float(row.get("stamp_received") or row_t),
                             "source": "BANC",
                             "startup_burst": is_startup,
+                            "b2": b2_val,
+                            "b3": b3_val,
+                            "protocol": proto_val,
                         }
                         await pacing_queue.put((raw_data, meta, row_t, is_startup))
 
@@ -1892,20 +2029,30 @@ async def main_loop(
 
     mcast_task = asyncio.create_task(mcast_listener(monitor, config))
     banc_task = asyncio.create_task(banc_listener(monitor, config))
+    aux_task = asyncio.create_task(aux_zmq_listener(monitor, config))
     monitor._mcast_task = mcast_task
     monitor._banc_task = banc_task
+    monitor._aux_task = aux_task
     wiu_sync_task = asyncio.create_task(banc_wiu_sync_loop(monitor, config))
     chat_task = asyncio.create_task(banc_chat_loop(monitor, config))
 
     last_console_stats = time.time()
+    last_rf_prune_check = time.time()
     running = True
     try:
         while running:
             running = await monitor.handle_input()
+            now_tick = time.time()
+            if now_tick - last_rf_prune_check >= 5.0:
+                last_rf_prune_check = now_tick
+                expired_rf = monitor.engine.train_scroller.prune_rf_trains(now=now_tick)
+                if expired_rf:
+                    monitor.engine._last_transmitted_signature = monitor.engine._compute_logical_signature()
+                    monitor.engine.broadcast_state(monitor.engine.get_render_state())
             if stdscr is not None:
                 monitor.draw()
             else:
-                now = time.time()
+                now = now_tick
                 if now - last_console_stats >= 10.0:
                     s = monitor.stats.get_stats()
                     sc = monitor.engine.scroller.to_state_dict()
@@ -1923,7 +2070,7 @@ async def main_loop(
         if stdscr is not None:
             sys.stdout = old_stdout
             sys.stderr = old_stderr
-        tasks_to_cancel = [mcast_task, banc_task, wiu_sync_task, chat_task]
+        tasks_to_cancel = [mcast_task, banc_task, aux_task, wiu_sync_task, chat_task]
         if monitor._banc_task and monitor._banc_task not in tasks_to_cancel:
             tasks_to_cancel.append(monitor._banc_task)
         if monitor._mcast_task and monitor._mcast_task not in tasks_to_cancel:
