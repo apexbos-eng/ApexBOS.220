@@ -34,7 +34,7 @@
 - **Setup Wizard Initial Scan Integration**: Step 5 of the ApexBOS Setup Wizard provides an automated prompt and a one-click GUI button to perform an initial 10-second dwell scan, applying discovered channels (CRC-verified locked), consensus PPM, recommended gain, and ZMQ ports as defaults.
 - **Multi-Worker Port & Process Allocation**: Automatically divides discovered active channels across Grabber worker processes and computes collision-free ZeroMQ ports ($18000 + \text{channel}$).
 - **Automated Script & Config Output**: Exports ready-to-run Windows Batch (`.bat`), PowerShell (`.ps1`), plain command line (`.txt`), calibration logs (`.txt`), and structured JSON (`apexbos_scan_results.json`) with absolute file paths.
-- **In-Place Selective Scrolling**: Clean ANSI display that overwrites silent channels in place and only scrolls down when active channels with sync signatures are discovered.
+- **In-Place Selective Scrolling & ANSI Fallback**: Clean ANSI display that overwrites silent channels in place and only scrolls down when active channels with sync signatures are discovered—with automatic plain-text fallback (`--no-color`) on Legacy Windows Console, `TERM=dumb`, or redirected non-TTY terminals.
 - **Interactive Keyboard Controls**: Non-blocking keyboard hotkeys allowing the user to skip to the next channel (`n`), safely abort Phase 1 and proceed to Phase 2 (`s`), or stop Phase 2 and generate final startup scripts (`q`).
 
 ---

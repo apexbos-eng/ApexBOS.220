@@ -1069,6 +1069,84 @@ class BancClient:
     def put_sdr_region_sync(self, regions: Dict[str, Any], timeout: float = 10.0) -> dict:
         return _run_sync(self.put_sdr_region(regions, timeout=timeout))
 
+    async def put_sdr_sensor(self, sensors: Dict[str, Any], timeout: float = 10.0) -> dict:
+        """
+        Privately registers opt-in quantized (~275 m) SDR sensor anchors with Banc Cloud
+        for server-only k>=3 RF localization. Never mirrored or exposed to GET clients.
+        """
+        if not isinstance(sensors, dict):
+            raise ValueError("sensors must be a dictionary")
+        payload_str = json.dumps(sensors)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.host, self.port), timeout=5.0
+        )
+        try:
+            token = mosfet_auth.generate_token(self.auth_secret)
+            header_str = f"PUT_SDR_SENSOR:{self.identity}:{token}"
+            await self._write_frame(writer, header_str)
+            await self._write_frame(writer, payload_str)
+            resp_str = await asyncio.wait_for(self._read_frame(reader), timeout=timeout)
+            if resp_str.startswith("ERROR:"):
+                raise RuntimeError(resp_str)
+            return json.loads(resp_str)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def put_sdr_sensor_sync(self, sensors: Dict[str, Any], timeout: float = 10.0) -> dict:
+        return _run_sync(self.put_sdr_sensor(sensors, timeout=timeout))
+
+    async def get_estimates(
+        self,
+        category: Optional[str] = None,
+        since_ts: Optional[float] = None,
+        geo_filter: Optional[Tuple[float, float, float]] = None,
+        timeout: float = 8.0,
+    ) -> List[Dict]:
+        """
+        Fetches strictly anonymized multi-SDR RF transmitter location estimates from Banc Cloud
+        (categories: 'wiu', 'train', 'base', 'mcp', 'repeater', or None/'all').
+        """
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.host, self.port), timeout=5.0
+        )
+        try:
+            token = mosfet_auth.generate_token(self.auth_secret)
+            cat_tok = str(category or "all").strip().lower() or "all"
+            since_tok = f"{float(since_ts):.3f}" if (since_ts is not None and float(since_ts) > 0.0) else "0"
+            header_str = f"GET_ESTIMATES:{self.identity}:{token}:{cat_tok}:{since_tok}"
+            if isinstance(geo_filter, (tuple, list)) and len(geo_filter) >= 3:
+                try:
+                    glat, glon, grad = float(geo_filter[0]), float(geo_filter[1]), max(0.0, float(geo_filter[2]))
+                    if -85.0 <= glat <= 85.0 and -180.0 <= glon <= 180.0 and not (glat == 0.0 and glon == 0.0):
+                        header_str += f":{glat:.4f}:{glon:.4f}:{grad:.2f}"
+                except (ValueError, TypeError):
+                    pass
+            await self._write_frame(writer, header_str)
+            resp_str = await asyncio.wait_for(self._read_frame(reader), timeout=timeout)
+            if not resp_str or resp_str.startswith("ERROR:"):
+                return []
+            data = json.loads(resp_str)
+            return data if isinstance(data, list) else []
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def get_estimates_sync(
+        self,
+        category: Optional[str] = None,
+        since_ts: Optional[float] = None,
+        geo_filter: Optional[Tuple[float, float, float]] = None,
+        timeout: float = 8.0,
+    ) -> List[Dict]:
+        return _run_sync(self.get_estimates(category=category, since_ts=since_ts, geo_filter=geo_filter, timeout=timeout))
+
     async def send_chat_message(
         self,
         text: str,

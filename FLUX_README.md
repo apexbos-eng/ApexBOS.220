@@ -5,7 +5,7 @@
 
 **ApexBOSFlux** (formerly MosFET) is an asynchronous telemetry ingestion daemon, local UDP multicast relay, and secure cloud bursting uplink designed for the **ApexBOS** Railroad Dispatcher & Trackside Simulation ecosystem.
 
-Operating at the critical junction between RF physical receivers and dispatcher visualization systems, ApexBOSFlux aggregates real-time 220 MHz telemetry message streams from multiple **ApexBOSGrabber** SDR processes via ZeroMQ PUB/SUB sockets, distributes them locally across low-latency UDP multicast for real-time dispatching, and packages, encrypts, and bursts historical telemetry to **ApexBOSBanc Cloud** over IPv4 or IPv6.
+Operating at the critical junction between RF physical receivers and dispatcher visualization systems, ApexBOSFlux aggregates real-time multi-band telemetry streams from **ApexBOSGrabber** (220 MHz PTC, `18071–18131`), **ApexBOSLatch** (900 MHz ATCS, `18201`), and **ApexBOSFred** (450 MHz EOT/HOT/DPU/RLC, `18301`) via ZeroMQ PUB/SUB sockets, distributes them locally across low-latency UDP multicast for real-time dispatching, and packages, encrypts, and bursts historical telemetry (along with optional opt-in private sensor anchors for Banc k>=3 RF triangulation) to **ApexBOSBanc Cloud** over IPv4 or IPv6. On non-ANSI consoles (Legacy Windows Console, `TERM=dumb`, or redirected pipes), Flux automatically falls back to clean plain-text scroll mode (`--no-tui --no-color`).
 
 ---
 
@@ -273,7 +273,7 @@ ApexBOSFlux supports both modern unified `config.json` files and standalone lega
 ### Modern Unified Structure (`config.json`):
 ```json
 {
-  "version": "v26.1113.01",
+  "version": "v26.1127.08",
   "common": {
     "deployment_mode": "cloud",
     "banc": {

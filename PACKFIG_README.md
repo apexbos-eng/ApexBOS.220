@@ -113,7 +113,8 @@ flowchart TD
 
 - **Zero-Latency Visual Feedback**: Every time a rule is added, repeated, or undone, the entire packet is immediately re-parsed and rendered.
 - **Bit-Level & Byte-Level Precision**: Supports arbitrary bit-width fields (`int_bits`, single flags `bit`/`bool`), byte boundaries, strings (`string`, null-terminated `string_0`), BCD numbers, arrays, and conditional branches.
-- **Bi-Directional Rule Portability**: Rules saved in PackFIG adhere to the standard schema interpreted by [parse_packets.py](parse_packets.py), allowing instant plug-and-play operation in [ApexBOSSpy.py](ApexBOSSpy.py) and [dispatcher_engine.py](dispatcher_engine.py).
+- **Bi-Directional Rule Portability & Fast Expression Caching**: Rules saved in PackFIG adhere to the standard schema interpreted by [parse_packets.py](parse_packets.py) (which uses `@lru_cache`-compiled expression evaluation for `calc` fields), powering 220 MHz PTC rules (`x33_rule.json`, `ctc_rules.json` ordered before `x70_rules.json`), 450 MHz DPU rules (`dpu_rules.json`), and custom 900 MHz ATCS rules (`atcs_rules.json`) across [ApexBOSSpy.py](ApexBOSSpy.py), [ApexBOSChroma.py](ApexBOSChroma.py), and [dispatcher_engine.py](dispatcher_engine.py).
+- **Safe Distribution & Updater Merging**: Official `config/*rules.json` files (including `ctc_rules.json`) are packaged and strategically merged by `update.py` so new specific rules are inserted before generic ones without overwriting your custom rules.
 - **Cross-Ecosystem Translation**: Automatically converts declarative JSON definitions into legacy colon-separated ITCMon syntax (`{name}:{bits}:{format}`) via the `--alt` flag.
 
 ---

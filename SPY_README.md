@@ -5,7 +5,10 @@
 
 **ApexBOSSpy** is an interactive, dual-panel ANSI terminal protocol analyzer, real-time packet spy, and modular rule inspector designed for the **ApexBOS** Railroad Dispatcher & Trackside Simulation ecosystem.
 
-Connecting directly to the ZeroMQ `PUB` and UDP broadcast streams of **ApexBOSGrabber** receiver processes, ApexBOSSpy decodes physical-layer 220 MHz radio telemetry messages on the fly. It splits incoming traffic into a high-visibility, dual-panel display: **Known Packets** (validated by modular rule parsers) and **Unknown Packets** (unparsed raw frames).
+Connecting directly to the ZeroMQ `PUB` and UDP broadcast streams of **ApexBOSGrabber** (220 MHz PTC), **ApexBOSLatch** (900 MHz ATCS, port `18201`), and **ApexBOSFred** (450 MHz EOT/HOT/DPU/RLC, port `18301`), ApexBOSSpy automatically detects running receivers and decodes multi-band railway telemetry messages on the fly. It splits incoming traffic into a high-visibility, dual-panel display: **Known Packets** (validated by modular rule parsers including `ctc_rules.json`, `x33_rule.json`, `dpu_rules.json`, `atcs_rules.json`, and `rlc_rules.json`) and **Unknown Packets** (unparsed raw frames). On terminals without ANSI/VT100 support (Legacy Windows Console, `TERM=dumb`, or redirected pipes), ApexBOSSpy automatically switches to clean plain-text streaming mode.
+
+> [!NOTE]
+> **Grabber Control-Packet Filter**: By default, `ApexBOSGrabber` withholds `QSTAT/ACK` (`0x01`), `ACQ` (`0x04`), and `CNTL` (`0x05`) from its outbound ZeroMQ/UDP feeds (`--filter-ctrl`). If you want to inspect those control packets in ApexBOSSpy, start Grabber with `--no-filter-ctrl` (or type `filter off` in Grabber's console).
 
 ApexBOSSpy functions as both an observational diagnostic terminal and an **interactive rule development laboratory**—allowing enthusiasts and researchers to author or modify packet parsing rules in any text editor, hot-reload them on the fly without restarting, and immediately deploy those exact same rules to the **ApexBOS Dispatcher Engine** for live layout frame rendering.
 

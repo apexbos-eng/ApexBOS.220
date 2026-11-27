@@ -160,8 +160,23 @@ def _write_file(rel_path: str, data: bytes, mode: Optional[int] = None):
     os.replace(tmp, dst)
 
 
+def _load_baseline_manifest_files() -> Dict[str, str]:
+    """
+    Loads the installed file-hash baseline from .apexbos_manifest.json, falling back
+    to the shipped MANIFEST.json on a fresh ZIP install that has not yet been updated.
+    """
+    for mname in (iu.LOCAL_MANIFEST_NAME, iu.MANIFEST_NAME):
+        mpath = os.path.join(INSTALL_DIR, mname)
+        if os.path.isfile(mpath):
+            data = iu.load_json(mpath, {}) or {}
+            files = data.get("files")
+            if isinstance(files, dict):
+                return files
+    return {}
+
+
 def plan_and_apply(zf: zipfile.ZipFile, info: Dict[str, Any], backup_dir: str, dry_run: bool) -> Dict[str, List[str]]:
-    old_manifest = (iu.load_json(os.path.join(INSTALL_DIR, iu.LOCAL_MANIFEST_NAME), {}) or {}).get("files", {})
+    old_manifest = _load_baseline_manifest_files()
     new_files = (info["manifest"] or {}).get("files", {})
     res: Dict[str, List[str]] = {"added": [], "updated": [], "unchanged": [], "kept_user": [], "conflicts": [], "removed": []}
 
@@ -276,11 +291,16 @@ def do_stage1(args) -> int:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_old = re.sub(r"[^0-9A-Za-z._-]", "_", old_v)
             backup_dir = os.path.join(BACKUPS_DIR, f"update_{safe_old}_{stamp}")
+            prev_defaults_bak: Optional[str] = None
             if not args.dry_run:
                 os.makedirs(backup_dir, exist_ok=True)
-                cfg = os.path.join(INSTALL_DIR, "config.json")
-                if os.path.isfile(cfg):
-                    shutil.copy2(cfg, os.path.join(backup_dir, "config.json"))
+                for snap_name in ("config.json", "config.defaults.json", iu.LOCAL_MANIFEST_NAME, iu.MANIFEST_NAME):
+                    snap_src = os.path.join(INSTALL_DIR, snap_name)
+                    if os.path.isfile(snap_src):
+                        snap_dst = os.path.join(backup_dir, snap_name)
+                        shutil.copy2(snap_src, snap_dst)
+                        if snap_name == "config.defaults.json":
+                            prev_defaults_bak = snap_dst
 
             result = plan_and_apply(zf, info, backup_dir, args.dry_run)
     except (zipfile.BadZipFile, ValueError) as exc:
@@ -294,6 +314,12 @@ def do_stage1(args) -> int:
     print(f"  added: {len(result['added'])}   updated: {len(result['updated'])}   unchanged: {len(result['unchanged'])}"
           f"   removed(obsolete): {len(result['removed'])}")
     print(f"  your data kept untouched: {len(result['kept_user'])} file(s)")
+    added_rules = [r for r in result["added"] if iu.is_rule_file(r)]
+    updated_rules = [r for r in result["updated"] if iu.is_rule_file(r)]
+    for r in added_rules:
+        print(f"  [+] Added new rule file: {r}")
+    for r in updated_rules:
+        print(f"  [~] Updated unmodified rule file: {r} (previous copy backed up)")
     for c in result["conflicts"]:
         print(f"  [!] You modified '{c}': kept YOUR copy; the new version is saved as '{c}.new' (merge by hand if wanted)")
     if not args.dry_run:
@@ -304,6 +330,8 @@ def do_stage1(args) -> int:
 
     # Stage 2 runs the NEW code in a fresh interpreter.
     cmd = [sys.executable, os.path.join(INSTALL_DIR, "update.py"), "--post-update"]
+    if prev_defaults_bak and os.path.isfile(prev_defaults_bak):
+        cmd.extend(["--prev-defaults", prev_defaults_bak])
     if args.no_deps:
         cmd.append("--no-deps")
     if args.yes:
@@ -322,7 +350,10 @@ def do_post_update(args) -> int:
     import config_loader
 
     print("\n[*] Migrating configuration ...")
-    rep = config_loader.migrate_config_file(os.path.join(INSTALL_DIR, config_loader.CONFIG_FILENAME))
+    rep = config_loader.migrate_config_file(
+        os.path.join(INSTALL_DIR, config_loader.CONFIG_FILENAME),
+        prev_defaults_path=getattr(args, "prev_defaults", None),
+    )
     st = rep.get("status")
     if st == "no_config":
         print("    No config.json yet - run setup (setup.bat / setup.sh / setup.command) to configure ApexBOS.")
@@ -371,6 +402,11 @@ def do_post_update(args) -> int:
             iu.save_json(rec_path, rec)
 
     print(f"\n[+] ApexBOS is now at {iu.installed_version()}.")
+    print("\n" + "=" * 70)
+    print("  The update has been installed successfully!")
+    print("  Press Enter to close this shell and restart the launcher")
+    print("  from the desktop icon.")
+    print("=" * 70)
     return 0
 
 
@@ -425,8 +461,9 @@ def main() -> int:
     ap.add_argument("--no-stop", action="store_true", help="Do not look for / stop running ApexBOS processes")
     ap.add_argument("--no-deps", action="store_true", help="Skip Python package installation")
     ap.add_argument("--no-gui", action="store_true", help="Never open a file chooser dialog")
-    ap.add_argument("--relaunch", action="store_true", help="Restart the Control Center when finished")
+    ap.add_argument("--relaunch", action="store_true", help="(deprecated/ignored) Launcher is not restarted automatically; restart from the desktop icon")
     ap.add_argument("--post-update", action="store_true", help="(internal) stage 2: migrate config + install packages")
+    ap.add_argument("--prev-defaults", help="(internal) path to pre-update config.defaults.json snapshot")
     ap.add_argument("--rollback", metavar="DIR|latest", help="Restore files from an update backup")
     args = ap.parse_args()
 
@@ -446,11 +483,9 @@ def main() -> int:
         rc = 1
     if sys.stdin and sys.stdin.isatty() and not args.yes and not args.post_update:
         try:
-            input("\nPress Enter to close ...")
+            input("\nPress Enter to close this shell ...")
         except EOFError:
             pass
-    if args.relaunch and not args.post_update:
-        iu.launch_launcher_detached(INSTALL_DIR)
     return rc
 
 

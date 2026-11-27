@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from functools import lru_cache
 try:
     from dataclasses import dataclass, field, asdict, fields
 except ImportError:
@@ -51,6 +52,26 @@ from parse_packets import PacketParser
 
 RE_CH_RSSI_BYTES = re.compile(rb"^CH(\d{3})(?::RSSI=([+-]?\d+(?:\.\d+)?))?:")
 RE_CH_RSSI_STR = re.compile(r"^CH(\d{3})(?::RSSI=([+-]?\d+(?:\.\d+)?))?:")
+RE_LABEL_FONT_TAG = re.compile(r"<fn\s*([+-]\s*\d+)\s*>", re.IGNORECASE)
+
+
+def parse_label_font_tag(raw_label: Any) -> Tuple[str, int]:
+    """
+    Parses and strips relative font-size adjustment tags (<fn+N> / <fn-N>) from an element name.
+    Example: '<fn+3>Main Yard' -> ('Main Yard', 3), 'CP 42 <fn-2>' -> ('CP 42', -2).
+    """
+    text = str(raw_label or "")
+    if not text or "<fn" not in text.lower():
+        return text.strip(), 0
+    delta = 0
+    for m in RE_LABEL_FONT_TAG.finditer(text):
+        try:
+            delta += int(m.group(1).replace(" ", ""))
+        except (ValueError, TypeError):
+            pass
+    clean = RE_LABEL_FONT_TAG.sub("", text)
+    clean = re.sub(r"\s{2,}", " ", clean).strip()
+    return clean, delta
 FIREWALL_HELP_NOTICE = """
 Windows Firewall Requirement:
   To ingest UDP multicast packets from ApexBOSFlux or Grabber on Windows,
@@ -246,32 +267,743 @@ def parse_signal_rules(rule_str: str) -> Tuple[Optional[str], Dict[int, Dict[str
     return rr_override, value_overrides
 
 
-def evaluate_ctc_rules(rules_str: str, active_tokens: set) -> bool:
+def split_ctc_id_specs(spec: Any) -> List[str]:
+    r"""
+    Splits a layout element's `ctc_id` configuration into individual match specs.
+    Supports:
+      - Single substring:  'cp.oak'
+      - Comma-separated list for multi-railroad elements:  'up.oak, bnsf.oak, amtk.oak'
+      - Regular expressions starting with r/R and enclosed in quotes (single or double),
+        standalone or mixed in a comma-separated list, including commas inside regex quantifiers:
+          r"^(up|bnsf)\.cp\d{1,3}$"
+          up.oak, r'bnsf\.cp[0-9]{1,2}'
     """
-    Evaluates CTC rules string against active packet tokens (case-insensitive).
-    Specification: clauses separated by comma (AND).
-    Within each clause, terms separated by OR / and/or (OR).
-    E.g. 'K11 OR C11,K12 OR C12,K25' -> (K11 or C11) AND (K12 or C12) AND K25
+    raw = str(spec or "").strip()
+    if not raw:
+        return []
+    tokens: List[str] = []
+    buf: List[str] = []
+    in_quote: Optional[str] = None
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if in_quote is not None:
+            if ch == "\\" and i + 1 < n:
+                buf.append(ch)
+                buf.append(raw[i + 1])
+                i += 2
+                continue
+            buf.append(ch)
+            if ch == in_quote:
+                in_quote = None
+            i += 1
+            continue
+
+        # Not inside quotes: check for r"..." / r'...' (or R"..." / R'...') at token start
+        if ch in ("r", "R") and (i + 1 < n) and raw[i + 1] in ('"', "'"):
+            if not "".join(buf).strip():
+                in_quote = raw[i + 1]
+                buf.append(ch)
+                buf.append(in_quote)
+                i += 2
+                continue
+
+        if ch == ",":
+            tok = "".join(buf).strip()
+            if tok:
+                tokens.append(tok)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        tokens.append(tail)
+    return tokens
+
+
+def _extract_ctc_regex_pattern(token: str) -> Optional[str]:
+    """If `token` is formatted as r"..." or r'...' (or R"..." / R'...'), returns the inner regex pattern."""
+    t = str(token or "").strip()
+    if len(t) >= 3 and t[0] in ("r", "R") and t[1] in ('"', "'") and t[-1] == t[1]:
+        q = t[1]
+        inner = t[2:-1]
+        # Unescape escaped quote delimiters only, preserving all regex escapes (\d, \., \s, etc.)
+        return inner.replace("\\" + q, q)
+    return None
+
+
+@lru_cache(maxsize=256)
+def _compile_ctc_regex(pattern: str) -> Optional[Any]:
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return None
+
+
+def ctc_id_matches(element_ctc_spec: Any, packet_ctc_id: Any) -> bool:
+    """
+    Returns True if `packet_ctc_id` matches `element_ctc_spec`.
+    Supports single substring, comma-separated lists of substrings, and quoted regexes
+    (`r"pattern"` / `r'pattern'`). Matching is case-insensitive.
+    """
+    el_raw = str(element_ctc_spec or "").strip()
+    pkt_raw = str(packet_ctc_id or "").strip()
+    if not el_raw or not pkt_raw:
+        return False
+    pkt_low = pkt_raw.lower()
+    pkt_no0 = pkt_low.lstrip("0")
+    specs = split_ctc_id_specs(el_raw)
+    for tok in specs:
+        pat = _extract_ctc_regex_pattern(tok)
+        if pat is not None:
+            rx = _compile_ctc_regex(pat)
+            if rx is not None and rx.search(pkt_raw) is not None:
+                return True
+        else:
+            tok_low = tok.lower()
+            if tok_low and tok_low in pkt_low:
+                return True
+            if tok_low.isdigit() and pkt_low.isdigit() and tok_low.lstrip("0") == pkt_no0:
+                return True
+    return False
+
+
+# Precomputed 128-bit CTC lookup tables (tens=1..16, ones=1..8):
+#   bitNum = (tens << 3) - ones
+_CTC_N_TO_BIT_128: Dict[int, int] = {
+    t * 10 + o: (t << 3) - o for t in range(1, 17) for o in range(1, 9)
+}
+_CTC_BIT_MASK_RT_128: Dict[int, int] = {
+    n: (1 << b) for n, b in _CTC_N_TO_BIT_128.items()
+}
+_CTC_BIT_MASK_LT_128: Dict[int, int] = {
+    n: (1 << (127 - b)) for n, b in _CTC_N_TO_BIT_128.items()
+}
+_RE_CTC_BIT_ATOM = re.compile(r"([kcz]?)(\d+)")
+
+
+def normalize_ctc_kc(raw_kc: Any) -> Optional[str]:
+    """Normalizes a CTC packet `_kc_` field to 'K' (indication), 'C' (command), or None."""
+    if raw_kc is None:
+        return None
+    s = str(raw_kc).strip().upper()
+    return s if s in ("K", "C") else None
+
+
+def extract_packet_kc(parsed_pkt: Any) -> Optional[str]:
+    """Extracts normalized `_kc_` ('K' or 'C') from a parsed CTC packet dict, or None if absent."""
+    if not isinstance(parsed_pkt, dict):
+        return None
+    raw = parsed_pkt.get("_kc_")
+    if raw is None:
+        raw = parsed_pkt.get("kc")
+    return normalize_ctc_kc(raw)
+
+
+def _ctc_letter_matches_kc(letter: str, pkt_kc: Optional[str]) -> bool:
+    """
+    Checks whether a CTC rule bit prefix letter matches the incoming packet's `_kc_` type:
+      - '' (bare integer, e.g. '11'): matches BOTH 'K' and 'C' packets.
+      - 'k': matches 'K' (indication) packets only.
+      - 'c': matches 'C' (command) packets only.
+      - 'z': matches 'K' (indication) packets only (Out-of-Service indications).
+      - When `pkt_kc` is None (packet omits `_kc_`), all prefixes match for backward compatibility.
+    """
+    if pkt_kc is None or not letter:
+        return True
+    if letter == "k" or letter == "z":
+        return pkt_kc == "K"
+    if letter == "c":
+        return pkt_kc == "C"
+    return False
+
+
+def ctc_n_to_bit_num(n: int) -> Optional[int]:
+    """
+    Converts decimal CTC bit label N (e.g. 11..18, 21..28, ..., 161..168) to 0-based bitNum:
+        bitNum = (tens << 3) - ones   
+    Uses an O(1) lookup table for standard 128-bit labels (11..168) and falls back to
+    single-division `divmod` arithmetic for larger bit widths.
+    Returns None if tens < 1 or ones digit is outside 1..8.
+    """
+    if type(n) is int:
+        hit = _CTC_N_TO_BIT_128.get(n)
+        if hit is not None:
+            return hit
+        if n <= 168:
+            return None
+        tens, ones = divmod(n, 10)
+        return ((tens << 3) - ones) if (1 <= ones <= 8) else None
+    if isinstance(n, bool):
+        return None
+    try:
+        n_int = int(n)
+    except (ValueError, TypeError):
+        return None
+    hit = _CTC_N_TO_BIT_128.get(n_int)
+    if hit is not None:
+        return hit
+    if n_int <= 168:
+        return None
+    tens, ones = divmod(n_int, 10)
+    return ((tens << 3) - ones) if (1 <= ones <= 8) else None
+
+
+def _ctc_bit_mask(bit_n: int, lsb_left: bool = False, bit_width: int = 128) -> int:
+    """Returns precomputed/computed integer bitmask (1 << shift) for CTC bit label N, or 0 if invalid."""
+    if bit_width == 128 and type(bit_n) is int:
+        return (_CTC_BIT_MASK_LT_128 if lsb_left else _CTC_BIT_MASK_RT_128).get(bit_n, 0)
+    bit_num = ctc_n_to_bit_num(bit_n)
+    if bit_num is None:
+        return 0
+    width = max(1, int(bit_width or 128))
+    shift = (width - 1 - bit_num) if lsb_left else bit_num
+    if shift < 0 or shift >= width:
+        return 0
+    return 1 << shift
+
+
+def coerce_ctc_rules_int(raw_val: Any) -> Optional[int]:
+    """Coerces a packet's `_ctc_rules_` field into an integer (supports int, bytes, hex/bin/dec strings)."""
+    if raw_val is None or isinstance(raw_val, bool):
+        return None
+    if isinstance(raw_val, int):
+        return raw_val
+    if isinstance(raw_val, (bytes, bytearray)):
+        return int.from_bytes(raw_val, "big", signed=False)
+    s = str(raw_val).strip()
+    if not s:
+        return None
+    try:
+        sl = s.lower()
+        if sl.startswith("0x"):
+            return int(s, 16)
+        if sl.startswith("0b"):
+            return int(s, 2)
+        if len(s) >= 8 and set(s) <= {"0", "1"}:
+            return int(s, 2)
+        return int(s, 10)
+    except ValueError:
+        try:
+            return int(s, 16)
+        except ValueError:
+            return None
+
+
+def ctc_bit_is_set(
+    ctc_rules_int: int,
+    bit_n: int,
+    lsb_left: bool = False,
+    bit_width: int = 128,
+) -> bool:
+    """
+    Tests bit N (from KN / CN / ZN) in a packet's `_ctc_rules_` integer:
+      bitNum = (tens << 3) - ones
+      - LSB-RT (lsb_left=False, default): LSB is on the right -> (val & (1 << bitNum)) != 0
+      - LSB-LT (lsb_left=True):           LSB is on the left  -> (val & (1 << (bit_width - 1 - bitNum))) != 0
+    """
+    mask = _ctc_bit_mask(bit_n, lsb_left=lsb_left, bit_width=bit_width)
+    return bool(mask and (int(ctc_rules_int) & mask))
+
+
+def _split_top_level_commas(expr: str) -> List[str]:
+    """Splits a CTC rule string on top-level commas (outside parentheses)."""
+    parts: List[str] = []
+    depth = 0
+    buf: List[str] = []
+    for ch in expr:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+        else:
+            buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _strip_lsb_prefix(text: str, default_lsb_left: bool) -> Tuple[str, bool]:
+    """Parses optional leading `LSB-LT:` or `LSB-RT:` prefix (case-insensitive)."""
+    m = re.match(r"^\s*LSB[-_]?(LT|RT)\s*:\s*(.*)$", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(2).strip(), (m.group(1).upper() == "LT")
+    return text.strip(), default_lsb_left
+
+
+_CTC_TOKEN_RE = re.compile(
+    r"\s*(?:"
+    r"(\()|"
+    r"(\))|"
+    r"(!|~|\bNOT\b)|"
+    r"(&&|&|\bAND\b(?!/OR\b))|"
+    r"(\^|\bXOR\b)|"
+    r"(\|\||\||\bAND/OR\b|\bOR\b|/)|"
+    r"(,)|"
+    r"([A-Za-z0-9_.:=-]+)"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def _parse_ctc_clause_ast(
+    clause: str,
+    default_lsb_left: bool,
+    bit_width: int,
+    pkt_kc: Optional[str] = None,
+) -> Optional[Tuple[tuple, bool, bool]]:
+    """
+    Compiles a single CTC rule clause once into (ast_node, has_bit_atoms, has_matching_kc_bit)
+    with pre-resolved bitmasks scoped to `pkt_kc` ('K', 'C', or None).
+    """
+    clause, lsb_left = _strip_lsb_prefix(clause, default_lsb_left)
+    if not clause:
+        return None
+
+    tokens: List[Tuple[str, str]] = []
+    pos = 0
+    n_len = len(clause)
+    while pos < n_len:
+        m = _CTC_TOKEN_RE.match(clause, pos)
+        if not m:
+            pos += 1
+            continue
+        pos = m.end()
+        if m.group(1):
+            tokens.append(("LPAREN", "("))
+        elif m.group(2):
+            tokens.append(("RPAREN", ")"))
+        elif m.group(3):
+            tokens.append(("NOT", "!"))
+        elif m.group(4):
+            tokens.append(("AND", "AND"))
+        elif m.group(5):
+            tokens.append(("XOR", "XOR"))
+        elif m.group(6):
+            tokens.append(("OR", "OR"))
+        elif m.group(7):
+            tokens.append(("COMMA", ","))
+        elif m.group(8):
+            tokens.append(("ATOM", m.group(8)))
+
+    if not tokens:
+        return None
+
+    idx = [0]
+    n_tok = len(tokens)
+    has_bit_atoms = [False]
+    has_matching_kc = [False]
+
+    def _parse_comma() -> tuple:
+        # Commas inside parentheses act as lowest-precedence AND, matching top-level commas:
+        # e.g. '(C1 and/or C12, K21 AND/OR K32)' == '(C1 OR C12) AND (K21 OR K32)'.
+        node = _parse_or()
+        while idx[0] < n_tok and tokens[idx[0]][0] == "COMMA":
+            idx[0] += 1
+            rhs = _parse_or()
+            node = ("AND", node, rhs)
+        return node
+
+    def _parse_or() -> tuple:
+        node = _parse_xor()
+        while idx[0] < n_tok and tokens[idx[0]][0] == "OR":
+            idx[0] += 1
+            rhs = _parse_xor()
+            node = ("OR", node, rhs)
+        return node
+
+    def _parse_xor() -> tuple:
+        node = _parse_and()
+        while idx[0] < n_tok and tokens[idx[0]][0] == "XOR":
+            idx[0] += 1
+            rhs = _parse_and()
+            node = ("XOR", node, rhs)
+        return node
+
+    def _parse_and() -> tuple:
+        node = _parse_not()
+        while idx[0] < n_tok and tokens[idx[0]][0] == "AND":
+            idx[0] += 1
+            rhs = _parse_not()
+            node = ("AND", node, rhs)
+        return node
+
+    def _parse_not() -> tuple:
+        if idx[0] < n_tok and tokens[idx[0]][0] == "NOT":
+            idx[0] += 1
+            child = _parse_not()
+            # Never invert a non-matching K/C direction into True (e.g. '!K11 OR !C11' on a C packet)
+            if child[0] == "KC_MISMATCH":
+                return child
+            return ("NOT", child)
+        return _parse_primary()
+
+    def _parse_primary() -> tuple:
+        if idx[0] >= n_tok:
+            return ("CONST", False)
+        kind, text = tokens[idx[0]]
+        if kind == "LPAREN":
+            idx[0] += 1
+            node = _parse_comma()
+            if idx[0] < n_tok and tokens[idx[0]][0] == "RPAREN":
+                idx[0] += 1
+            return node
+        if kind == "ATOM":
+            idx[0] += 1
+            al = text.strip().lower()
+            if not al or al in ("false", "0"):
+                return ("CONST", False)
+            if al in ("true", "1"):
+                return ("CONST", True)
+            m_bit = _RE_CTC_BIT_ATOM.fullmatch(al)
+            if m_bit:
+                letter, digits = m_bit.group(1), m_bit.group(2)
+                has_bit_atoms[0] = True
+                if _ctc_letter_matches_kc(letter, pkt_kc):
+                    has_matching_kc[0] = True
+                    mask = _ctc_bit_mask(int(digits), lsb_left=lsb_left, bit_width=bit_width)
+                    return ("BIT", mask, al, letter)
+                return ("KC_MISMATCH", al)
+            return ("TOK", al)
+        # Unexpected operator token -> consume to prevent infinite loop
+        idx[0] += 1
+        return ("CONST", False)
+
+    return _parse_comma(), has_bit_atoms[0], has_matching_kc[0]
+
+
+def _extract_fast_int_matcher(node: tuple) -> Optional[Tuple[str, int]]:
+    """
+    Collapses pure positive OR-only or AND-only CTC bit ASTs into a single bitmask operation:
+      - ("OR", mask)   -> bool(val & mask)
+      - ("AND", mask)  -> (val & mask) == mask
+      - ("CONST", 0|1) -> constant bool
+    Returns None when general AST evaluation is required (NOT, XOR, mixed ops, symbolic tokens).
+    """
+    op = node[0]
+    if op == "CONST":
+        return ("CONST", 1 if node[1] else 0)
+    if op == "KC_MISMATCH":
+        return ("CONST", 0)
+    if op == "BIT":
+        return ("OR", node[1])
+
+    def _collect_or_mask(n: tuple) -> Optional[int]:
+        nop = n[0]
+        if nop == "BIT":
+            return n[1]
+        if nop == "KC_MISMATCH":
+            return 0
+        if nop == "CONST":
+            return None if n[1] else 0
+        if nop == "OR":
+            lm = _collect_or_mask(n[1])
+            if lm is None:
+                return None
+            rm = _collect_or_mask(n[2])
+            if rm is None:
+                return None
+            return lm | rm
+        return None
+
+    or_mask = _collect_or_mask(node)
+    if or_mask is not None:
+        return ("OR", or_mask)
+
+    def _collect_and_mask(n: tuple) -> Optional[int]:
+        nop = n[0]
+        if nop == "BIT":
+            return -1 if n[1] == 0 else n[1]
+        if nop == "KC_MISMATCH":
+            return -1
+        if nop == "CONST":
+            return 0 if n[1] else -1
+        if nop == "AND":
+            lm = _collect_and_mask(n[1])
+            if lm is None:
+                return None
+            rm = _collect_and_mask(n[2])
+            if rm is None:
+                return None
+            if lm == -1 or rm == -1:
+                return -1
+            return lm | rm
+        return None
+
+    and_mask = _collect_and_mask(node)
+    if and_mask is not None:
+        if and_mask == -1:
+            return ("CONST", 0)
+        if and_mask == 0:
+            return ("CONST", 1)
+        return ("AND", and_mask)
+
+    return None
+
+
+def _eval_ctc_ast(node: tuple, ctc_rules_int: Optional[int], active_tokens: set) -> bool:
+    """Fast evaluator for a compiled CTC rule AST."""
+    op = node[0]
+    if op == "BIT":
+        if ctc_rules_int is not None:
+            m = node[1]
+            return bool(m and (ctc_rules_int & m))
+        al = node[2]
+        if al in active_tokens:
+            return True
+        # Bare integer bit (letter == "") also matches 'k<N>' or 'c<N>' in symbolic token mode
+        if len(node) > 3 and node[3] == "":
+            return (f"k{al}" in active_tokens) or (f"c{al}" in active_tokens)
+        return False
+    if op == "KC_MISMATCH":
+        return False
+    if op == "OR":
+        return _eval_ctc_ast(node[1], ctc_rules_int, active_tokens) or _eval_ctc_ast(node[2], ctc_rules_int, active_tokens)
+    if op == "AND":
+        return _eval_ctc_ast(node[1], ctc_rules_int, active_tokens) and _eval_ctc_ast(node[2], ctc_rules_int, active_tokens)
+    if op == "NOT":
+        return not _eval_ctc_ast(node[1], ctc_rules_int, active_tokens)
+    if op == "XOR":
+        return _eval_ctc_ast(node[1], ctc_rules_int, active_tokens) ^ _eval_ctc_ast(node[2], ctc_rules_int, active_tokens)
+    if op == "TOK":
+        return node[1] in active_tokens
+    if op == "CONST":
+        return bool(node[1])
+    return False
+
+
+def _eval_compiled_ctc_program(
+    compiled: Optional[Tuple[tuple, Optional[Tuple[str, int]]]],
+    active_tokens: Optional[set],
+    ctc_rules_int: Optional[int],
+) -> bool:
+    """Runs a compiled (ast, fast_int_matcher) program against integer or symbolic CTC state."""
+    if compiled is None:
+        return False
+    ast_node, fast = compiled
+    if ctc_rules_int is not None:
+        val = int(ctc_rules_int)
+        if fast is not None:
+            mode, mask = fast
+            if mode == "OR":
+                return bool(val & mask)
+            if mode == "AND":
+                return (val & mask) == mask
+            return bool(mask)
+        toks = active_tokens if isinstance(active_tokens, set) else set()
+        return _eval_ctc_ast(ast_node, val, toks)
+    toks = active_tokens if isinstance(active_tokens, set) else set()
+    return _eval_ctc_ast(ast_node, None, toks)
+
+
+@lru_cache(maxsize=1024)
+def _compile_ctc_clause_cached(
+    clause: str,
+    lsb_left: bool,
+    bit_width: int,
+    pkt_kc: Optional[str] = None,
+) -> Optional[Tuple[tuple, Optional[Tuple[str, int]]]]:
+    parsed = _parse_ctc_clause_ast(clause, lsb_left, bit_width, pkt_kc=pkt_kc)
+    if parsed is None:
+        return None
+    ast_node, has_bits, has_matching_kc = parsed
+    if pkt_kc is not None and has_bits and not has_matching_kc:
+        return None
+    return (ast_node, _extract_fast_int_matcher(ast_node))
+
+
+def _eval_ctc_clause(
+    clause: str,
+    active_tokens: set,
+    ctc_rules_int: Optional[int],
+    lsb_left: bool,
+    bit_width: int,
+    pkt_kc: Optional[str] = None,
+) -> bool:
+    """Evaluates a single CTC rule clause using the compiled/cached AST & bitmask fast path."""
+    width = max(1, int(bit_width or 128))
+    kc = normalize_ctc_kc(pkt_kc)
+    compiled = _compile_ctc_clause_cached(str(clause or ""), bool(lsb_left), width, kc)
+    return _eval_compiled_ctc_program(compiled, active_tokens, ctc_rules_int)
+
+
+RE_CTC_Z_TOKEN = re.compile(r"\bz\d+\b", re.IGNORECASE)
+
+
+@lru_cache(maxsize=1024)
+def split_ctc_rules_and_oos(rules_str: str) -> Tuple[str, str]:
+    """
+    Splits a CTC rules string into (primary_logic_rule, oos_z_rule) separated by ';'.
+    Z bits (Out-of-Service) are NOT part of primary occupancy/switch/signal logic;
+    they are appended after ';' and can be OR'd between themselves (e.g. 'K11; Z21 OR Z22').
+    Preserves any leading 'LSB-LT:' / 'LSB-RT:' prefix on both parts.
     """
     if not rules_str:
-        return False
-    clean = rules_str.strip().strip("()")
-    if not clean:
-        return False
-    clauses = [c.strip() for c in clean.split(",") if c.strip()]
+        return "", ""
+    raw = str(rules_str).strip()
+    if not raw:
+        return "", ""
+    body, lsb_left = _strip_lsb_prefix(raw, default_lsb_left=False)
+    has_explicit_prefix = bool(re.match(r"^(?:LSB-(?:LT|RT))\s*:\s*", raw, re.IGNORECASE))
+    prefix = ("LSB-LT:" if lsb_left else "LSB-RT:") if has_explicit_prefix else ""
+
+    parts = [p.strip() for p in body.split(";") if p.strip()]
+    primary_parts: List[str] = []
+    oos_parts: List[str] = []
+    for p in parts:
+        if RE_CTC_Z_TOKEN.search(p):
+            oos_parts.append(p)
+        else:
+            primary_parts.append(p)
+
+    def _attach_prefix(expr: str) -> str:
+        if not expr:
+            return ""
+        if prefix and not re.match(r"^(?:LSB-(?:LT|RT))\s*:", expr, re.IGNORECASE):
+            return f"{prefix}{expr}"
+        return expr
+
+    primary_expr = _attach_prefix(", ".join(primary_parts)) if primary_parts else ""
+    oos_expr = _attach_prefix(" OR ".join(oos_parts)) if oos_parts else ""
+    return primary_expr, oos_expr
+
+
+def _compile_ctc_expr_group(
+    expr_str: str,
+    join_op: str,
+    bit_width: int,
+    pkt_kc: Optional[str] = None,
+) -> Optional[Tuple[tuple, Optional[Tuple[str, int]]]]:
+    if not expr_str:
+        return None
+    body, lsb_left = _strip_lsb_prefix(expr_str, default_lsb_left=False)
+    if not body:
+        return None
+    clauses = _split_top_level_commas(body)
     if not clauses:
-        return False
+        return None
+    combined: Optional[tuple] = None
+    any_bits = False
+    any_matching_kc = False
     for clause in clauses:
-        terms = re.split(r"\s+(?:and/or|or|/)\s+", clause, flags=re.IGNORECASE)
-        clause_satisfied = False
-        for term in terms:
-            t = term.strip().lower()
-            if t in active_tokens:
-                clause_satisfied = True
-                break
-        if not clause_satisfied:
-            return False
-    return True
+        parsed = _parse_ctc_clause_ast(clause, lsb_left, bit_width, pkt_kc=pkt_kc)
+        if parsed is None:
+            ast_node = ("CONST", False)
+        else:
+            ast_node, c_has_bits, c_has_kc = parsed
+            any_bits = any_bits or c_has_bits
+            any_matching_kc = any_matching_kc or c_has_kc
+        combined = ast_node if combined is None else (join_op, combined, ast_node)
+    if combined is None:
+        return None
+    if pkt_kc is not None and any_bits and not any_matching_kc:
+        return None
+    return (combined, _extract_fast_int_matcher(combined))
+
+
+@lru_cache(maxsize=1024)
+def _compile_ctc_rule_bundle(
+    rules_str: str,
+    bit_width: int,
+    pkt_kc: Optional[str] = None,
+) -> Tuple[
+    Optional[Tuple[tuple, Optional[Tuple[str, int]]]],
+    Optional[Tuple[tuple, Optional[Tuple[str, int]]]],
+]:
+    """
+    Compiles and caches both primary and OOS Z rule evaluators for a (rules_str, bit_width, pkt_kc) tuple.
+    Either slot is None when absent or when its bit letters do not apply to `pkt_kc`.
+    """
+    primary_str, oos_str = split_ctc_rules_and_oos(rules_str)
+    primary_prog = _compile_ctc_expr_group(primary_str, "AND", bit_width, pkt_kc=pkt_kc) if primary_str else None
+    oos_prog = _compile_ctc_expr_group(oos_str, "OR", bit_width, pkt_kc=pkt_kc) if oos_str else None
+    return primary_prog, oos_prog
+
+
+def evaluate_ctc_rules_optional(
+    rules_str: str,
+    active_tokens: Optional[set] = None,
+    ctc_rules_int: Optional[int] = None,
+    bit_width: int = 128,
+    pkt_kc: Optional[str] = None,
+) -> Optional[bool]:
+    """
+    Evaluates the primary (non-Z) CTC rule string scoped to `pkt_kc` ('K', 'C', or None).
+    Returns None if no primary rule is defined OR if the rule's bit letters do not apply to `pkt_kc`
+    (e.g., a 'K11' indication rule receiving a '_kc_ == C' command packet), so callers preserve existing state.
+    """
+    if not rules_str:
+        return None
+    width = max(1, int(bit_width or 128))
+    kc = normalize_ctc_kc(pkt_kc)
+    primary_prog, _ = _compile_ctc_rule_bundle(str(rules_str), width, kc)
+    if primary_prog is None:
+        return None
+    return _eval_compiled_ctc_program(primary_prog, active_tokens, ctc_rules_int)
+
+
+def evaluate_ctc_rules(
+    rules_str: str,
+    active_tokens: Optional[set] = None,
+    ctc_rules_int: Optional[int] = None,
+    bit_width: int = 128,
+    pkt_kc: Optional[str] = None,
+) -> bool:
+    """
+    Evaluates the primary (non-Z) CTC rule string against either:
+      1. A packet's 128-bit integer `_ctc_rules_` (when `ctc_rules_int` is provided):
+         - KN matches only `_kc_ == 'K'` (indications); CN matches only `_kc_ == 'C'` (commands);
+           bare integer N (e.g. `11`) matches BOTH 'K' and 'C' packets.
+         - bitNum = (tens << 3) - ones
+         - Optional prefix `LSB-LT:` puts LSB on the left (transmitted first);
+           `LSB-RT:` or no prefix puts LSB on the right (transmitted last).
+         - Any `; Z...` out-of-service clauses are excluded from primary logic.
+      2. Legacy symbolic `active_tokens` set (when `ctc_rules_int` is None).
+    """
+    res = evaluate_ctc_rules_optional(
+        rules_str,
+        active_tokens=active_tokens,
+        ctc_rules_int=ctc_rules_int,
+        bit_width=bit_width,
+        pkt_kc=pkt_kc,
+    )
+    return bool(res)
+
+
+def evaluate_ctc_oos_rules(
+    rules_str: str,
+    active_tokens: Optional[set] = None,
+    ctc_rules_int: Optional[int] = None,
+    bit_width: int = 128,
+    pkt_kc: Optional[str] = None,
+) -> Optional[bool]:
+    """
+    Evaluates the Out-of-Service (`; Z...`) portion of a CTC rules string.
+    Z bits only match when `_kc_` is 'K' (indications) or omitted (`pkt_kc is None`).
+    Returns None if no Z bits are defined or `pkt_kc` is 'C', True if any OOS Z bit matches,
+    or False if Z bits apply and none match.
+    """
+    if not rules_str:
+        return None
+    width = max(1, int(bit_width or 128))
+    kc = normalize_ctc_kc(pkt_kc)
+    _, oos_prog = _compile_ctc_rule_bundle(str(rules_str), width, kc)
+    if oos_prog is None:
+        return None
+    return _eval_compiled_ctc_program(oos_prog, active_tokens, ctc_rules_int)
 
 @dataclass
 class BaseElement:
@@ -290,9 +1022,27 @@ class BaseElement:
     _last_packet_ts: float = field(default=0.0, repr=False)
     _packets_received: int = field(default=0, repr=False)
     _last_raw_hex: str = field(default="", repr=False)
+    _last_ptc_ts: float = field(default=0.0, repr=False)
     _last_ctc_ts: float = field(default=0.0, repr=False)
     _last_rssi: Optional[float] = field(default=None, repr=False)
     _rssi_samples: Any = field(default_factory=lambda: deque(maxlen=20), repr=False)
+
+    def is_ptc_active(self, engine: Any, now_ts: Optional[float] = None) -> bool:
+        """
+        True if this element has received a matching PTC (WIU ID) packet within the PTC timeout window.
+        While PTC is active, CTC logic is ignored for this element; once PTC times out, CTC may update
+        the element until overwritten by the next PTC packet.
+        """
+        last_ptc = float(getattr(self, "_last_ptc_ts", 0.0) or 0.0)
+        if last_ptc <= 0.0:
+            return False
+        ts = float(now_ts if now_ts is not None else time.time())
+        timeout_sec = float(
+            getattr(engine, "ptc_timeout_sec", None)
+            or getattr(engine, "inferred_timeout_sec", None)
+            or 120.0
+        )
+        return (ts - last_ptc) < timeout_sec
 
     def add_rssi_sample(self, rssi: Any):
         if not hasattr(self, "_rssi_samples") or self._rssi_samples is None:
@@ -384,33 +1134,115 @@ class BaseElement:
                 active_tokens.add(v.lower())
         return active_tokens
 
+    @staticmethod
+    def _extract_ctc_rules_int_and_width(parsed_pkt: dict) -> Tuple[Optional[int], int]:
+        """Extracts optional 128-bit integer `_ctc_rules_` and bit width from parsed_pkt."""
+        if not isinstance(parsed_pkt, dict):
+            return None, 128
+        raw_r = parsed_pkt.get("_ctc_rules_")
+        if raw_r is None:
+            raw_r = parsed_pkt.get("ctc_rules")
+        val = coerce_ctc_rules_int(raw_r)
+        if val is None:
+            return None, 128
+        raw_w = parsed_pkt.get("_ctc_base_")
+        if raw_w is None:
+            raw_w = parsed_pkt.get("_ctc_bits_")
+        try:
+            width = int(raw_w) if raw_w is not None and int(raw_w) > 0 else 128
+        except (ValueError, TypeError):
+            width = 128
+        return val, width
+
     def _ctc_id_matches_packet(self, parsed_pkt: dict) -> Optional[bool]:
-        """Returns True if self.ctc_id matches packet CTC/MCP ID, False if both are set and differ, else None."""
-        el_cid = str(self.ctc_id or "").strip().lower()
+        """
+        Checks whether this element's `ctc_id` is addressed by the packet's `_ctc_id_` string:
+        supports single substring, comma-separated multi-railroad lists, and quoted regexes
+        (`r"..."` / `r'...'`) matched against packet `_ctc_id_` / `ctc_id` / `mcp_addr`.
+        Returns True on match, False if both element and packet carry CTC IDs and none match, else None.
+        """
+        el_cid = str(self.ctc_id or "").strip()
         pkt_ids = [
-            str(x).strip().lower()
+            str(x).strip()
             for x in (parsed_pkt.get("_ctc_id_"), parsed_pkt.get("ctc_id"), parsed_pkt.get("mcp_addr"))
             if x is not None and str(x).strip()
         ]
         if not el_cid or not pkt_ids:
             return None
-        return any(el_cid == pid or el_cid.lstrip("0") == pid.lstrip("0") for pid in pkt_ids)
+        for pid in pkt_ids:
+            if ctc_id_matches(el_cid, pid):
+                return True
+        return False
+
+    def _evaluate_ctc_rule_for_packet(self, parsed_pkt: dict) -> Optional[bool]:
+        """
+        Evaluates primary (non-Z) `self.ctc_rules` against packet `_ctc_rules_` int or tokens,
+        honoring packet `_kc_` ('K' indication vs 'C' command).
+        Returns None if no primary rules exist or if the rule does not apply to this packet's `_kc_`.
+        """
+        if not self.ctc_rules:
+            return None
+        ctc_int, ctc_bits = self._extract_ctc_rules_int_and_width(parsed_pkt)
+        active_tokens = self._extract_ctc_tokens(parsed_pkt)
+        pkt_kc = extract_packet_kc(parsed_pkt)
+        return evaluate_ctc_rules_optional(
+            self.ctc_rules,
+            active_tokens=active_tokens,
+            ctc_rules_int=ctc_int,
+            bit_width=ctc_bits,
+            pkt_kc=pkt_kc,
+        )
+
+    def _evaluate_ctc_oos_for_packet(self, parsed_pkt: dict) -> Optional[bool]:
+        """
+        Evaluates Out-of-Service (`; Z...`) portion of `self.ctc_rules`.
+        Z bits only apply when packet `_kc_` is 'K' (indications) or omitted.
+        Returns None if no Z rules exist or packet `_kc_` is 'C'.
+        """
+        if not self.ctc_rules:
+            return None
+        ctc_int, ctc_bits = self._extract_ctc_rules_int_and_width(parsed_pkt)
+        active_tokens = self._extract_ctc_tokens(parsed_pkt)
+        pkt_kc = extract_packet_kc(parsed_pkt)
+        return evaluate_ctc_oos_rules(
+            self.ctc_rules,
+            active_tokens=active_tokens,
+            ctc_rules_int=ctc_int,
+            bit_width=ctc_bits,
+            pkt_kc=pkt_kc,
+        )
 
     def check_ctc_match(self, parsed_pkt: dict) -> bool:
         pkt_ctc = parsed_pkt.get("_ctc_id_") or parsed_pkt.get("ctc_id")
-        if not pkt_ctc and not self.ctc_rules:
+        ctc_int, _ = self._extract_ctc_rules_int_and_width(parsed_pkt)
+        if not pkt_ctc and ctc_int is None and not self.ctc_rules:
             return False
 
-        # For ATCS packets, if this element is scoped to a specific ctc_id, do not match a different station's tokens
         cid_match = self._ctc_id_matches_packet(parsed_pkt)
-        if parsed_pkt.get("protocol") == "atcs" and cid_match is False:
+        # If this element is scoped to a specific ctc_id and the packet carries a non-matching _ctc_id_, reject
+        if cid_match is False:
             return False
+
+        # When packet carries a 128-bit _ctc_rules_ integer, require explicit ctc_id match if element has one
+        if ctc_int is not None:
+            if cid_match is not True:
+                return False
+            if self.ctc_rules:
+                primary_eval = self._evaluate_ctc_rule_for_packet(parsed_pkt)
+                oos_eval = self._evaluate_ctc_oos_for_packet(parsed_pkt)
+                matched = bool(primary_eval is True or oos_eval is True)
+            else:
+                matched = True
+            if matched:
+                self._last_ctc_ts = float(parsed_pkt.get("timestamp", time.time()))
+            return matched
 
         active_tokens = self._extract_ctc_tokens(parsed_pkt)
+        pkt_kc = extract_packet_kc(parsed_pkt)
 
         matched = False
         if self.ctc_rules:
-            if evaluate_ctc_rules(self.ctc_rules, active_tokens):
+            if evaluate_ctc_rules(self.ctc_rules, active_tokens, pkt_kc=pkt_kc):
                 matched = True
 
         if not matched and pkt_ctc:
@@ -418,7 +1250,7 @@ class BaseElement:
                 # Scoped ATCS element with explicit ctc_rules only fires ctc_active when its rule matches
                 return False
             c_val = str(pkt_ctc).strip().lower()
-            if self.ctc_id and (cid_match is True or c_val == self.ctc_id.strip().lower()):
+            if self.ctc_id and (cid_match is True or ctc_id_matches(self.ctc_id, pkt_ctc)):
                 matched = True
             elif not self.ctc_id and c_val == self.id.strip().lower():
                 matched = True
@@ -429,14 +1261,19 @@ class BaseElement:
         return False
 
     def process_packet(self, parsed_pkt: dict, engine: "DispatcherEngine"):
-        self.check_ctc_match(parsed_pkt)
+        ts = float(parsed_pkt.get("timestamp", time.time()))
         self.update_rssi_from_packet(parsed_pkt)
-        if self._matches_wiu(parsed_pkt.get("_node_id_")):
-            self._last_packet_ts = parsed_pkt.get("timestamp", time.time())
+        if parsed_pkt.get("protocol") != "atcs" and self._matches_wiu(parsed_pkt.get("_node_id_")):
+            self._last_ptc_ts = ts
+            self._last_ctc_ts = 0.0
+            self._last_packet_ts = ts
             self._packets_received += 1
             raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
             if raw_hex:
                 self._last_raw_hex = str(raw_hex)
+            return
+        if not self.is_ptc_active(engine, now_ts=ts):
+            self.check_ctc_match(parsed_pkt)
 
     @staticmethod
     def _wiu_matches(wiu_id: Any, node_id: Any) -> bool:
@@ -573,68 +1410,118 @@ class TrackSegment(BaseElement):
     _collision_warning: bool = field(default=False, repr=False)
     _collision_details: str = field(default="", repr=False)
     _is_dimmed: bool = field(default=False, repr=False)
+    _out_of_service: bool = field(default=False, repr=False)
 
     def process_packet(self, parsed_pkt: dict, engine: "DispatcherEngine"):
-        ctc_hit = self.check_ctc_match(parsed_pkt)
+        ts = float(parsed_pkt.get("timestamp", time.time()))
         self.update_rssi_from_packet(parsed_pkt)
-        if not self._matches_wiu(parsed_pkt.get("_node_id_")):
-            if parsed_pkt.get("protocol") == "atcs":
-                cid_match = self._ctc_id_matches_packet(parsed_pkt)
-                if cid_match is True or (cid_match is None and ctc_hit):
-                    ts = parsed_pkt.get("timestamp", time.time())
-                    self._last_packet_ts = ts
-                    self._packets_received += 1
-                    raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
-                    if raw_hex:
-                        self._last_raw_hex = str(raw_hex)
-                    if parsed_pkt.get("rssi") is not None:
-                        self.add_rssi_sample(parsed_pkt["rssi"])
-                    hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
-                    occ_val = None
-                    if self.ctc_rules:
-                        occ_val = bool(ctc_hit)
-                    elif "occupied" in hints:
-                        occ_val = bool(hints["occupied"])
-                    if occ_val is not None:
-                        prev_occ = self._hw_occupied
-                        self._hw_occupied = occ_val
-                        self._raw_occ_val = 1 if occ_val else 0
-                        if self._hw_occupied:
-                            self._inferred_occupied = False
-                            if not prev_occ:
-                                engine.record_train_sighting(self.id, ts)
-                        else:
-                            self._estimated_speed_mph = None
-                            self._train_direction = None
-                            self._train_name = None
-            return
-        self._last_packet_ts = parsed_pkt.get("timestamp", time.time())
-        self._packets_received += 1
-        raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
-        if raw_hex:
-            self._last_raw_hex = str(raw_hex)
-        if not self.has_occ_bit:
-            return
-        rb = self._extract_packet_rules_and_base(parsed_pkt)
-        if rb is None:
+
+        # 1. PTC (WIU ID) logic ALWAYS takes strict priority over CTC logic.
+        if parsed_pkt.get("protocol") != "atcs" and self._matches_wiu(parsed_pkt.get("_node_id_")):
+            self._last_ptc_ts = ts
+            self._last_ctc_ts = 0.0
+            self._out_of_service = False
+            self._last_packet_ts = ts
+            self._packets_received += 1
+            raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+            if raw_hex:
+                self._last_raw_hex = str(raw_hex)
+            if not self.has_occ_bit:
+                return
+            rb = self._extract_packet_rules_and_base(parsed_pkt)
+            if rb is None:
+                return
+
+            pkt_rules, base_bits = rb
+            bit_no = self.occ_bit_offset
+
+            if bit_no is not None and (base_bits - bit_no - 1) >= 0:
+                occup_val = (pkt_rules >> (base_bits - bit_no - 1)) % 2
+                self._raw_occ_val = occup_val
+                prev_occ = self._hw_occupied
+                self._hw_occupied = (occup_val == 1)
+                if self._hw_occupied:
+                    self._inferred_occupied = False
+                    if not prev_occ:
+                        engine.record_train_sighting(self.id, ts)
+                else:
+                    self._estimated_speed_mph = None
+                    self._train_direction = None
+                    self._train_name = None
             return
 
-        pkt_rules, base_bits = rb
-        bit_no = self.occ_bit_offset
+        # 2. Ignore all CTC logic while fresh PTC (WIU ID) data is active for this element.
+        if self.is_ptc_active(engine, now_ts=ts):
+            return
 
-        if bit_no is not None and (base_bits - bit_no - 1) >= 0:
-            occup_val = (pkt_rules >> (base_bits - bit_no - 1)) % 2
-            self._raw_occ_val = occup_val
-            prev_occ = self._hw_occupied
-            self._hw_occupied = (occup_val == 1)
-            if self._hw_occupied:
-                self._inferred_occupied = False
-                if not prev_occ:
-                    engine.record_train_sighting(self.id, parsed_pkt["timestamp"])
-            else:
-                self._estimated_speed_mph = None
-                self._train_direction = None
-                self._train_name = None
+        ctc_hit = self.check_ctc_match(parsed_pkt)
+        ctc_int, _ = self._extract_ctc_rules_int_and_width(parsed_pkt)
+        cid_match = self._ctc_id_matches_packet(parsed_pkt)
+
+        # Direct 128-bit _ctc_rules_ packet addressed to this element by _ctc_id_
+        if ctc_int is not None and cid_match is True:
+            primary_eval = self._evaluate_ctc_rule_for_packet(parsed_pkt)
+            oos_eval = self._evaluate_ctc_oos_for_packet(parsed_pkt)
+            # If this track has CTC rules and none apply to the packet's _kc_ (e.g. K/Z rules on a C packet),
+            # preserve existing track state untouched.
+            if self.ctc_rules and primary_eval is None and oos_eval is None:
+                return
+            self._last_packet_ts = ts
+            self._packets_received += 1
+            raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+            if raw_hex:
+                self._last_raw_hex = str(raw_hex)
+            if parsed_pkt.get("rssi") is not None:
+                self.add_rssi_sample(parsed_pkt["rssi"])
+            if primary_eval is not None:
+                occ_val = bool(primary_eval)
+                prev_occ = self._hw_occupied
+                self._hw_occupied = occ_val
+                self._raw_occ_val = 1 if occ_val else 0
+                if self._hw_occupied:
+                    self._inferred_occupied = False
+                    if not prev_occ:
+                        engine.record_train_sighting(self.id, ts)
+                else:
+                    self._estimated_speed_mph = None
+                    self._train_direction = None
+                    self._train_name = None
+            if oos_eval is not None:
+                self._out_of_service = bool(oos_eval)
+            return
+
+        if parsed_pkt.get("protocol") == "atcs":
+            if cid_match is True or (cid_match is None and ctc_hit):
+                self._last_packet_ts = ts
+                self._packets_received += 1
+                raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+                if raw_hex:
+                    self._last_raw_hex = str(raw_hex)
+                if parsed_pkt.get("rssi") is not None:
+                    self.add_rssi_sample(parsed_pkt["rssi"])
+                hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
+                primary_rule, oos_rule = split_ctc_rules_and_oos(self.ctc_rules)
+                occ_val = None
+                if primary_rule:
+                    occ_val = bool(ctc_hit)
+                elif "occupied" in hints:
+                    occ_val = bool(hints["occupied"])
+                if occ_val is not None:
+                    prev_occ = self._hw_occupied
+                    self._hw_occupied = occ_val
+                    self._raw_occ_val = 1 if occ_val else 0
+                    if self._hw_occupied:
+                        self._inferred_occupied = False
+                        if not prev_occ:
+                            engine.record_train_sighting(self.id, ts)
+                    else:
+                        self._estimated_speed_mph = None
+                        self._train_direction = None
+                        self._train_name = None
+                if oos_rule:
+                    oos_hit = self._evaluate_ctc_oos_for_packet(parsed_pkt)
+                    if oos_hit is not None:
+                        self._out_of_service = bool(oos_hit)
 
     def next_in_direction(self, travel_dir: str, prev_id: Optional[str] = None) -> Tuple[Optional[str], str]:
         if travel_dir in self.neighbors and self.neighbors[travel_dir]:
@@ -670,10 +1557,14 @@ class TrackSegment(BaseElement):
         color = "WHITE"
         if self._collision_warning or self.is_occupied:
             color = "RED"
-        elif self._green_path:
+        elif self._green_path and not self._out_of_service:
             color = "GREEN"
         if self._collision_warning:
             last_st = f"COLLISION ALERT ({self._collision_details})"
+        elif self._out_of_service and self.is_occupied:
+            last_st = f"OUT OF SERVICE (OCCUPIED){f' - {self._train_name}' if self._train_name else ''}"
+        elif self._out_of_service:
+            last_st = "OUT OF SERVICE (EMPTY)"
         elif self._hw_occupied:
             last_st = f"OCCUPIED (HW){f' - {self._train_name}' if self._train_name else ''}"
         elif self._inferred_occupied:
@@ -684,7 +1575,8 @@ class TrackSegment(BaseElement):
             last_st = "UNOCCUPIED (CLEAR)"
         d.update({
             "hw_occupied": self._hw_occupied, "inferred_occupied": self._inferred_occupied,
-            "occupied": self.is_occupied, "green_path": self._green_path, "green_path_dir": self._green_path_dir, "display_color": color,
+            "occupied": self.is_occupied, "out_of_service": self._out_of_service,
+            "green_path": self._green_path, "green_path_dir": self._green_path_dir, "display_color": color,
             "train_name": self._train_name, "train_direction": self._train_direction,
             "estimated_speed_mph": self._estimated_speed_mph, "collision_warning": self._collision_warning,
             "collision_details": self._collision_details, "last_status": last_st,
@@ -723,84 +1615,118 @@ class Turnout(BaseElement):
     _collision_warning: bool = field(default=False, repr=False)
     _collision_details: str = field(default="", repr=False)
     _is_dimmed: bool = field(default=False, repr=False)
+    _out_of_service: bool = field(default=False, repr=False)
 
     def process_packet(self, parsed_pkt: dict, engine: "DispatcherEngine"):
-        ctc_hit = self.check_ctc_match(parsed_pkt)
+        ts = float(parsed_pkt.get("timestamp", time.time()))
         self.update_rssi_from_packet(parsed_pkt)
-        if not self._matches_wiu(parsed_pkt.get("_node_id_")):
-            if parsed_pkt.get("protocol") == "atcs":
-                cid_match = self._ctc_id_matches_packet(parsed_pkt)
-                if cid_match is True or (cid_match is None and ctc_hit):
-                    ts = parsed_pkt.get("timestamp", time.time())
-                    self._last_packet_ts = ts
-                    self._packets_received += 1
-                    raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
-                    if raw_hex:
-                        self._last_raw_hex = str(raw_hex)
-                    if parsed_pkt.get("rssi") is not None:
-                        self.add_rssi_sample(parsed_pkt["rssi"])
-                    hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
-                    toks = self._extract_ctc_tokens(parsed_pkt)
-                    sw_hint = str(hints.get("switch") or "").lower()
-                    if sw_hint == "reverse" or (not sw_hint and any(t in toks for t in ("k12", "k14", "c12", "c14"))):
-                        self._state = 1
-                        self._out_of_corr = False
-                    elif sw_hint == "normal" or (not sw_hint and any(t in toks for t in ("k11", "k13", "c11", "c13"))):
-                        self._state = 0
-                        self._out_of_corr = False
-                    if "occupied" in hints:
-                        prev_occ = self._hw_occupied
-                        self._hw_occupied = bool(hints["occupied"])
-                        self._raw_occ_val = 1 if self._hw_occupied else 0
-                        if self._hw_occupied:
-                            self._inferred_occupied = False
-                            if not prev_occ:
-                                engine.record_train_sighting(self.id, ts)
-                        else:
-                            self._estimated_speed_mph = None
-                            self._train_direction = None
-                            self._train_name = None
-            return
-        ts = parsed_pkt.get("timestamp", time.time())
-        self._last_packet_ts = ts
-        self._packets_received += 1
-        raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
-        if raw_hex:
-            self._last_raw_hex = str(raw_hex)
-        for adj_id in (self.common_neighbor, self.normal_neighbor, self.reverse_neighbor):
-            if adj_id and hasattr(engine, "elements"):
-                adj_el = engine.elements.get(adj_id)
-                if adj_el and getattr(adj_el, "wiu_id", None) is None:
-                    adj_el._last_packet_ts = ts
-        rb = self._extract_packet_rules_and_base(parsed_pkt)
-        if rb is None:
+
+        # 1. PTC (WIU ID) logic ALWAYS takes strict priority over CTC logic.
+        if parsed_pkt.get("protocol") != "atcs" and self._matches_wiu(parsed_pkt.get("_node_id_")):
+            self._last_ptc_ts = ts
+            self._last_ctc_ts = 0.0
+            self._out_of_service = False
+            self._last_packet_ts = ts
+            self._packets_received += 1
+            raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+            if raw_hex:
+                self._last_raw_hex = str(raw_hex)
+            for adj_id in (self.common_neighbor, self.normal_neighbor, self.reverse_neighbor):
+                if adj_id and hasattr(engine, "elements"):
+                    adj_el = engine.elements.get(adj_id)
+                    if adj_el and getattr(adj_el, "wiu_id", None) is None:
+                        adj_el._last_packet_ts = ts
+            rb = self._extract_packet_rules_and_base(parsed_pkt)
+            if rb is None:
+                return
+
+            pkt_rules, base_bits = rb
+
+            if self.cmd_bit_offset is not None and (base_bits - self.cmd_bit_offset - 2) >= 0:
+                turnout_val = (pkt_rules >> (base_bits - self.cmd_bit_offset - 2)) % 4
+                self._raw_switch_val = turnout_val
+                mapped = TURNOUT_VALUE_MAP.get(turnout_val)
+                if mapped is not None:
+                    self._state = mapped
+                    self._out_of_corr = False
+                else:
+                    self._out_of_corr = True
+
+            if self.has_occ_bit and self.occ_bit_offset is not None and (base_bits - self.occ_bit_offset - 1) >= 0:
+                occup_val = (pkt_rules >> (base_bits - self.occ_bit_offset - 1)) % 2
+                self._raw_occ_val = occup_val
+                prev_occ = self._hw_occupied
+                self._hw_occupied = (occup_val == 1)
+                if self._hw_occupied:
+                    self._inferred_occupied = False
+                    if not prev_occ:
+                        engine.record_train_sighting(self.id, ts)
+                else:
+                    self._estimated_speed_mph = None
+                    self._train_direction = None
+                    self._train_name = None
             return
 
-        pkt_rules, base_bits = rb
+        # 2. Ignore all CTC logic while fresh PTC (WIU ID) data is active for this turnout.
+        if self.is_ptc_active(engine, now_ts=ts):
+            return
 
-        if self.cmd_bit_offset is not None and (base_bits - self.cmd_bit_offset - 2) >= 0:
-            turnout_val = (pkt_rules >> (base_bits - self.cmd_bit_offset - 2)) % 4
-            self._raw_switch_val = turnout_val
-            mapped = TURNOUT_VALUE_MAP.get(turnout_val)
-            if mapped is not None:
-                self._state = mapped
+        ctc_hit = self.check_ctc_match(parsed_pkt)
+        ctc_int, _ = self._extract_ctc_rules_int_and_width(parsed_pkt)
+        cid_match = self._ctc_id_matches_packet(parsed_pkt)
+
+        # Direct 128-bit _ctc_rules_ packet addressed to this turnout by _ctc_id_:
+        # Rule evaluates True -> Reversed (_state=1), False -> Normal (_state=0).
+        # E.g. 'K11' -> reversed if bit=1 on K packet; '!K11' -> normal if bit=1 on K packet; '11' -> matches K & C.
+        if ctc_int is not None and cid_match is True:
+            primary_eval = self._evaluate_ctc_rule_for_packet(parsed_pkt)
+            if self.ctc_rules and primary_eval is None:
+                return
+            self._last_packet_ts = ts
+            self._packets_received += 1
+            raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+            if raw_hex:
+                self._last_raw_hex = str(raw_hex)
+            if parsed_pkt.get("rssi") is not None:
+                self.add_rssi_sample(parsed_pkt["rssi"])
+            if primary_eval is not None:
+                self._state = 1 if primary_eval else 0
                 self._out_of_corr = False
-            else:
-                self._out_of_corr = True
+            return
 
-        if self.has_occ_bit and self.occ_bit_offset is not None and (base_bits - self.occ_bit_offset - 1) >= 0:
-            occup_val = (pkt_rules >> (base_bits - self.occ_bit_offset - 1)) % 2
-            self._raw_occ_val = occup_val
-            prev_occ = self._hw_occupied
-            self._hw_occupied = (occup_val == 1)
-            if self._hw_occupied:
-                self._inferred_occupied = False
-                if not prev_occ:
-                    engine.record_train_sighting(self.id, parsed_pkt["timestamp"])
-            else:
-                self._estimated_speed_mph = None
-                self._train_direction = None
-                self._train_name = None
+        if parsed_pkt.get("protocol") == "atcs":
+            if cid_match is True or (cid_match is None and ctc_hit):
+                self._last_packet_ts = ts
+                self._packets_received += 1
+                raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+                if raw_hex:
+                    self._last_raw_hex = str(raw_hex)
+                if parsed_pkt.get("rssi") is not None:
+                    self.add_rssi_sample(parsed_pkt["rssi"])
+                hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
+                toks = self._extract_ctc_tokens(parsed_pkt)
+                sw_hint = str(hints.get("switch") or "").lower()
+                if self.ctc_rules:
+                    self._state = 1 if ctc_hit else 0
+                    self._out_of_corr = False
+                elif sw_hint == "reverse" or (not sw_hint and any(t in toks for t in ("k12", "k14", "c12", "c14"))):
+                    self._state = 1
+                    self._out_of_corr = False
+                elif sw_hint == "normal" or (not sw_hint and any(t in toks for t in ("k11", "k13", "c11", "c13"))):
+                    self._state = 0
+                    self._out_of_corr = False
+                if "occupied" in hints:
+                    prev_occ = self._hw_occupied
+                    self._hw_occupied = bool(hints["occupied"])
+                    self._raw_occ_val = 1 if self._hw_occupied else 0
+                    if self._hw_occupied:
+                        self._inferred_occupied = False
+                        if not prev_occ:
+                            engine.record_train_sighting(self.id, ts)
+                    else:
+                        self._estimated_speed_mph = None
+                        self._train_direction = None
+                        self._train_name = None
 
     @property
     def is_occupied(self) -> bool:
@@ -861,77 +1787,113 @@ class Signal(BaseElement):
     _hw_occupied: bool = field(default=False, repr=False)
 
     def process_packet(self, parsed_pkt: dict, engine: "DispatcherEngine"):
-        ctc_hit = self.check_ctc_match(parsed_pkt)
+        ts = float(parsed_pkt.get("timestamp", time.time()))
         self.update_rssi_from_packet(parsed_pkt)
-        if not self._matches_wiu(parsed_pkt.get("_node_id_")):
-            if parsed_pkt.get("protocol") == "atcs":
-                cid_match = self._ctc_id_matches_packet(parsed_pkt)
-                if cid_match is True or (cid_match is None and ctc_hit):
-                    ts = parsed_pkt.get("timestamp", time.time())
-                    self._last_packet_ts = ts
-                    self._packets_received += 1
-                    raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
-                    if raw_hex:
-                        self._last_raw_hex = str(raw_hex)
-                    if parsed_pkt.get("rssi") is not None:
-                        self.add_rssi_sample(parsed_pkt["rssi"])
-                    hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
-                    new_lamp = None
-                    if self.ctc_rules:
-                        new_lamp = "green" if ctc_hit else "red"
-                    elif hints.get("signal"):
-                        new_lamp = str(hints["signal"]).lower()
-                    if new_lamp:
-                        was_perm = self.is_permissive
-                        self._prev_lamp_aspect = self._lamp_aspect
-                        self._raw_aspect_str = new_lamp
-                        self._lamp_aspect = new_lamp
-                        self._last_reported_color = self.base_color
-                        if was_perm and self.is_restricted:
-                            self._dropped_to_red_ts = ts
-                            engine.notify_signal_dropped(self, ts)
+
+        # 1. PTC (WIU ID) logic ALWAYS takes strict priority over CTC logic.
+        if parsed_pkt.get("protocol") != "atcs" and self._matches_wiu(parsed_pkt.get("_node_id_")):
+            self._last_ptc_ts = ts
+            self._last_ctc_ts = 0.0
+            self._last_packet_ts = ts
+            self._packets_received += 1
+            raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+            if raw_hex:
+                self._last_raw_hex = str(raw_hex)
+            for adj_id in (self.protects_element, self.rear_element):
+                if adj_id and hasattr(engine, "elements"):
+                    adj_el = engine.elements.get(adj_id)
+                    if adj_el and getattr(adj_el, "wiu_id", None) is None:
+                        adj_el._last_packet_ts = ts
+            rb = self._extract_packet_rules_and_base(parsed_pkt)
+            if rb is None:
+                return
+
+            pkt_rules, base_bits = rb
+            bit_no = self.sig_bit_offset
+
+            if (base_bits - bit_no - 5) >= 0:
+                signal_val = (pkt_rules >> (base_bits - bit_no - 5)) % 32
+                rule_str = self.signal_rules or self.signal_override or ""
+                aspect_str = engine.lookup_signal_aspect(self.wiu_id, signal_val, signal_rules=rule_str)
+                resolved_lamp = resolve_signal_lamp_aspect(aspect_str, self.position)
+
+                if resolved_lamp is not None:
+                    was_permissive = self.is_permissive
+                    self._prev_lamp_aspect = self._lamp_aspect
+                    self._signal_val = signal_val
+                    self._raw_aspect_str = aspect_str
+                    self._lamp_aspect = resolved_lamp.lower()
+                    c = self.base_color
+                    if c not in ("GRAY", "DARK", "BLACK"):
+                        self._last_reported_color = c
+
+                    if was_permissive and self.is_restricted:
+                        self._dropped_to_red_ts = ts
+                        engine.notify_signal_dropped(self, ts)
+
+            if self.has_occ_bit and self.occ_bit_offset is not None and (base_bits - self.occ_bit_offset - 1) >= 0:
+                occup_val = (pkt_rules >> (base_bits - self.occ_bit_offset - 1)) % 2
+                self._hw_occupied = (occup_val == 1)
             return
-        ts = parsed_pkt.get("timestamp", time.time())
-        self._last_packet_ts = ts
-        self._packets_received += 1
-        raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
-        if raw_hex:
-            self._last_raw_hex = str(raw_hex)
-        for adj_id in (self.protects_element, self.rear_element):
-            if adj_id and hasattr(engine, "elements"):
-                adj_el = engine.elements.get(adj_id)
-                if adj_el and getattr(adj_el, "wiu_id", None) is None:
-                    adj_el._last_packet_ts = ts
-        rb = self._extract_packet_rules_and_base(parsed_pkt)
-        if rb is None:
+
+        # 2. Ignore all CTC logic while fresh PTC (WIU ID) data is active for this signal.
+        if self.is_ptc_active(engine, now_ts=ts):
             return
 
-        pkt_rules, base_bits = rb
-        bit_no = self.sig_bit_offset
+        ctc_hit = self.check_ctc_match(parsed_pkt)
+        ctc_int, _ = self._extract_ctc_rules_int_and_width(parsed_pkt)
+        cid_match = self._ctc_id_matches_packet(parsed_pkt)
 
-        if (base_bits - bit_no - 5) >= 0:
-            signal_val = (pkt_rules >> (base_bits - bit_no - 5)) % 32
-            rule_str = self.signal_rules or self.signal_override or ""
-            aspect_str = engine.lookup_signal_aspect(self.wiu_id, signal_val, signal_rules=rule_str)
-            resolved_lamp = resolve_signal_lamp_aspect(aspect_str, self.position)
-
-            if resolved_lamp is not None:
-                was_permissive = self.is_permissive
+        # Direct 128-bit _ctc_rules_ packet addressed to this signal by _ctc_id_:
+        # Rule evaluates True -> Green, False -> Red.
+        # E.g. 'K32' -> Green if bit=1 on K packet; '!K32' -> Red if bit=1 on K packet; '32' -> matches K & C.
+        if ctc_int is not None and cid_match is True:
+            primary_eval = self._evaluate_ctc_rule_for_packet(parsed_pkt)
+            if self.ctc_rules and primary_eval is None:
+                return
+            self._last_packet_ts = ts
+            self._packets_received += 1
+            raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+            if raw_hex:
+                self._last_raw_hex = str(raw_hex)
+            if parsed_pkt.get("rssi") is not None:
+                self.add_rssi_sample(parsed_pkt["rssi"])
+            if primary_eval is not None:
+                new_lamp = "green" if primary_eval else "red"
+                was_perm = self.is_permissive
                 self._prev_lamp_aspect = self._lamp_aspect
-                self._signal_val = signal_val
-                self._raw_aspect_str = aspect_str
-                self._lamp_aspect = resolved_lamp.lower()
-                c = self.base_color
-                if c not in ("GRAY", "DARK", "BLACK"):
-                    self._last_reported_color = c
+                self._raw_aspect_str = new_lamp
+                self._lamp_aspect = new_lamp
+                self._last_reported_color = self.base_color
+                if was_perm and self.is_restricted:
+                    self._dropped_to_red_ts = ts
+                    engine.notify_signal_dropped(self, ts)
+            return
 
-                if was_permissive and self.is_restricted:
-                    self._dropped_to_red_ts = parsed_pkt["timestamp"]
-                    engine.notify_signal_dropped(self, parsed_pkt["timestamp"])
-
-        if self.has_occ_bit and self.occ_bit_offset is not None and (base_bits - self.occ_bit_offset - 1) >= 0:
-            occup_val = (pkt_rules >> (base_bits - self.occ_bit_offset - 1)) % 2
-            self._hw_occupied = (occup_val == 1)
+        if parsed_pkt.get("protocol") == "atcs":
+            if cid_match is True or (cid_match is None and ctc_hit):
+                self._last_packet_ts = ts
+                self._packets_received += 1
+                raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
+                if raw_hex:
+                    self._last_raw_hex = str(raw_hex)
+                if parsed_pkt.get("rssi") is not None:
+                    self.add_rssi_sample(parsed_pkt["rssi"])
+                hints = parsed_pkt.get("atcs_state_hints") if isinstance(parsed_pkt.get("atcs_state_hints"), dict) else {}
+                new_lamp = None
+                if self.ctc_rules:
+                    new_lamp = "green" if ctc_hit else "red"
+                elif hints.get("signal"):
+                    new_lamp = str(hints["signal"]).lower()
+                if new_lamp:
+                    was_perm = self.is_permissive
+                    self._prev_lamp_aspect = self._lamp_aspect
+                    self._raw_aspect_str = new_lamp
+                    self._lamp_aspect = new_lamp
+                    self._last_reported_color = self.base_color
+                    if was_perm and self.is_restricted:
+                        self._dropped_to_red_ts = ts
+                        engine.notify_signal_dropped(self, ts)
 
     @property
     def is_dark(self) -> bool: return self._lamp_aspect in ("black", "gray", "dark")
@@ -1341,15 +2303,86 @@ class AddressTable:
     def total_packets(self) -> int:
         return sum(r.get("packet_count", 0) for r in self.wius.values())
 
+    def _record_ctc_entry(
+        self,
+        ctc_id_str: str,
+        parsed_pkt: dict,
+        ch: Any,
+        rssi_val: float,
+        seq: Any,
+        now_t: float,
+    ):
+        """Records or updates a received CTC address entry in the WIU/Address table."""
+        if not ctc_id_str:
+            return
+        if ctc_id_str not in self.wius:
+            samples = deque(maxlen=20)
+            samples.append(rssi_val)
+            avg = round(sum(samples) / len(samples), 1)
+            self.wius[ctc_id_str] = {
+                "wiu_id": ctc_id_str,
+                "ctc_id": ctc_id_str,
+                "is_ctc": True,
+                "rr_code": "CTC",
+                "rr_name": "CTC",
+                "channels": {ch},
+                "high_watermark_rssi": rssi_val,
+                "last_rssi": rssi_val,
+                "rssi_samples": samples,
+                "avg_rssi": avg,
+                "rssi_avg": avg,
+                "last_sequence": seq if seq is not None else 0,
+                "packet_count": 1,
+                "last_seen": parsed_pkt.get("timestamp", now_t),
+                "last_seq_time": now_t,
+            }
+        else:
+            rec = self.wius[ctc_id_str]
+            rec["is_ctc"] = True
+            rec["ctc_id"] = ctc_id_str
+            rec["rr_code"] = "CTC"
+            rec["rr_name"] = "CTC"
+            rec["channels"].add(ch)
+            rec["last_rssi"] = rssi_val
+            if rssi_val > rec.get("high_watermark_rssi", -99.0):
+                rec["high_watermark_rssi"] = rssi_val
+            if "rssi_samples" not in rec or not isinstance(rec["rssi_samples"], deque):
+                rec["rssi_samples"] = deque(maxlen=20)
+            rec["rssi_samples"].append(rssi_val)
+            rec["avg_rssi"] = round(sum(rec["rssi_samples"]) / len(rec["rssi_samples"]), 1)
+            rec["rssi_avg"] = rec["avg_rssi"]
+            if seq is not None:
+                rec["last_sequence"] = seq
+                rec["last_seq_time"] = now_t
+            rec["packet_count"] += 1
+            rec["last_seen"] = parsed_pkt.get("timestamp", now_t)
+
     def check_and_update_sequence(self, parsed_pkt: dict, rrdata: Optional[Dict[str, str]] = None) -> bool:
         wiu_id = parsed_pkt.get("_node_id_")
-        if wiu_id is None: return False
+        pkt_ctc_id = str(parsed_pkt.get("_ctc_id_") or parsed_pkt.get("ctc_id") or "").strip()
+        ch_meta = parsed_pkt.get("channel_meta")
+        ch = ch_meta if (ch_meta is not None and ch_meta != 0) else parsed_pkt.get("Channel", ch_meta or 0)
+        rssi = parsed_pkt.get("rssi", -99.0)
+        try:
+            rssi_val = float(rssi)
+        except (ValueError, TypeError):
+            rssi_val = -99.0
+        now_t = float(parsed_pkt.get("timestamp") or time.time())
+        seq = parsed_pkt.get("_sequence_")
+        ctc_seq = seq if seq is not None else parsed_pkt.get("_seq_")
+
+        if wiu_id is None:
+            # Record received CTC addresses directly into the WIU/Address table and allow packet through.
+            if pkt_ctc_id:
+                self._record_ctc_entry(pkt_ctc_id, parsed_pkt, ch, rssi_val, ctc_seq, now_t)
+                return True
+            if parsed_pkt.get("_ctc_rules_") is not None:
+                return True
+            return False
         try:
             wiu_id = int(wiu_id)
         except (ValueError, TypeError):
             pass
-        seq = parsed_pkt.get("_sequence_")
-        now_t = float(parsed_pkt.get("timestamp") or time.time())
         ttl = getattr(self, "dedup_ttl", 0.4)
         if wiu_id in self.wius and seq is not None:
             last_seq = self.wius[wiu_id].get("last_sequence")
@@ -1360,14 +2393,6 @@ class AddressTable:
                     if (now_t - last_t) < ttl:
                         if seq_int == last_int: return False
                         if (seq_int - last_int) % 256 >= 128: return False
-
-        ch_meta = parsed_pkt.get("channel_meta")
-        ch = ch_meta if (ch_meta is not None and ch_meta != 0) else parsed_pkt.get("Channel", ch_meta or 0)
-        rssi = parsed_pkt.get("rssi", -99.0)
-        try:
-            rssi_val = float(rssi)
-        except (ValueError, TypeError):
-            rssi_val = -99.0
 
         if isinstance(wiu_id, int) and wiu_id > 10000000:
             rr_code = str(wiu_id)[1:4] if len(str(wiu_id)) >= 4 else "DEF"
@@ -1428,6 +2453,8 @@ class AddressTable:
                 rec["last_seq_time"] = now_t
             rec["packet_count"] += 1
             rec["last_seen"] = parsed_pkt.get("timestamp", now_t)
+        if pkt_ctc_id and pkt_ctc_id != str(wiu_id):
+            self._record_ctc_entry(pkt_ctc_id, parsed_pkt, ch, rssi_val, ctc_seq, now_t)
         return True
 
     def to_state_dict(
@@ -1436,22 +2463,32 @@ class AddressTable:
         rrdata: Optional[Dict[str, str]] = None,
         layout_wiu_names: Optional[Dict[int, str]] = None,
         element_avg_rssi: Optional[dict] = None,
+        layout_ctc_specs: Optional[List[str]] = None,
     ) -> dict:
         serialized = {}
+        ctc_specs = [str(s).strip() for s in (layout_ctc_specs or []) if s and str(s).strip()]
         for wid, rec in sorted(
             self.wius.items(),
             key=lambda item: (0, int(item[0])) if str(item[0]).lstrip("-").isdigit() else (1, str(item[0])),
             reverse=True,
         ):
-            try:
-                wid_int = int(wid)
-            except (ValueError, TypeError):
+            is_ctc = bool(rec.get("is_ctc"))
+            if is_ctc:
                 wid_int = -1
-            raw_name = (layout_wiu_names or {}).get(wid_int, "") or rec.get("wiu_name", "")
-            disp_name = format_wiu_display_name(raw_name, wid)
+                raw_name = str(wid)
+                disp_name = str(wid)
+                on_layout = any(ctc_id_matches(spec, str(wid)) for spec in ctc_specs)
+            else:
+                try:
+                    wid_int = int(wid)
+                except (ValueError, TypeError):
+                    wid_int = -1
+                raw_name = (layout_wiu_names or {}).get(wid_int, "") or rec.get("wiu_name", "")
+                disp_name = format_wiu_display_name(raw_name, wid)
+                on_layout = wid_int in (layout_wiu_ids or set())
             rec_dict = {k: v for k, v in rec.items() if k != "rssi_samples"}
             avg_rssi = rec.get("avg_rssi")
-            if element_avg_rssi and (wid_int in element_avg_rssi or str(wid) in element_avg_rssi):
+            if not is_ctc and element_avg_rssi and (wid_int in element_avg_rssi or str(wid) in element_avg_rssi):
                 el_avg = element_avg_rssi.get(wid_int, element_avg_rssi.get(str(wid)))
                 if el_avg is not None:
                     avg_rssi = el_avg
@@ -1464,10 +2501,11 @@ class AddressTable:
             rec_dict["last_rssi"] = rec.get("last_rssi")
             serialized[str(wid)] = {
                 **rec_dict,
+                "is_ctc": is_ctc,
                 "wiu_name": raw_name,
                 "wiu_display_name": disp_name,
-                "rr_name": (rrdata or {}).get(rec.get("rr_code", "DEF"), rec.get("rr_name", rec.get("rr_code", "DEF"))),
-                "on_layout": wid_int in (layout_wiu_ids or set()),
+                "rr_name": "CTC" if is_ctc else (rrdata or {}).get(rec.get("rr_code", "DEF"), rec.get("rr_name", rec.get("rr_code", "DEF"))),
+                "on_layout": on_layout,
                 "channels": sorted(list(rec["channels"])),
             }
         tot_pkts = sum(r.get("packet_count", 0) for r in self.wius.values())
@@ -1636,6 +2674,7 @@ class DispatcherEngine:
                 self.config["connections"] = eng_sub["connections"]
         self.quiet: bool = bool(self.config.get("quiet", False))
         self.log_fn = self.config.get("log_fn", None)
+        self.banc_layout_name: Optional[str] = None
         self.load_packet_cache_enabled: bool = bool(self.config.get("load_packet_cache", True))
         self.save_packet_cache_enabled: bool = bool(self.config.get("save_packet_cache", True))
         self.config_dir = self.config.get("config_dir", os.getcwd())
@@ -1686,6 +2725,7 @@ class DispatcherEngine:
         self.thanks_text: str = ""
         self._orig_element_bindings: Dict[str, dict] = {}
         self.last_packets_by_wiu: Dict[int, dict] = {}
+        self.last_packets_by_ctc: Dict[str, dict] = {}
         self.elements: Dict[str, BaseElement] = {}
         self._sorted_element_ids: List[str] = []
 
@@ -1782,6 +2822,7 @@ class DispatcherEngine:
 
         self.quiet: bool = bool(self.config.get("quiet", False))
         self.log_fn = self.config.get("log_fn", None)
+        self.banc_layout_name: Optional[str] = None
 
         # WIU Metadata Tracking (for ApexBOSBanc sync)
         self._wiu_sync_lock = threading.Lock()
@@ -2325,7 +3366,7 @@ class DispatcherEngine:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
-    def load_layout_data(self, data: dict, layout_filename: str = "banc_layout.json", config_dir: Optional[str] = None, filepath: Optional[str] = None):
+    def load_layout_data(self, data: dict, layout_filename: str = "banc_layout.json", config_dir: Optional[str] = None, filepath: Optional[str] = None, banc_layout_name: Optional[str] = None):
         """Loads a layout directly from an in-memory dictionary (e.g. from Banc Cloud) or pre-parsed layout."""
         # Save cache for the current layout before switching to a new layout
         if self.save_packet_cache_enabled and hasattr(self, "packet_cache") and self.packet_cache and (filepath is None or self.layout_filepath != filepath):
@@ -2339,9 +3380,15 @@ class DispatcherEngine:
             except Exception:
                 pass
 
+        self.banc_layout_name = banc_layout_name
         self.layout_filepath = filepath or os.path.join(os.getcwd(), layout_filename)
         self.layout_filename = os.path.basename(self.layout_filepath) if self.layout_filepath else layout_filename
-        self.config_dir = config_dir or (os.path.dirname(os.path.abspath(self.layout_filepath)) if self.layout_filepath else os.getcwd())
+        if config_dir:
+            self.config_dir = config_dir
+        elif filepath:
+            self.config_dir = os.path.dirname(os.path.abspath(filepath))
+        elif not getattr(self, "config_dir", None):
+            self.config_dir = os.getcwd()
         self._load_auxiliary_files()
         self.raw_layout_data = data
         self.source_info = copy.deepcopy(data.get("source")) if isinstance(data, dict) and "source" in data else None
@@ -2514,7 +3561,7 @@ class DispatcherEngine:
         if not clean_name.lower().endswith(".json"):
             clean_name += ".json"
         target_fname = f"banc_{clean_name}"
-        self.load_layout_data(data, layout_filename=target_fname)
+        self.load_layout_data(data, layout_filename=target_fname, banc_layout_name=layout_name)
         state = self.get_render_state()
         self.broadcast_state(state)
         return {
@@ -2578,6 +3625,8 @@ class DispatcherEngine:
         if getattr(self, "config_dir", None):
             candidates.append(os.path.join(self.config_dir, "layouts", name_with_ext))
             candidates.append(os.path.join(self.config_dir, "layouts", clean_name))
+            candidates.append(os.path.join(self.config_dir, name_with_ext))
+            candidates.append(os.path.join(self.config_dir, clean_name))
         script_dir = os.path.dirname(os.path.abspath(__file__))
         candidates.append(os.path.join(script_dir, "layouts", name_with_ext))
         candidates.append(os.path.join(script_dir, "layouts", clean_name))
@@ -3532,7 +4581,7 @@ class DispatcherEngine:
         for eid in sorted_ids:
             el = self.elements[eid]
             if isinstance(el, TrackSegment):
-                parts.append(f"{eid}:{el._hw_occupied}:{el._inferred_occupied}:{el._green_path}:{el._green_path_dir}:{el._train_name}:{el._train_direction}:{el._estimated_speed_mph}:{el._collision_warning}:{el._packets_received}:{round(el._last_packet_ts, 3)}")
+                parts.append(f"{eid}:{el._hw_occupied}:{el._inferred_occupied}:{el._out_of_service}:{el._green_path}:{el._green_path_dir}:{el._train_name}:{el._train_direction}:{el._estimated_speed_mph}:{el._collision_warning}:{el._packets_received}:{round(el._last_packet_ts, 3)}")
             elif isinstance(el, Turnout):
                 parts.append(f"{eid}:{el._state}:{el._hw_occupied}:{el._inferred_occupied}:{el._green_path}:{el._green_path_dir}:{el._collision_warning}:{el._packets_received}:{round(el._last_packet_ts, 3)}")
             elif isinstance(el, Signal):
@@ -3766,14 +4815,14 @@ class DispatcherEngine:
                     meta = dict(meta or {})
                     meta["channel"] = parsed_data["channel"]
         if not parsed_data:
+            # Strictly respect configured parser order (specific rules first, generic catch-all last)
+            # and stop immediately on the first valid match without reordering self.parsers.
             for cand in candidates:
-                for idx, parser_obj in enumerate(self.parsers):
+                for parser_obj in self.parsers:
                     try:
                         res = parser_obj.parse(cand)
                         if isinstance(res, dict) and res.get("is_valid"):
                             parsed_data = dict(res.get("data", res))
-                            if idx > 0:
-                                self.parsers.insert(0, self.parsers.pop(idx))
                             break
                     except Exception:
                         pass
@@ -3832,6 +4881,9 @@ class DispatcherEngine:
             return None
 
         wiu_node_id = parsed_data.get("_node_id_")
+        raw_ctc_id = parsed_data.get("_ctc_id_") or parsed_data.get("ctc_id")
+        if raw_ctc_id is not None and str(raw_ctc_id).strip():
+            self.last_packets_by_ctc[str(raw_ctc_id).strip().lower()] = parsed_data
         if wiu_node_id is not None:
             try:
                 self.last_packets_by_wiu[int(wiu_node_id)] = parsed_data
@@ -3897,6 +4949,8 @@ class DispatcherEngine:
                 "occ_bit_offset": getattr(el, "occ_bit_offset", None),
                 "cmd_bit_offset": getattr(el, "cmd_bit_offset", None),
                 "sig_bit_offset": getattr(el, "sig_bit_offset", None),
+                "ctc_id": getattr(el, "ctc_id", ""),
+                "ctc_rules": getattr(el, "ctc_rules", ""),
             }
         if "wiu_id" in ovr:
             el.wiu_id = int(ovr["wiu_id"]) if ovr["wiu_id"] not in (None, "") else None
@@ -3911,8 +4965,18 @@ class DispatcherEngine:
         if "sig_bit_offset" in ovr and hasattr(el, "sig_bit_offset"):
             v = ovr["sig_bit_offset"]
             el.sig_bit_offset = int(v) if v not in (None, "") else None
+        if "ctc_id" in ovr and hasattr(el, "ctc_id"):
+            v = ovr["ctc_id"]
+            el.ctc_id = "" if v in (None, "") else str(v).strip()
+        if "ctc_rules" in ovr and hasattr(el, "ctc_rules"):
+            v = ovr["ctc_rules"]
+            el.ctc_rules = "" if v in (None, "") else str(v).strip()
         if el.wiu_id is not None and int(el.wiu_id) in self.last_packets_by_wiu:
             el.process_packet(self.last_packets_by_wiu[int(el.wiu_id)], self)
+        if getattr(el, "ctc_id", "") and getattr(self, "last_packets_by_ctc", None):
+            for c_pkt in list(self.last_packets_by_ctc.values()):
+                if el._ctc_id_matches_packet(c_pkt) is True:
+                    el.process_packet(c_pkt, self)
         self._evaluate_system_logic(time.time())
         self.broadcast_state(self.get_render_state())
 
@@ -3926,6 +4990,10 @@ class DispatcherEngine:
                 setattr(el, k, v)
         if el.wiu_id is not None and int(el.wiu_id) in self.last_packets_by_wiu:
             el.process_packet(self.last_packets_by_wiu[int(el.wiu_id)], self)
+        if getattr(el, "ctc_id", "") and getattr(self, "last_packets_by_ctc", None):
+            for c_pkt in list(self.last_packets_by_ctc.values()):
+                if el._ctc_id_matches_packet(c_pkt) is True:
+                    el.process_packet(c_pkt, self)
         self._evaluate_system_logic(time.time())
         self.broadcast_state(self.get_render_state())
 
@@ -4323,7 +5391,7 @@ class DispatcherEngine:
     def _dispatch_packet_to_elements(self, pkt: dict, catch_exceptions: bool = False):
         """Fast pre-filtered packet dispatch across layout elements."""
         node_id = pkt.get("_node_id_")
-        has_pkt_ctc = bool(pkt.get("_ctc_id_") or pkt.get("ctc_id"))
+        has_pkt_ctc = bool(pkt.get("_ctc_id_") or pkt.get("ctc_id") or pkt.get("_ctc_rules_") is not None)
         has_src_id = any(
             isinstance(k, str) and k.strip().lower() in ("_src_id_", "_src_id", "src_id", "_srcid_") and v not in (None, "")
             for k, v in pkt.items()
@@ -4621,6 +5689,11 @@ class DispatcherEngine:
                     for el in self.elements.values()
                     if (getattr(el, "wiu_id", None) is not None or getattr(el, "radio_id", None) is not None) and getattr(el, "rssi_avg", None) is not None
                 },
+                layout_ctc_specs=[
+                    str(getattr(el, "ctc_id", "")).strip()
+                    for el in self.elements.values()
+                    if getattr(el, "ctc_id", None) and str(getattr(el, "ctc_id", "")).strip()
+                ],
             ) if getattr(self, "address_table_enabled", False) else None,
             "train_scroller": self.train_scroller.to_state_dict(now=time.time()) if getattr(self, "train_scroller_enabled", False) else None,
             "chat": self.chat_panel.to_state_dict(active_identity=self.get_active_chat_identity()) if (getattr(self, "chat_enabled", False) or len(self.chat_panel.messages) > 0) else None,

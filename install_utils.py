@@ -54,8 +54,15 @@ USER_OWNED_PATTERNS = (
 # Shipped data files the user may have customised: replaced only if unmodified since the last install
 # (3-way compare against the previous manifest); otherwise the new version is saved as '<name>.new'.
 MANAGED_DATA_PATTERNS = (
-    "config/*", "signals_default.json", "ptc_status_parser.json", "thanks.txt",
+    "config/*", "*rules.json", "*_rule.json", "signals_default.json", "ptc_status_parser.json", "thanks.txt",
 )
+
+
+def is_rule_file(rel_path: str) -> bool:
+    """True if `rel_path` is a packet parser rule file (e.g. config/ctc_rules.json, config/*.rules.json)."""
+    rp = rel_path.replace("\\", "/")
+    base = rp.rsplit("/", 1)[-1].lower()
+    return base.endswith("rules.json") or base.endswith("_rule.json") or base.endswith(".rule.json")
 
 
 def sha256_bytes(data: bytes) -> str:

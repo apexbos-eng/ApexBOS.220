@@ -1,5 +1,5 @@
 {
-  "version": "v26.1125.10",
+  "version": "v26.1127.08",
   "common": {
     "deployment_mode": "local",
     "packet_source": "flux",
@@ -12,7 +12,7 @@
       "ui_port": 23010,
       "auth_secret": "",
       "encryption_key": "",
-      "identity": "ApexNode_f8df27ae",
+      "identity": "ApexNode_b698f3ad",
       "banc_initial_history_sec": 60
     },
     "multicast": {
@@ -86,6 +86,7 @@
     "rtl_tcp_host": "127.0.0.1",
     "rtl_tcp_port": 1234,
     "dedup_ttl": 0.4,
+    "filter_ctrl": true,
     "processes": [
       {
         "index": 0,
@@ -153,9 +154,10 @@
       "x2_base_rules.json",
       "x01_rules.json",
       "x05_rules.json",
-      "x70_rules.json",
       "x06_rules.json",
-      "x04_rules.json"
+      "x04_rules.json",
+      "ctc_rules.json",
+      "x70_rules.json"
     ],
     "connections": {
       "mcast_group": "239.1.1.1",
@@ -164,7 +166,7 @@
       "banc_port": "none",
       "auth_secret": "",
       "encryption_key": "",
-      "identity": "ApexNode_f8df27ae",
+      "identity": "ApexNode_b698f3ad",
       "banc_initial_history_sec": 60
     }
   },
@@ -179,7 +181,7 @@
     "banc_port": 23009,
     "auth_secret": "",
     "encryption_key": "",
-    "identity": "ApexNode_f8df27ae"
+    "identity": "ApexNode_b698f3ad"
   },
   "creator": {
     "db_path": "wius.db",
@@ -188,7 +190,7 @@
     "banc_port": 23009,
     "auth_secret": "",
     "encryption_key": "",
-    "identity": "ApexNode_f8df27ae"
+    "identity": "ApexNode_b698f3ad"
   },
   "banc": {
     "port": 23009,
@@ -211,9 +213,10 @@
       "x2_base_rules.json",
       "x01_rules.json",
       "x05_rules.json",
-      "x70_rules.json",
       "x06_rules.json",
-      "x04_rules.json"
+      "x04_rules.json",
+      "ctc_rules.json",
+      "x70_rules.json"
     ]
   },
   "packfig": {

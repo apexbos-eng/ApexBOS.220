@@ -397,6 +397,41 @@ def prompt_editable(prompt: str, default: str) -> str:
                 return default
 
 
+def resolve_preserved_parser_rules(
+    existing: Optional[Dict[str, Any]],
+    working_dir: Optional[str] = None,
+) -> Tuple[List[str], List[str], List[str], List[str]]:
+    """
+    Safely resolves engine.parsers and spy.rules for fresh setup or setup re-run:
+      * On fresh setup: returns canonical defaults (including ctc_rules.json & any new rules in config.defaults.json).
+      * On re-run with an existing config.json: preserves all user custom rules & ordering while
+        safely inserting newly shipped default rules at their strategic relative positions
+        (e.g. ctc_rules.json before x70_rules.json). Never modifies rule files on disk.
+    Returns (engine_parsers, spy_rules, added_engine, added_spy).
+    """
+    default_engine = config_loader.resolve_default_parser_rules(base_dir=working_dir, section="engine")
+    default_spy = config_loader.resolve_default_parser_rules(base_dir=working_dir, section="spy")
+
+    if not isinstance(existing, dict):
+        return default_engine, default_spy, [], []
+
+    ex_eng = (existing.get("engine") or {}).get("parsers")
+    if not isinstance(ex_eng, list) or not ex_eng:
+        ex_eng = existing.get("parsers") if isinstance(existing.get("parsers"), list) else None
+    if isinstance(ex_eng, list) and ex_eng:
+        merged_eng, added_eng = config_loader.merge_rule_list(ex_eng, default_engine)
+    else:
+        merged_eng, added_eng = default_engine, []
+
+    ex_spy = (existing.get("spy") or {}).get("rules")
+    if isinstance(ex_spy, list) and ex_spy:
+        merged_spy, added_spy = config_loader.merge_rule_list(ex_spy, default_spy)
+    else:
+        merged_spy, added_spy = default_spy, []
+
+    return merged_eng, merged_spy, added_eng, added_spy
+
+
 def finalize_install(
     cfg: Dict[str, Any],
     autostart: bool,
@@ -405,7 +440,16 @@ def finalize_install(
 ) -> Dict[str, Any]:
     """Writes config.json + legacy configs + install record; sets up boot services and shortcuts."""
     wdir = os.path.abspath(working_dir or os.getcwd())
-    config_loader.save_unified_config(cfg, os.path.join(wdir, config_loader.CONFIG_FILENAME))
+    cfg_path = os.path.join(wdir, config_loader.CONFIG_FILENAME)
+    backup_path = None
+    if os.path.isfile(cfg_path):
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{cfg_path}.bak.setup_{stamp}"
+            shutil.copy2(cfg_path, backup_path)
+        except OSError:
+            backup_path = None
+    config_loader.save_unified_config(cfg, cfg_path)
     config_loader.sync_legacy_configs(cfg, target_dir=wdir)
     fw_files = config_loader.save_windows_firewall_files(cfg, target_dir=wdir)
 
@@ -447,6 +491,16 @@ def finalize_install(
             json.dump(rec, f, indent=2)
     except OSError:
         pass
+    # Seed .apexbos_manifest.json from shipped MANIFEST.json on first setup so future
+    # updates can reliably perform 3-way hash comparisons for unmodified vs user-edited rules.
+    shipped_manifest = os.path.join(wdir, "MANIFEST.json")
+    local_manifest = os.path.join(wdir, ".apexbos_manifest.json")
+    if os.path.isfile(shipped_manifest) and not os.path.isfile(local_manifest):
+        try:
+            shutil.copy2(shipped_manifest, local_manifest)
+        except OSError:
+            pass
+
     return {"boot": boot, "shortcuts": shortcuts, "record": rec_path, "firewall_files": fw_files}
 
 
@@ -1383,6 +1437,7 @@ def run_cli_wizard(
 
     ex_eng_conns = (existing or {}).get("engine", {}).get("connections", {})
     banc_init_hist = int(ex_eng_conns.get("banc_initial_history_sec", 60))
+    merged_parsers, merged_spy_rules, added_eng_rules, added_spy_rules = resolve_preserved_parser_rules(existing)
 
     cfg = config_loader.generate_unified_config(
         deployment_mode=deployment_mode,
@@ -1418,9 +1473,14 @@ def run_cli_wizard(
         sdr_mode=sdr_mode_choice if deployment_mode != "engines_viewers" else None,
         rtl_tcp_host=tcp_host_val if deployment_mode != "engines_viewers" else None,
         rtl_tcp_port=tcp_port_val if deployment_mode != "engines_viewers" else None,
+        parsers=merged_parsers,
+        spy_rules=merged_spy_rules,
     )
     res = finalize_install(cfg, autostart)
     print("\n[+] Saved master configuration -> config.json")
+    if existing and (added_eng_rules or added_spy_rules):
+        merged_note = sorted(set(added_eng_rules) | set(added_spy_rules))
+        print(f"[+] Preserved your parser rules and safely added new default rule(s): {', '.join(merged_note)}")
     print("[+] Synchronized legacy configs (grabber_config.json, MosFET.json, banc.json)")
     if res["boot"]:
         print(f"[+] Configured boot services for {res['boot']['platform']}: {res['boot']['details']}")
@@ -1586,8 +1646,18 @@ class SdrRegionMapModal:
         self.pan_start_world_px = (0.0, 0.0)
 
         self.raw_pick_latlon: Optional[Tuple[float, float]] = None
+        self.loc_optin: bool = bool(isinstance(existing_region, dict) and existing_region.get("loc_optin", False))
+        self.loc_latlon: Optional[Tuple[float, float]] = None
+        if self.loc_optin and isinstance(existing_region, dict):
+            if existing_region.get("loc_lat") is not None and existing_region.get("loc_lon") is not None:
+                try:
+                    self.loc_latlon = (float(existing_region["loc_lat"]), float(existing_region["loc_lon"]))
+                except (ValueError, TypeError):
+                    self.loc_latlon = None
         if isinstance(existing_region, dict) and existing_region.get("region_lat") is not None:
-            self.blurred_region: Optional[Dict[str, float]] = dict(existing_region)
+            self.blurred_region: Optional[Dict[str, float]] = config_loader.sanitize_sdr_region(
+                existing_region, default_radius_mi=default_radius_mi
+            )
             self.center_lat = float(existing_region["region_lat"])
             self.center_lon = float(existing_region["region_lon"])
             self.rx_radius_mi = max(
@@ -1602,8 +1672,8 @@ class SdrRegionMapModal:
             self.rx_radius_mi = float(default_radius_mi)
             self.zoom = 4
 
-        self.modal_rect = pygame.Rect(30, 25, 800, 590)
-        self.map_rect = pygame.Rect(46, 86, 768, 392)
+        self.modal_rect = pygame.Rect(30, 20, 800, 600)
+        self.map_rect = pygame.Rect(46, 82, 768, 366)
         self.btn_rects: Dict[str, pygame.Rect] = {}
         self._build_rects()
 
@@ -1614,11 +1684,12 @@ class SdrRegionMapModal:
             "zoom_in": pygame.Rect(mr.right - 216, mr.y + 16, 34, 28),
             "zoom_out": pygame.Rect(mr.right - 176, mr.y + 16, 34, 28),
             "layer": pygame.Rect(mr.right - 134, mr.y + 16, 118, 28),
-            "rad_minus": pygame.Rect(mr.x + 178, mr.bottom - 94, 32, 28),
-            "rad_plus": pygame.Rect(mr.x + 286, mr.bottom - 94, 32, 28),
-            "save": pygame.Rect(mr.right - 178, mr.bottom - 48, 162, 34),
-            "clear": pygame.Rect(mr.right - 278, mr.bottom - 48, 90, 34),
-            "cancel": pygame.Rect(mr.x + 16, mr.bottom - 48, 96, 34),
+            "rad_minus": pygame.Rect(mr.x + 178, mr.bottom - 122, 32, 26),
+            "rad_plus": pygame.Rect(mr.x + 286, mr.bottom - 122, 32, 26),
+            "loc_optin": pygame.Rect(mr.x + 16, mr.bottom - 90, 560, 22),
+            "save": pygame.Rect(mr.right - 178, mr.bottom - 46, 162, 34),
+            "clear": pygame.Rect(mr.right - 278, mr.bottom - 46, 90, 34),
+            "cancel": pygame.Rect(mr.x + 16, mr.bottom - 46, 96, 34),
         }
 
     def apply_picked_location(self, lat: float, lon: float, rx_radius_mi: Optional[float] = None, rng: Optional[Any] = None) -> Dict[str, float]:
@@ -1712,13 +1783,27 @@ class SdrRegionMapModal:
                 self._adjust_radius(-2.0)
             elif self.btn_rects["rad_plus"].collidepoint(pos):
                 self._adjust_radius(2.0)
+            elif self.btn_rects["loc_optin"].collidepoint(pos):
+                self.loc_optin = not self.loc_optin
             elif self.btn_rects["save"].collidepoint(pos):
-                # Discard raw click immediately; persist ONLY the sanitized blurred region!
+                # Persist sanitized blurred region; only attach ~275m quantized anchor if explicitly opted in
+                picked_for_optin = self.raw_pick_latlon or self.loc_latlon
                 self.raw_pick_latlon = None
                 clean = config_loader.sanitize_sdr_region(self.blurred_region) if self.blurred_region else None
+                if clean and self.loc_optin and picked_for_optin is not None:
+                    priv = config_loader.sanitize_private_sdr_sensor({
+                        "loc_optin": True,
+                        "loc_lat": picked_for_optin[0],
+                        "loc_lon": picked_for_optin[1],
+                    })
+                    if priv:
+                        clean = dict(clean)
+                        clean.update(priv)
                 self.on_save_cb(clean)
             elif self.btn_rects["clear"].collidepoint(pos):
                 self.raw_pick_latlon = None
+                self.loc_latlon = None
+                self.loc_optin = False
                 self.blurred_region = None
                 self.on_save_cb(None)
             elif self.btn_rects["cancel"].collidepoint(pos):
@@ -1836,25 +1921,37 @@ class SdrRegionMapModal:
 
         # Controls below map
         r_lbl = self.font_body.render("RF Rx Radius:", True, COLOR_TEXT)
-        screen.blit(r_lbl, (mr.x + 16, mr.bottom - 90))
+        screen.blit(r_lbl, (mr.x + 16, mr.bottom - 118))
         rad_val_lbl = self.font_h2.render(f"{self.rx_radius_mi:.0f} mi", True, COLOR_ACCENT)
-        screen.blit(rad_val_lbl, (mr.x + 218, mr.bottom - 90))
+        screen.blit(rad_val_lbl, (mr.x + 218, mr.bottom - 118))
 
         if self.blurred_region is not None:
             info_txt = (
-                f"Saved Blurred Center: {self.blurred_region['region_lat']:.3f}, "
-                f"{self.blurred_region['region_lon']:.3f}  |  Banc Enclosing Radius: "
+                f"Blurred Center: {self.blurred_region['region_lat']:.3f}, "
+                f"{self.blurred_region['region_lon']:.3f}  |  Radius: "
                 f"{self.blurred_region['region_radius_mi']:.1f} mi"
             )
             info_col = COLOR_GREEN
         else:
             info_txt = "No location picked yet — click anywhere on the map (or Cancel for Auto)."
             info_col = COLOR_TEXT_DIM
-        screen.blit(self.font_sm.render(info_txt, True, info_col), (mr.x + 335, mr.bottom - 87))
+        screen.blit(self.font_sm.render(info_txt, True, info_col), (mr.x + 335, mr.bottom - 115))
+
+        # Optional opt-in checkbox for private server-only k>=3 RF triangulation
+        cb_r = self.btn_rects["loc_optin"]
+        box_r = pygame.Rect(cb_r.x, cb_r.y + 3, 16, 16)
+        pygame.draw.rect(screen, COLOR_ACCENT if self.loc_optin else COLOR_BORDER, box_r, 0 if self.loc_optin else 2, border_radius=3)
+        if self.loc_optin:
+            chk_s = self.font_sm.render("X", True, (10, 10, 10))
+            screen.blit(chk_s, chk_s.get_rect(center=box_r.center))
+        opt_txt = "Opt-in: Private server RF triangulation (~275m grid, decoupled ID, k>=3 anonymous, never shared)"
+        screen.blit(
+            self.font_sm.render(opt_txt, True, COLOR_ACCENT if self.loc_optin else COLOR_TEXT_DIM),
+            (box_r.right + 8, cb_r.y + 3),
+        )
 
         priv_txt = (
-            "Privacy: Raw click GPS is discarded immediately. A one-time random 2.5-4.5 mi offset is applied "
-            "and never shown to other users."
+            "Privacy: Default stores ONLY the 2.5-4.5 mi blurred circle. Opt-in sends ~275m cell to primary Banc only."
         )
         screen.blit(self.font_sm.render(priv_txt, True, COLOR_TEXT_DIM), (mr.x + 16, mr.bottom - 66))
 
@@ -2018,14 +2115,23 @@ class PygameSetupWizard:
         self.fields["fred_chans"] = str(ex_fred_g.get("chans") or "EOT,DPU3,DPU4")
         self.fields["fred_gain"] = str(ex_fred_g.get("gain", ex_grab.get("gain", "auto")))
         self.fields["fred_ppm"] = str(ex_fred_g.get("ppm", ex_grab.get("ppm", ex_grab.get("frequency_correction", 0))))
-        self.grabber_region: Optional[Dict[str, float]] = config_loader.sanitize_sdr_region(
-            ex_grab, default_radius_mi=config_loader.DEFAULT_PTC_RX_RADIUS_MI
+        def _load_region_with_optin(sec_dict, def_rad):
+            reg = config_loader.sanitize_sdr_region(sec_dict, default_radius_mi=def_rad)
+            if reg is not None:
+                priv = config_loader.sanitize_private_sdr_sensor(sec_dict)
+                if priv:
+                    reg = dict(reg)
+                    reg.update(priv)
+            return reg
+
+        self.grabber_region: Optional[Dict[str, Any]] = _load_region_with_optin(
+            ex_grab, config_loader.DEFAULT_PTC_RX_RADIUS_MI
         )
-        self.latch_region: Optional[Dict[str, float]] = config_loader.sanitize_sdr_region(
-            ex_latch_g, default_radius_mi=config_loader.DEFAULT_ATCS_RX_RADIUS_MI
+        self.latch_region: Optional[Dict[str, Any]] = _load_region_with_optin(
+            ex_latch_g, config_loader.DEFAULT_ATCS_RX_RADIUS_MI
         )
-        self.fred_region: Optional[Dict[str, float]] = config_loader.sanitize_sdr_region(
-            ex_fred_g, default_radius_mi=config_loader.DEFAULT_FRED_RX_RADIUS_MI
+        self.fred_region: Optional[Dict[str, Any]] = _load_region_with_optin(
+            ex_fred_g, config_loader.DEFAULT_FRED_RX_RADIUS_MI
         )
         self.region_map_modal: Optional[SdrRegionMapModal] = None
         self._tile_mgr: Optional[WizardTileMapManager] = None
@@ -2242,10 +2348,11 @@ class PygameSetupWizard:
         )
 
     @staticmethod
-    def _format_region_summary(reg: Optional[Dict[str, float]], auto_txt: str) -> Tuple[str, bool]:
+    def _format_region_summary(reg: Optional[Dict[str, Any]], auto_txt: str) -> Tuple[str, bool]:
         if isinstance(reg, dict) and reg.get("region_lat") is not None and reg.get("region_lon") is not None:
             rad = float(reg.get("region_radius_mi", 12.0))
-            return f"Blurred ~{rad:.1f} mi @ {float(reg['region_lat']):.2f}, {float(reg['region_lon']):.2f}", True
+            opt = " [+Triang]" if reg.get("loc_optin") else ""
+            return f"Blurred ~{rad:.1f} mi @ {float(reg['region_lat']):.2f}, {float(reg['region_lon']):.2f}{opt}", True
         return auto_txt, False
 
     # ----- main loop -------------------------------------------------------
@@ -2367,6 +2474,8 @@ class PygameSetupWizard:
         except ValueError:
             fred_ppm_int = ppm_int
 
+        merged_parsers, merged_spy_rules, _, _ = resolve_preserved_parser_rules(self.existing)
+
         cfg = config_loader.generate_unified_config(
             deployment_mode=dep_mode_val,
             banc_location=banc_loc_val,
@@ -2404,6 +2513,8 @@ class PygameSetupWizard:
             grabber_region=self.grabber_region if dep_mode_val != "engines_viewers" else None,
             latch_region=self.latch_region if dep_mode_val != "engines_viewers" else None,
             fred_region=self.fred_region if dep_mode_val != "engines_viewers" else None,
+            parsers=merged_parsers,
+            spy_rules=merged_spy_rules,
         )
         finalize_install(cfg, self.autostart_boot)
         return cfg

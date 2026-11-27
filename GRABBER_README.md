@@ -182,12 +182,21 @@ Transmissions begin with a 64-bit unique word synchronization signature. Grabber
    - Polynomial: $x^{16} + x^{15} + x^2 + 1$ (`0xA001`, reversed `0x8005`).
    - Ensures zero undetected bit errors before forwarding packets to downstream clients.
 
-### 6. Frame Formatting & Deduplication
+### 6. Frame Formatting, Deduplication & Outbound Control-Packet Filter
 Packets passing CRC validation are formatted into the standard ApexBOSFlux protocol frame:
 ```
 [ 0x49 ('I') ] [ Length (2 bytes BE) ] [ Packet Type (1 byte) ] [ Flags (0x00) ] [ Payload... ]
 ```
 Because locomotives and base stations often transmit repeatedly or across overlapping channels, an adaptive deduplication filter suppresses identical frames seen within the configured expiration window (`--dedup-ttl`, default: 1.0s).
+
+#### Optional Outbound Control-Packet Filter (Default: ON)
+By default (`--filter-ctrl` / `filter_ctrl: true`), ApexBOSGrabber suppresses high-volume, non-layout housekeeping packets—**`QSTAT/ACK` (`0x01`)**, **`ACQ` (`0x04`)**, and **`CNTL` (`0x05`)**—from being forwarded over its outbound ZeroMQ `PUB` and UDP feeds to Flux, Engine, and Spy, significantly reducing downstream network and CPU noise:
+- **Still Counted in Grabber Statistics**: Filtered packets remain fully counted in `Packets`, `PPM`, worker tables, and recent packet logs (tagged with a dim `[FLT]` badge).
+- **Always Displayed on ApexBOSChroma**: When [ApexBOSChroma](CHROMA_README.md) is connected, Grabber mirrors **every** demodulated packet—including filtered `0x01`/`0x04`/`0x05` frames—over its gated `b"PKT"` XPUB channel (`18099`), so Chroma's waterfall always shows every live RF burst accurately.
+- **Toggle Anytime**: Disable at launch via `--no-filter-ctrl` (aliases `--no-filter`, `--send-all`), set `"filter_ctrl": false` in `config.json`, or toggle live in the console via `filter off` / `filter on`.
+
+#### Automatic Terminal ANSI Detection & Plain-Text Fallback
+On startup, Grabber probes stdout/console VT100 support via `config_loader.init_terminal_mode()`. If run in a non-ANSI environment (such as Windows Legacy Console, `TERM=dumb`, `NO_COLOR=1`, or redirected log pipes), Grabber automatically switches to clean plain-text scroll mode (`--no-tui --no-color`) so logs stay readable with zero garbled escape sequences.
 
 ### 7. Signal Power, dBFS Calibration & ADC Clipping Detection
 ApexBOSGrabber evaluates RMS signal power for incoming RF bursts and raw I/Q sample chunks in decibels relative to full scale:
@@ -266,11 +275,11 @@ Reference guide matching the fields shown in [`GrabberMainScreen.png`](images/Gr
 
 ### 1. Header Bar
 ```
-ApexBOSGrabber (2.2.0) | Elapsed: 00:04:12 | SDR: PIPE | Rate: 960000 S/s [AUTO] | Gain: AGC | Bias: ON | PPM: 6 | Err: 8 | Center: 220.4875 MHz
+ApexBOSGrabber (v26.1127.08) | Elapsed: 00:04:12 | SDR: PIPE | Rate: 960000 S/s [AUTO] | Gain: AGC | Bias: ON | PPM: 6 | Err: 8 | Center: 220.4875 MHz
 ```
-- **`2.2.0`**: Active Grabber engine release version.
+- **`v26.1127.08`**: Active unified ApexBOS release version (from `version.py`).
 - **`Elapsed: 00:04:12`**: Elapsed execution time since Grabber launched (`HH:MM:SS`).
-- **`SDR: PIPE`**: Active ingestion mode (`PIPE`, `TCP`, `RTLSDR`, or `STDIN`).
+- **`SDR: PIPE`**: Active ingestion mode (`PIPE`, `TCP`, `RTLSDR`, `RSPTCP`, `SOAPY`, or `STDIN`).
 - **`Rate: 960000 S/s [AUTO]`**: Hardware sampling rate. `[AUTO]` denotes that Grabber automatically expanded the sample rate from 192 kS/s to 960 kS/s to span all requested channels.
 - **`Gain: AGC`**: Tuner gain setting. Displays `AGC` when auto-gain is active, or fixed gain in dB (e.g. `42.0 dB`). When incoming bursts clip the ADC (`Peak RSSI >= 0.0 dBFS`), an alert tag `[CLIP: GAIN HIGH]` warns in bold red that the gain is set too high.
 - **`Bias: ON`**: Status of internal 4.5V LNA bias-tee power (`ON` or `OFF`).
@@ -369,6 +378,7 @@ python ApexBOSGrabber.py [OPTIONS]
 | `--config <path>` | Load configuration options from a JSON file | `None` |
 | `--gen-config` | Generate a template configuration file with defaults and exit | — |
 | `--no-color` | Disable ANSI terminal colors | `False` |
+| `--no-tui` | Disable full-screen ANSI TUI and print plain scrolling lines (auto-enabled on non-ANSI / redirected consoles) | `False` |
 | `--full` | Print full packet hex and decoding details | `False` |
 
 ### SDR Hardware & Tuning
@@ -416,6 +426,7 @@ python ApexBOSGrabber.py [OPTIONS]
 | `--procs <ports>` | Comma-separated ZeroMQ PUB ports | `5555` |
 | `--workers <count>` | Number of worker processes (overrides `--procs` port count) | Process count |
 | `--udp-port <port>` | Base UDP broadcast port | Same as ZMQ |
+| `--filter-ctrl` / `--no-filter-ctrl` | Filter `QSTAT/ACK` (`0x01`), `ACQ` (`0x04`), and `CNTL` (`0x05`) from outbound ZMQ/UDP feeds (still counted in stats & displayed on Chroma). Aliases: `--no-filter`, `--send-all`. | `True` (ON) |
 | `--no-rssi` | Emit raw hex without RSSI prepended (legacy mode) | `False` |
 
 ---
@@ -437,6 +448,8 @@ While ApexBOSGrabber is running, you can adjust parameters in real time directly
 | `tune <on\|off>`| Enable or disable automated PID tuner | `tune on` |
 | `afc <on\|off>` | Enable or disable per-channel AFC frequency correction | `afc off` |
 | `dedup <sec>` | Adjust deduplication window in seconds | `dedup 2.0` |
+| `filter <on\|off\|status>` | Toggle outbound control-packet filter (`0x01`/`0x04`/`0x05`) live (alias: `flt`) | `filter off` |
+| `lock <chan>` / `unlock <chan>` | Pin or unpin an active channel against idle pruning | `lock 102` |
 | `t <sec>` | Set channel inactivity timeout | `t 600` |
 | `q` | Cleanly terminate all worker processes and exit | `q` |
 
@@ -529,6 +542,7 @@ python ApexBOSScanner.py --mock --start-ch 100 --end-ch 115
     "channel_afc": true,
     "afc_limit": 500.0,
     "dedup_ttl": 1.0,
+    "filter_ctrl": true,
     "chans": null,
     "chans_file": null,
     "channel_timeout": 300.0,

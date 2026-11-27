@@ -21,6 +21,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -357,6 +358,33 @@ class ApexBOSChannelScanner:
         self.aborted = False
         self.keyboard = KeyboardController()
         self.simulated_keys: List[str] = []
+        self._no_color_req = bool(getattr(self, "_no_color_req", False))
+        try:
+            import config_loader as _cfg_term
+            _, _use_color, _ = _cfg_term.init_terminal_mode(
+                no_color=self._no_color_req,
+                announce_fallback=False,
+            )
+            self.use_color = bool(_use_color)
+        except Exception:
+            self.use_color = not self._no_color_req
+
+    def _strip_ansi(self, text: str) -> str:
+        return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", str(text or ""))
+
+    def _write_progress(self, text: str, final: bool = False):
+        if not self.verbose:
+            return
+        if self.use_color:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        elif final:
+            clean = self._strip_ansi(text).lstrip("\r")
+            if clean.strip():
+                if not clean.endswith("\n"):
+                    clean += "\n"
+                sys.stdout.write(clean)
+                sys.stdout.flush()
 
     def _poll_key(self) -> Optional[str]:
         """Polls keyboard or consumes queued simulated keys for automated tests."""
@@ -366,9 +394,12 @@ class ApexBOSChannelScanner:
 
     def log(self, text: str, color: str = ""):
         if self.verbose:
-            c_prefix = color if color else ""
-            c_suffix = COLOR_RESET if color else ""
-            print(f"{c_prefix}{text}{c_suffix}")
+            if getattr(self, "use_color", True):
+                c_prefix = color if color else ""
+                c_suffix = COLOR_RESET if color else ""
+                print(f"{c_prefix}{text}{c_suffix}")
+            else:
+                print(self._strip_ansi(text))
         if getattr(self, "progress_cb", None):
             try:
                 clean_text = re.sub(r"\033\[[0-9;]*[a-zA-Z]", "", text).strip()
@@ -665,8 +696,7 @@ class ApexBOSChannelScanner:
                         f"\r    [*] In-Band Center {freq_disp} "
                         f"[T-{remaining_sec:4.1f}s / {eff_duration:.1f}s] | Accumulating Max-Hold PSD...\033[K"
                     )
-                    sys.stdout.write(progress_line)
-                    sys.stdout.flush()
+                    self._write_progress(progress_line, final=False)
 
                 key = self._poll_key()
                 if key in ("n", " ", "\r", "\t"):
@@ -682,8 +712,7 @@ class ApexBOSChannelScanner:
                     break
 
             if self.verbose:
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
+                self._write_progress("\r\033[K", final=False)
 
             if n_blocks_accum == 0:
                 continue
@@ -958,8 +987,7 @@ class ApexBOSChannelScanner:
                         f"\r [{pct_done:5.1f}%] Ch {ch:3d} ({freq_mhz:.4f} MHz){pri_tag} "
                         f"[T-{remaining_sec:4.1f}s] | {sync_str} | {crc_str} | {rssi_str} | {snr_str}\033[K"
                     )
-                    sys.stdout.write(progress_line)
-                    sys.stdout.flush()
+                    self._write_progress(progress_line, final=False)
 
                 key = self._poll_key()
                 if key in ("n", " ", "\r", "\t"):
@@ -981,8 +1009,7 @@ class ApexBOSChannelScanner:
 
             if user_quit:
                 if self.verbose:
-                    sys.stdout.write("\r\033[K")
-                    sys.stdout.flush()
+                    self._write_progress("\r\033[K", final=False)
                 self.log("\n[!] Scan aborted by user.", COLOR_RED + COLOR_BOLD)
                 break
 
@@ -996,12 +1023,10 @@ class ApexBOSChannelScanner:
                         f"{COLOR_GREEN}{COLOR_BOLD}SYNC DETECTED!{COLOR_RESET} "
                         f"({total_sync} sync [{rate_sync:.1f}/s], CRC: {total_crc}, RSSI: {avg_rssi:5.1f} dBFS, SNR: {avg_snr:4.1f} dB)\033[K\n"
                     )
-                    sys.stdout.write(detected_line)
-                    sys.stdout.flush()
+                    self._write_progress(detected_line, final=True)
             else:
                 if self.verbose:
-                    sys.stdout.write("\r\033[K")
-                    sys.stdout.flush()
+                    self._write_progress("\r\033[K", final=False)
 
             if stop_phase1:
                 self.log(
@@ -1011,8 +1036,7 @@ class ApexBOSChannelScanner:
                 break
 
         if self.verbose:
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
+            self._write_progress("\r\033[K", final=False)
 
         self.active_channels = detected_channels
         self.log(
@@ -1119,8 +1143,7 @@ class ApexBOSChannelScanner:
                             f"{sync_eval:3d} Sync / {self.opt_duration_sec:.1f}s  |  CRC Good: {crc_eval:2d}  |  "
                             f"RSSI: {cur_rssi:5.1f} dBFS  |  SNR: {cur_snr:4.1f} dB\033[K"
                         )
-                        sys.stdout.write(ppm_line)
-                        sys.stdout.flush()
+                        self._write_progress(ppm_line, final=False)
 
                     key = self._poll_key()
                     if key in ("n", " ", "\r", "\t"):
@@ -1141,8 +1164,7 @@ class ApexBOSChannelScanner:
                         f"{sync_eval:3d} Sync / {self.opt_duration_sec:.1f}s  |  CRC Good: {crc_eval:2d}  |  "
                         f"RSSI: {avg_rssi:5.1f} dBFS  |  SNR: {avg_snr:4.1f} dB\033[K\n"
                     )
-                    sys.stdout.write(final_ppm_line)
-                    sys.stdout.flush()
+                    self._write_progress(final_ppm_line, final=True)
 
                 if (
                     (sync_eval > max_sync)
@@ -1571,6 +1593,7 @@ def build_scanner_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mock", action="store_true", default=False, help="Run offline scan using synthetic mock bursts")
     parser.add_argument("--output-dir", default=None, help="Directory to save generated start scripts and report (default: temp folder)")
     parser.add_argument("--quiet", action="store_true", default=False, help="Suppress detailed scan logs")
+    parser.add_argument("--no-color", action="store_true", default=False, help="Disable ANSI terminal colors and inline control codes")
     parser.add_argument(
         "--update-config",
         action="store_true",
@@ -1612,7 +1635,12 @@ def main():
         skip_phase0=args.skip_phase0,
         inband_duration=args.inband_duration,
     )
+    if getattr(args, "no_color", False):
+        scanner.use_color = False
     cmd_str, saved_files = scanner.run()
+
+    def _c(code: str, txt: str) -> str:
+        return f"{code}{txt}{COLOR_RESET}" if scanner.use_color else txt
 
     if scanner.scan_results:
         cfg_file = args.config or os.path.join(PROJECT_ROOT, "config.json")
@@ -1621,7 +1649,7 @@ def main():
             try:
                 chans_disp = ", ".join(str(c) for c in sorted(scanner.scan_results.keys()))
                 prompt_txt = (
-                    f"\n{COLOR_CYAN}[?]{COLOR_RESET} Update Grabber configuration in {os.path.basename(cfg_file)}?\n"
+                    f"\n{_c(COLOR_CYAN, '[?]')} Update Grabber configuration in {os.path.basename(cfg_file)}?\n"
                     f"    Channels: [{chans_disp}]\n"
                     f"    Consensus PPM: {scanner.recommended_ppm:+d}\n"
                     f"    Proceed with update? [y/N]: "
@@ -1631,7 +1659,7 @@ def main():
             except Exception:
                 do_update = False
         elif args.no_update_prompt and not args.quiet:
-            print(f"\n{COLOR_GREEN}[✓] Scan complete! Results have been sent to the ApexBOS Setup Wizard.{COLOR_RESET}\n")
+            print(f"\n{_c(COLOR_GREEN, '[✓] Scan complete! Results have been sent to the ApexBOS Setup Wizard.')}\n")
 
         if do_update:
             try:
@@ -1641,13 +1669,13 @@ def main():
                     config_path=cfg_file,
                 )
                 if ok:
-                    print(f"\n{COLOR_GREEN}[✓] {msg}{COLOR_RESET}\n")
+                    print(f"\n{_c(COLOR_GREEN, f'[✓] {msg}')}\n")
                 else:
-                    print(f"\n{COLOR_YELLOW}[!] {msg}{COLOR_RESET}\n")
+                    print(f"\n{_c(COLOR_YELLOW, f'[!] {msg}')}\n")
             except Exception as e:
-                print(f"\n{COLOR_RED}[!] Failed to update configuration: {e}{COLOR_RESET}\n", file=sys.stderr)
+                print(f"\n{_c(COLOR_RED, f'[!] Failed to update configuration: {e}')}\n", file=sys.stderr)
     elif args.no_update_prompt and not args.quiet:
-        print(f"\n{COLOR_YELLOW}[*] Scan finished with no active channels detected.{COLOR_RESET}\n")
+        print(f"\n{_c(COLOR_YELLOW, '[*] Scan finished with no active channels detected.')}\n")
 
 
 if __name__ == "__main__":

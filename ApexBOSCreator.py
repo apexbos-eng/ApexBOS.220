@@ -56,6 +56,7 @@ from dispatcher_engine import (
     OPPOSITE_DIR,
     DispatcherEngine,
     format_wiu_display_name,
+    parse_label_font_tag,
     BaseElement,
     TrackSegment,
     Turnout,
@@ -563,6 +564,51 @@ class WIUAddressCache:
             for row in rows:
                 if self._ingest_wiu_row_dict(row):
                     loaded_count += 1
+            # Optionally enrich unlocated WIUs with anonymized multi-SDR RF estimates from Banc
+            # (stored strictly as 'est_gps', NEVER overwriting verified ground-truth 'gps')
+            if callable(getattr(banc_client, "get_estimates_sync", None)):
+                try:
+                    est_rows = banc_client.get_estimates_sync(category="wiu", timeout=timeout)
+                    if isinstance(est_rows, list):
+                        for er in est_rows:
+                            if not isinstance(er, dict):
+                                continue
+                            ekey = _normalize_wiu_key(er.get("unit_id"))
+                            elat = er.get("est_lat")
+                            elon = er.get("est_lon")
+                            if not ekey or elat is None or elon is None:
+                                continue
+                            try:
+                                elat_f, elon_f = float(elat), float(elon)
+                                erad_km = float(er.get("est_radius_km", 5.0))
+                            except (ValueError, TypeError):
+                                continue
+                            rec = self.wiu_records.get(ekey)
+                            if rec is None:
+                                try:
+                                    wid_stored: Any = int(ekey) if re.fullmatch(r"-?\d+", ekey) else ekey
+                                except Exception:
+                                    wid_stored = ekey
+                                rec = {
+                                    "wiu_id": wid_stored,
+                                    "max_base_bits": 16,
+                                    "channels": [1],
+                                    "seen_count": int(er.get("sample_count", 1) or 1),
+                                    "name": "",
+                                    "gps": None,
+                                    "ctc_addresses": [],
+                                    "has_ctc": False,
+                                    "submitter": "",
+                                    "first_submitted": "",
+                                    "last_updated": "",
+                                }
+                                self.wiu_records[ekey] = rec
+                            if not rec.get("gps"):
+                                rec["est_gps"] = [elat_f, elon_f]
+                                rec["est_radius_km"] = round(erad_km, 2)
+                                rec["est_confidence"] = str(er.get("confidence") or "low")
+                except Exception:
+                    pass
             self.last_banc_loaded_ok = True
             if loaded_count > 0 or replace_existing:
                 self.save_cache()
@@ -732,6 +778,21 @@ class WIUAddressCache:
                         return g
         return None
 
+    def get_wiu_estimated_gps(self, wiu_id: Any) -> Optional[Tuple[float, float, float, str]]:
+        """Returns (est_lat, est_lon, est_radius_km, confidence) for an unverified RF-estimated WIU, or None."""
+        key = _normalize_wiu_key(wiu_id)
+        if not key:
+            return None
+        rec = self.wiu_records.get(key)
+        if not isinstance(rec, dict):
+            return None
+        g = _parse_wiu_gps(rec.get("est_gps"))
+        if g is None:
+            return None
+        rad_km = float(rec.get("est_radius_km", 5.0) or 5.0)
+        conf = str(rec.get("est_confidence") or "low")
+        return g[0], g[1], rad_km, conf
+
     def get_suggestion_list(
         self,
         layout_elements: Dict[str, BaseElement],
@@ -767,6 +828,8 @@ class WIUAddressCache:
                 g = None
                 if isinstance(rec, dict):
                     g = _parse_wiu_gps(rec.get("gps"))
+                    if g is None:
+                        g = _parse_wiu_gps(rec.get("est_gps"))
                 if g is None:
                     g = layout_gps_by_wiu.get(wid_str)
                 if g is not None:
@@ -1729,6 +1792,10 @@ class InPlaceElementEditor:
     ):
         self.element = element
         self.orig_id = element.id
+        self.orig_x = element.x
+        self.orig_y = element.y
+        self._orig_x_str = str(element.x).strip()
+        self._orig_y_str = str(element.y).strip()
         self.screen_pos = screen_pos
         self.all_elements = all_elements
         self.wiu_cache = wiu_cache
@@ -1798,7 +1865,7 @@ class InPlaceElementEditor:
         if ctc_list:
             ctc_fd["tooltip"] = f"Suggested CTC address(es) for WIU {wiu_val}: {', '.join(ctc_list)}"
         else:
-            ctc_fd["tooltip"] = "CTC ID string (e.g., C12 or K21). Case-insensitive."
+            ctc_fd["tooltip"] = 'CTC ID(s): substring, comma-separated list, or r"regex" matched against packet _ctc_id_.'
 
         if self.is_newly_created and not self._ctc_user_modified:
             if ctc_list and (force_auto_fill or not ctc_fd.get("val", "").strip() or self._ctc_auto_populated):
@@ -1843,7 +1910,7 @@ class InPlaceElementEditor:
 
         self.fields = [
             {"key": "id", "label": "Element ID *", "val": el.id, "req": True, "choices": [], "tooltip": "Unique identifier for this element (e.g., T1, W1)."},
-            {"key": "label", "label": "Display Name", "val": el.label, "req": False, "choices": [], "tooltip": "Optional human-readable display name shown on the panel."},
+            {"key": "label", "label": "Display Name", "val": el.label, "req": False, "choices": [], "tooltip": "Optional display name. Use <fn+N> or <fn-N> to adjust font size (e.g. <fn+3>Main Yard)."},
             {"key": "label_pos", "label": "Label Pos (Wheel)", "val": el.label_pos, "req": True, "choices": LABEL_POSITIONS, "tooltip": "Render location for this element's text tag."},
             {"key": "x", "label": "Logical X *", "val": str(el.x), "req": True, "choices": [], "tooltip": "Logical X coordinate on the grid."},
             {"key": "y", "label": "Logical Y *", "val": str(el.y), "req": True, "choices": [], "tooltip": "Logical Y coordinate on the grid."},
@@ -1862,8 +1929,8 @@ class InPlaceElementEditor:
                 {"key": "has_occ_bit", "label": "Has HW Occ Bit (Wheel)", "val": str(el.has_occ_bit), "req": True, "choices": ["False", "True"], "tooltip": "True if this track has a dedicated hardware occupancy bit."},
                 {"key": "wiu_id", "label": "WIU ID (if HW Occ)", "val": str(el.wiu_id or ""), "req": False, "choices": wiu_choices, "tooltip": "WIU address transmitting this track's hardware occupancy bit."},
                 {"key": "occ_bit_offset", "label": "Occ Bit Offset", "val": str(el.occ_bit_offset if el.occ_bit_offset is not None else ""), "req": False, "choices": [str(i) for i in range(32)], "tooltip": "Bit index (0-31) in the WIU payload for occupancy."},
-                {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": "CTC ID string (e.g., C12 or K21). Case-insensitive."},
-                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC rules (e.g., K11 OR C11,K12 OR C12,K25). Case-insensitive."},
+                {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": 'CTC ID(s): substring, comma-separated list (e.g., up.oak, bnsf.oak), or r"regex" matched against _ctc_id_.'},
+                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). Supports !, AND, OR, XOR, LSB-LT:."},
             ])
 
         elif isinstance(el, Turnout):
@@ -1879,8 +1946,8 @@ class InPlaceElementEditor:
                 {"key": "guarded_by_signals", "label": "Guarding Signals", "val": ", ".join(el.guarded_by_signals), "req": False, "choices": sig_choices, "tooltip": "IDs of signals directly protecting this switch."},
                 {"key": "has_occ_bit", "label": "Has HW Occ Bit (Wheel)", "val": str(el.has_occ_bit), "req": True, "choices": ["False", "True"], "tooltip": "True if this switch has a dedicated hardware occupancy bit."},
                 {"key": "occ_bit_offset", "label": "Occ Bit Offset (1b)", "val": str(el.occ_bit_offset if el.occ_bit_offset is not None else ""), "req": False, "choices": [str(i) for i in range(32)], "tooltip": "Bit index (0-31) in the payload for hardware occupancy."},
-                {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": "CTC ID string (e.g., C12 or K21). Case-insensitive."},
-                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC rules (e.g., K11 OR C11,K12 OR C12,K25). Case-insensitive."},
+                {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": 'CTC ID(s): substring, comma-separated list (e.g., up.oak, bnsf.oak), or r"regex" matched against _ctc_id_.'},
+                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). Supports !, AND, OR, XOR, LSB-LT:."},
             ])
 
         elif isinstance(el, Signal):
@@ -1894,8 +1961,8 @@ class InPlaceElementEditor:
                 {"key": "has_occ_bit", "label": "Has HW Occ Bit (Wheel)", "val": str(el.has_occ_bit), "req": True, "choices": ["False", "True"], "tooltip": "True if the signal mast tracks its own OS occupancy."},
                 {"key": "occ_bit_offset", "label": "Occ Bit Offset (1b)", "val": str(el.occ_bit_offset if el.occ_bit_offset is not None else ""), "req": False, "choices": [str(i) for i in range(32)], "tooltip": "Bit index for OS hardware occupancy."},
                 {"key": "signal_rules", "label": "Signal Rules / RR Override", "val": getattr(el, "signal_rules", "") or "", "req": False, "choices": ["<DEF>", "<BNSF>", "<UP>", "<NS>", "<CSX>"], "tooltip": "Signal table override e.g. <RRR> or 32:\"t:flashing_green,m:magenta,b:black\"."},
-                {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": "CTC ID string (e.g., C12 or K21). Case-insensitive."},
-                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC rules (e.g., K11 OR C11,K12 OR C12,K25). Case-insensitive."},
+                {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": 'CTC ID(s): substring, comma-separated list (e.g., up.oak, bnsf.oak), or r"regex" matched against _ctc_id_.'},
+                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). Supports !, AND, OR, XOR, LSB-LT:."},
             ])
 
         elif isinstance(el, Crossing):
@@ -2129,8 +2196,18 @@ class InPlaceElementEditor:
 
         el = self.element
         try:
-            el.x = int(round(float(vals.get("x", el.x))))
-            el.y = int(round(float(vals.get("y", el.y))))
+            x_raw = vals.get("x", str(el.x)).strip()
+            y_raw = vals.get("y", str(el.y)).strip()
+            if x_raw == getattr(self, "_orig_x_str", None):
+                el.x = self.orig_x
+            else:
+                fx = float(x_raw)
+                el.x = int(fx) if fx.is_integer() else round(fx, 4)
+            if y_raw == getattr(self, "_orig_y_str", None):
+                el.y = self.orig_y
+            else:
+                fy = float(y_raw)
+                el.y = int(fy) if fy.is_integer() else round(fy, 4)
         except ValueError:
             if not force_apply:
                 self.validation_error = "Logical X and Y must be numeric."
@@ -3819,13 +3896,17 @@ class ApexBOSCreatorApp:
         self.dragging_selection: bool = False
         self.drag_moved: bool = False
         self.drag_anchor_logical: Tuple[float, float] = (0.0, 0.0)
-        self.drag_initial_positions: Dict[str, Tuple[int, int]] = {}
+        self.drag_anchor_screen: Tuple[int, int] = (0, 0)
+        self.drag_initial_positions: Dict[str, Tuple[Any, Any]] = {}
         self._group_rot_session: Optional[Dict[str, Any]] = None
         self._shift_arrow_repeat_ts: float = 0.0
         self._shift_arrow_moved_during_hold: bool = False
 
         self.dragging_track_end: Optional[Tuple[str, int, Tuple[float, float]]] = None
         self.track_end_drag_curr_logical: Tuple[float, float] = (0.0, 0.0)
+        self.track_end_drag_start_screen: Tuple[int, int] = (0, 0)
+        self.track_end_drag_moved: bool = False
+        self._editor_open_snapshot: Optional[dict] = None
 
         self.box_selecting: bool = False
         self.box_start_screen: Tuple[int, int] = (0, 0)
@@ -4078,15 +4159,20 @@ class ApexBOSCreatorApp:
         wy = (sy - self.cam_y) / self.zoom
         return wx / LOGICAL_GRID_SCALE, wy / LOGICAL_GRID_SCALE
 
-    def _get_element_label_font(self, bold: bool = False) -> pygame.font.Font:
-        """Returns a reduced, zoom-scaled font (clamped to [7, 14]) for track, signal, and turnout names."""
-        sz = max(7, min(14, int(round(9.0 * self.zoom))))
+    def _get_adjusted_font(self, base_size: int, font_delta: int = 0, bold: bool = False) -> pygame.font.Font:
+        """Returns a cached font whose pixel size is adjusted by `font_delta` relative to `base_size`."""
+        sz = max(5, min(72, int(base_size) + int(font_delta)))
         key = (sz, bool(bold))
         if not hasattr(self, "_elem_label_font_cache"):
             self._elem_label_font_cache = {}
         if key not in self._elem_label_font_cache:
             self._elem_label_font_cache[key] = pygame.font.SysFont("Consolas,DejaVu Sans Mono,monospace", sz, bold=bold)
         return self._elem_label_font_cache[key]
+
+    def _get_element_label_font(self, bold: bool = False, font_delta: int = 0) -> pygame.font.Font:
+        """Returns a reduced, zoom-scaled font (clamped to [7, 14] before <fn+-N> delta) for track, signal, and turnout names."""
+        base_sz = max(7, min(14, int(round(9.0 * self.zoom))))
+        return self._get_adjusted_font(base_sz, font_delta=font_delta, bold=bold)
 
     def _get_label_rect(self, sx: int, sy: int, w: int, h: int, pos: str, offset: int) -> Tuple[int, int]:
         p = str(pos).lower()
@@ -4226,6 +4312,8 @@ class ApexBOSCreatorApp:
         self.crank_engine()
         self.last_placed_element_id = new_id
 
+        self._clear_canvas_interaction_state()
+        self._editor_open_snapshot = None
         self.selected_ids = {new_id}
         self.inplace_editor = InPlaceElementEditor(
             element=el, screen_pos=screen_pos, all_elements=self.engine.elements,
@@ -4243,14 +4331,48 @@ class ApexBOSCreatorApp:
             self.specified_gps = parsed_g
             self.gps_specified = True
 
+    def _clear_canvas_interaction_state(self):
+        """Resets all transient canvas drag/selection/pan state so modal open/close never moves elements."""
+        self.dragging_selection = False
+        self.drag_moved = False
+        self.drag_initial_positions = {}
+        self.dragging_track_end = None
+        self.track_end_drag_moved = False
+        self.box_selecting = False
+        self.is_panning = False
+
+    def _cancel_inplace_editor(self):
+        """Closes the Details/Configuration panel without modifying the element's position or attributes."""
+        ed = self.inplace_editor
+        if not ed:
+            return
+        if ed.is_newly_created:
+            self.engine.elements.pop(ed.element.id, None)
+            self.selected_ids.discard(ed.element.id)
+            if self.undo_stack:
+                self.undo_stack.pop()
+            self.status_toast = f"Cancelled creation of '{ed.element.id}'."
+        else:
+            snap = getattr(self, "_editor_open_snapshot", None)
+            if snap is not None:
+                self._restore_snapshot(snap)
+                if self.undo_stack:
+                    self.undo_stack.pop()
+                self.crank_engine()
+        self.inplace_editor = None
+        self._editor_open_snapshot = None
+        self._clear_canvas_interaction_state()
+
     def _apply_track_endpoint_drag(self, trk: TrackSegment, fixed_pt: Tuple[float, float], drag_pt: Tuple[float, float], finalize_subdivision: bool = False):
         pts = LayoutTopologyAssistant.compute_45deg_polyline(fixed_pt, drag_pt)
         p_start, p_mid = pts[0], pts[1]
         dx1, dy1 = p_mid[0] - p_start[0], p_mid[1] - p_start[1]
         dist1 = max(0.8, math.hypot(dx1, dy1))
 
-        trk.x = int(round((p_start[0] + p_mid[0]) / 2.0))
-        trk.y = int(round((p_start[1] + p_mid[1]) / 2.0))
+        mid_x = round(((p_start[0] + p_mid[0]) / 2.0) * 2.0) / 2.0
+        mid_y = round(((p_start[1] + p_mid[1]) / 2.0) * 2.0) / 2.0
+        trk.x = int(mid_x) if mid_x.is_integer() else mid_x
+        trk.y = int(mid_y) if mid_y.is_integer() else mid_y
         trk.orientation = LayoutTopologyAssistant.vector_to_track_orientation(dx1, dy1)
         trk.length_miles = max(0.1, round(dist1 / LayoutTopologyAssistant.LOGICAL_UNITS_PER_MILE, 2))
 
@@ -4260,7 +4382,10 @@ class ApexBOSCreatorApp:
             dist2 = math.hypot(dx2, dy2)
             if dist2 >= 1.5:
                 new_id = self._generate_unique_id("track")
-                cx2, cy2 = int(round((p_mid[0] + p_end[0]) / 2.0)), int(round((p_mid[1] + p_end[1]) / 2.0))
+                mx2 = round(((p_mid[0] + p_end[0]) / 2.0) * 2.0) / 2.0
+                my2 = round(((p_mid[1] + p_end[1]) / 2.0) * 2.0) / 2.0
+                cx2 = int(mx2) if mx2.is_integer() else mx2
+                cy2 = int(my2) if my2.is_integer() else my2
                 orient2 = LayoutTopologyAssistant.vector_to_track_orientation(dx2, dy2)
                 len_mi2 = max(0.1, round(dist2 / LayoutTopologyAssistant.LOGICAL_UNITS_PER_MILE, 2))
                 cdir = LayoutTopologyAssistant.vector_to_compass(dx2, dy2)
@@ -4298,8 +4423,10 @@ class ApexBOSCreatorApp:
             id_remap[old_id] = new_id
             c_item = copy.deepcopy(item)
             c_item["id"] = new_id
-            c_item["x"] = int(c_item.get("x", 0)) + 3
-            c_item["y"] = int(c_item.get("y", 0)) + 2
+            px_val = float(c_item.get("x", 0)) + 3.0
+            py_val = float(c_item.get("y", 0)) + 2.0
+            c_item["x"] = int(px_val) if px_val.is_integer() else round(px_val, 4)
+            c_item["y"] = int(py_val) if py_val.is_integer() else round(py_val, 4)
             new_configs.append(c_item)
 
         type_map = {"track": TrackSegment, "turnout": Turnout, "signal": Signal, "crossing": Crossing, "base": BaseRadio, "track_jump": TrackJump, "ptc_datetime": PTCDateTime, "date_time": PTCDateTime, "datetime": PTCDateTime}
@@ -4853,19 +4980,39 @@ class ApexBOSCreatorApp:
         now = time.time()
         el._last_packet_ts = now
         if isinstance(el, TrackSegment):
-            if not el._hw_occupied and not el._inferred_occupied:
-                el._hw_occupied = True; el._train_direction = "E"
+            is_occ = bool(el._hw_occupied or el._inferred_occupied)
+            is_oos = bool(getattr(el, "_out_of_service", False))
+            # Cycle: Empty -> Occupied -> OOS Empty -> OOS Occupied -> Empty
+            if not is_oos and not is_occ:
+                el._hw_occupied = True
+                el._inferred_occupied = False
+                el._out_of_service = False
+                el._train_direction = "E"
                 self.engine.record_train_sighting(el.id, now, "E")
-            elif el._hw_occupied and el._train_direction == "E":
-                el._train_direction = "W"
-                self.engine.record_train_sighting(el.id, now, "W")
-            elif el._hw_occupied:
-                if self.enable_inference_logic:
-                    el._hw_occupied = False; el._inferred_occupied = True; el._inferred_timestamp = now + 3600.0; el._train_direction = "E"
-                else:
-                    el._hw_occupied = False; el._inferred_occupied = False; el._train_direction = None; el._estimated_speed_mph = None; el._train_name = None
+                self.status_toast = f"SIM: Track '{el.id}' -> OCCUPIED"
+            elif not is_oos and is_occ:
+                el._hw_occupied = False
+                el._inferred_occupied = False
+                el._out_of_service = True
+                el._train_direction = None
+                el._estimated_speed_mph = None
+                el._train_name = None
+                self.status_toast = f"SIM: Track '{el.id}' -> OOS EMPTY"
+            elif is_oos and not is_occ:
+                el._hw_occupied = True
+                el._inferred_occupied = False
+                el._out_of_service = True
+                el._train_direction = "E"
+                self.engine.record_train_sighting(el.id, now, "E")
+                self.status_toast = f"SIM: Track '{el.id}' -> OOS OCCUPIED"
             else:
-                el._hw_occupied = False; el._inferred_occupied = False; el._train_direction = None; el._estimated_speed_mph = None; el._train_name = None
+                el._hw_occupied = False
+                el._inferred_occupied = False
+                el._out_of_service = False
+                el._train_direction = None
+                el._estimated_speed_mph = None
+                el._train_name = None
+                self.status_toast = f"SIM: Track '{el.id}' -> EMPTY"
         elif isinstance(el, Turnout):
             if el._state == 0 and not el._hw_occupied: el._state = 1
             elif el._state == 1 and not el._hw_occupied:
@@ -5445,6 +5592,13 @@ class ApexBOSCreatorApp:
                     self.gps_picker_modal.zoom_at_point(mx, my, 1 if event.y > 0 else -1)
                     continue
 
+                if self.inplace_editor:
+                    for idx, r in enumerate(self.inplace_editor.field_rects):
+                        if r.collidepoint(mx, my):
+                            self.inplace_editor.cycle_field_by_wheel(idx, 1 if event.y > 0 else -1)
+                            break
+                    continue
+
                 mods = pygame.key.get_mods()
                 if (mods & pygame.KMOD_SHIFT) or (mods & pygame.KMOD_LSHIFT) or (mods & pygame.KMOD_RSHIFT):
                     direction = 1 if event.y > 0 else -1
@@ -5452,12 +5606,7 @@ class ApexBOSCreatorApp:
                         self.status_toast = "Select a track or multiple elements to rotate in 45° increments (Shift + Scroll)."
                     continue
 
-                if self.inplace_editor:
-                    for idx, r in enumerate(self.inplace_editor.field_rects):
-                        if r.collidepoint(mx, my):
-                            self.inplace_editor.cycle_field_by_wheel(idx, 1 if event.y > 0 else -1)
-                            break
-                elif self._train_board_panel_rect.width > 0 and self._train_board_panel_rect.collidepoint(mx, my):
+                if self._train_board_panel_rect.width > 0 and self._train_board_panel_rect.collidepoint(mx, my):
                     page_step = max(1, self._train_board_avail_rows)
                     delta = -2 if event.y > 0 else 2
                     max_scroll = max(0, self._train_board_total_items - page_step)
@@ -5886,6 +6035,10 @@ class ApexBOSCreatorApp:
                 self._update_file_prompt_suggestions()
                 return
             mode = self.file_prompt_mode
+            if mode == "save_as" and not target_path:
+                # Force the user to specify a filename rather than silently dismissing or saving empty
+                self.status_toast = "Please enter a filename to save (Esc to cancel)."
+                return
             self.file_prompt_mode = None
             self.file_prompt_suggestions = []
             self.file_prompt_selected_idx = -1
@@ -6608,12 +6761,7 @@ class ApexBOSCreatorApp:
         if not ed: return
 
         if event.key == pygame.K_ESCAPE:
-            if ed.is_newly_created:
-                self.engine.elements.pop(ed.element.id, None)
-                self.selected_ids.discard(ed.element.id)
-                if self.undo_stack: self.undo_stack.pop()
-                self.status_toast = f"Cancelled creation of '{ed.element.id}'."
-            self.inplace_editor = None
+            self._cancel_inplace_editor()
             return
 
         if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
@@ -6624,6 +6772,8 @@ class ApexBOSCreatorApp:
                 self.dirty = True
                 self.crank_engine()
                 self.inplace_editor = None
+                self._editor_open_snapshot = None
+                self._clear_canvas_interaction_state()
                 self.status_toast = f"Updated '{ed.element.id}' and cranked engine."
             return
 
@@ -6726,6 +6876,8 @@ class ApexBOSCreatorApp:
             if sel_id in self.engine.elements:
                 el = self.engine.elements[sel_id]
                 self.status_toast = f"Opening edit panel for '{sel_id}'..."
+                self._clear_canvas_interaction_state()
+                self._editor_open_snapshot = self._capture_snapshot()
                 self.push_undo_state()
                 self.selected_ids = {sel_id}
                 sx, sy = self.logical_to_screen(float(el.x), float(el.y))
@@ -6907,6 +7059,8 @@ class ApexBOSCreatorApp:
                             self.dirty = True
                             self.crank_engine()
                             self.inplace_editor = None
+                            self._editor_open_snapshot = None
+                            self._clear_canvas_interaction_state()
                     elif bkey == "auto_adj":
                         if self.inplace_editor.element.elem_type not in SYSTEM_LIST_TYPES:
                             LayoutTopologyAssistant.auto_suggest_connections(self.inplace_editor.element, self.engine.elements)
@@ -6914,14 +7068,12 @@ class ApexBOSCreatorApp:
                     elif bkey == "gps":
                         self._open_gps_picker_for_editor()
                     elif bkey == "cancel":
-                        if self.inplace_editor.is_newly_created:
-                            self.engine.elements.pop(self.inplace_editor.element.id, None)
-                            self.selected_ids.discard(self.inplace_editor.element.id)
-                            if self.undo_stack: self.undo_stack.pop()
-                        self.inplace_editor = None
+                        self._cancel_inplace_editor()
                     elif bkey == "split":
                         split_id = self.inplace_editor.element.id
                         self.inplace_editor = None
+                        self._editor_open_snapshot = None
+                        self._clear_canvas_interaction_state()
                         self.split_selected_track(split_id)
                         return
                     elif bkey == "copy_hex":
@@ -7043,17 +7195,39 @@ class ApexBOSCreatorApp:
                 return
 
             handle_hit = self.pick_track_endpoint_handle_at_screen(mx, my)
+            now = time.time()
             if handle_hit and self.active_tool == "select":
                 trk_id, end_idx, fixed_pt = handle_hit
-                self.push_undo_state()
+                if trk_id == self.last_click_id and (now - self.last_click_time) < 0.35 and trk_id in self.engine.elements:
+                    el = self.engine.elements[trk_id]
+                    self._clear_canvas_interaction_state()
+                    self._editor_open_snapshot = self._capture_snapshot()
+                    self.push_undo_state()
+                    self.selected_ids = {trk_id}
+                    self.inplace_editor = InPlaceElementEditor(
+                        element=el,
+                        screen_pos=(mx, my),
+                        all_elements=self.engine.elements,
+                        wiu_cache=self.wiu_cache,
+                        get_last_gps_cb=lambda: self.last_selected_gps,
+                        set_last_gps_cb=self._update_last_selected_gps,
+                        default_radius=self.default_radius,
+                        is_newly_created=False,
+                        get_ref_gps_cb=lambda el_ref=el: self.get_active_ref_gps(el_ref),
+                    )
+                    self.status_toast = f"Opened editor for '{trk_id}'."
+                    self.last_click_time = 0.0
+                    return
+                self.last_click_id = trk_id
+                self.last_click_time = now
                 self.selected_ids = {trk_id}
                 self.dragging_track_end = (trk_id, end_idx, fixed_pt)
                 self.track_end_drag_curr_logical = self.screen_to_logical(mx, my)
-                self.status_toast = f"Dragging endpoint of '{trk_id}' (45° snap + auto-sectioning enabled)..."
+                self.track_end_drag_start_screen = (mx, my)
+                self.track_end_drag_moved = False
                 return
 
             hit_id = self.pick_element_at_screen(mx, my)
-            now = time.time()
 
             if hit_id and hit_id in self.engine.elements:
                 el = self.engine.elements[hit_id]
@@ -7063,6 +7237,8 @@ class ApexBOSCreatorApp:
 
                 if hit_id == self.last_click_id and (now - self.last_click_time) < 0.35:
                     self.status_toast = f"Opening edit panel for '{hit_id}'..."
+                    self._clear_canvas_interaction_state()
+                    self._editor_open_snapshot = self._capture_snapshot()
                     self.push_undo_state()
                     self.selected_ids = {hit_id}
                     self.inplace_editor = InPlaceElementEditor(
@@ -7093,6 +7269,7 @@ class ApexBOSCreatorApp:
                 self.dragging_selection = True
                 self.drag_moved = False
                 self.drag_anchor_logical = self.screen_to_logical(mx, my)
+                self.drag_anchor_screen = (mx, my)
                 self.drag_initial_positions = {
                     sid: (self.engine.elements[sid].x, self.engine.elements[sid].y)
                     for sid in self.selected_ids if sid in self.engine.elements
@@ -7123,16 +7300,21 @@ class ApexBOSCreatorApp:
                     self.status_toast = f"Picked GPS ({lat_v:.6f}, {lon_v:.6f})."
             return
         if event.button == 1:
-            if self.inplace_editor and getattr(self.inplace_editor, 'is_dragging', False):
-                self.inplace_editor.is_dragging = False
+            if self.inplace_editor:
+                if getattr(self.inplace_editor, 'is_dragging', False):
+                    self.inplace_editor.is_dragging = False
+                self._clear_canvas_interaction_state()
+                return
 
             if self.dragging_track_end:
                 trk_id, _, fixed_pt = self.dragging_track_end
-                trk = self.engine.elements.get(trk_id)
-                if isinstance(trk, TrackSegment):
-                    self._apply_track_endpoint_drag(trk, fixed_pt, self.track_end_drag_curr_logical, finalize_subdivision=True)
+                if getattr(self, "track_end_drag_moved", False):
+                    trk = self.engine.elements.get(trk_id)
+                    if isinstance(trk, TrackSegment):
+                        self._apply_track_endpoint_drag(trk, fixed_pt, self.track_end_drag_curr_logical, finalize_subdivision=True)
+                    self.crank_engine()
                 self.dragging_track_end = None
-                self.crank_engine()
+                self.track_end_drag_moved = False
 
             if self.dragging_selection:
                 if self.drag_moved:
@@ -7176,12 +7358,21 @@ class ApexBOSCreatorApp:
                 gm.center_lat, gm.center_lon = gm.tile_mgr.world_px_to_latlon(sx - dx, sy - dy, gm.zoom)
             return
         mx, my = event.pos
-        if self.inplace_editor and getattr(self.inplace_editor, 'is_dragging', False):
-            self.inplace_editor.px = mx + self.inplace_editor.drag_offset[0]
-            self.inplace_editor.py = my + self.inplace_editor.drag_offset[1]
+        if self.inplace_editor:
+            if getattr(self.inplace_editor, 'is_dragging', False):
+                self.inplace_editor.px = mx + self.inplace_editor.drag_offset[0]
+                self.inplace_editor.py = my + self.inplace_editor.drag_offset[1]
             return
 
         if self.dragging_track_end:
+            sx0, sy0 = getattr(self, "track_end_drag_start_screen", (mx, my))
+            if not getattr(self, "track_end_drag_moved", False):
+                if math.hypot(mx - sx0, my - sy0) < 5.0:
+                    return
+                self.push_undo_state()
+                self.track_end_drag_moved = True
+                trk_id_dbg = self.dragging_track_end[0]
+                self.status_toast = f"Dragging endpoint of '{trk_id_dbg}' (45° snap + auto-sectioning enabled)..."
             trk_id, _, fixed_pt = self.dragging_track_end
             mlx, mly = self.screen_to_logical(mx, my)
             self.track_end_drag_curr_logical = (round(mlx * 2.0) / 2.0, round(mly * 2.0) / 2.0)
@@ -7189,18 +7380,23 @@ class ApexBOSCreatorApp:
             if isinstance(trk, TrackSegment):
                 self._apply_track_endpoint_drag(trk, fixed_pt, self.track_end_drag_curr_logical, finalize_subdivision=False)
         elif self.dragging_selection and self.selected_ids:
+            if not self.drag_moved:
+                sx0, sy0 = getattr(self, "drag_anchor_screen", (mx, my))
+                if math.hypot(mx - sx0, my - sy0) < 5.0:
+                    return
             mlx, mly = self.screen_to_logical(mx, my)
             dx = round((mlx - self.drag_anchor_logical[0]) * 2.0) / 2.0
             dy = round((mly - self.drag_anchor_logical[1]) * 2.0) / 2.0
             if (dx != 0 or dy != 0) and not self.drag_moved:
                 self.push_undo_state()
                 self.drag_moved = True
-            for sid, (ox, oy) in self.drag_initial_positions.items():
-                if sid in self.engine.elements:
-                    nx = round((float(ox) + float(dx)) * 2.0) / 2.0
-                    ny = round((float(oy) + float(dy)) * 2.0) / 2.0
-                    self.engine.elements[sid].x = int(nx) if nx.is_integer() else nx
-                    self.engine.elements[sid].y = int(ny) if ny.is_integer() else ny
+            if self.drag_moved:
+                for sid, (ox, oy) in self.drag_initial_positions.items():
+                    if sid in self.engine.elements:
+                        nx = round((float(ox) + float(dx)) * 2.0) / 2.0
+                        ny = round((float(oy) + float(dy)) * 2.0) / 2.0
+                        self.engine.elements[sid].x = int(nx) if nx.is_integer() else nx
+                        self.engine.elements[sid].y = int(ny) if ny.is_integer() else ny
         elif self.box_selecting:
             self.box_curr_screen = (mx, my)
         elif self.is_panning:
@@ -7300,8 +7496,54 @@ class ApexBOSCreatorApp:
     # -----------------------------------------------------------------
     # Rendering 
     # -----------------------------------------------------------------
+    def _draw_dotted_line(
+        self,
+        color: Tuple[int, int, int],
+        s0: Tuple[int, int],
+        s1: Tuple[int, int],
+        line_w: int,
+    ):
+        """Draws a crisp dotted/dashed line segment between s0 and s1 (used for Out-of-Service tracks)."""
+        x0, y0 = s0
+        x1, y1 = s1
+        dx = x1 - x0
+        dy = y1 - y0
+        length = math.hypot(dx, dy)
+        if length < 2.0:
+            pygame.draw.line(self.screen, color, s0, s1, line_w)
+            return
+        ux = dx / length
+        uy = dy / length
+        dot_len = max(3.0, 4.0 * self.zoom)
+        step_len = max(7.0, 9.5 * self.zoom)
+        draw_line = pygame.draw.line
+        screen = self.screen
+        t = 0.0
+        while t < length:
+            t_end = min(length, t + dot_len)
+            draw_line(
+                screen,
+                color,
+                (int(x0 + ux * t), int(y0 + uy * t)),
+                (int(x0 + ux * t_end), int(y0 + uy * t_end)),
+                line_w,
+            )
+            t += step_len
+
+    def _draw_oos_center_badge(self, sx: int, sy: int, is_occupied: bool):
+        """Draws centered 'OOS' letters at the midpoint of an Out-of-Service track segment."""
+        oos_font = self._get_element_label_font(bold=True)
+        txt_col = COLOR_TRACK_RED if is_occupied else COLOR_TRACK_WHITE
+        oos_surf = self._render_cached_text(oos_font, "OOS", txt_col)
+        ow, oh = oos_surf.get_width(), oos_surf.get_height()
+        bg_rect = pygame.Rect(sx - ow // 2 - 3, sy - oh // 2 - 1, ow + 6, oh + 2)
+        pygame.draw.rect(self.screen, COLOR_BG, bg_rect, border_radius=2)
+        self.screen.blit(oos_surf, (sx - ow // 2, sy - oh // 2))
+
     def _track_color(self, el_dict: dict, flash_on: bool) -> Tuple[int, int, int]:
         if el_dict.get("collision_warning"): return COLOR_TRACK_RED if flash_on else COLOR_TRACK_FLASH_DARK_RED
+        if el_dict.get("out_of_service"):
+            return COLOR_TRACK_RED if (el_dict.get("occupied") or el_dict.get("hw_occupied") or el_dict.get("inferred_occupied")) else COLOR_TRACK_WHITE
         if el_dict.get("hw_occupied"): return COLOR_TRACK_RED
         if el_dict.get("is_dimmed"): return (110, 115, 125)
         if el_dict.get("inferred_occupied"): return COLOR_TRACK_INFERRED
@@ -7513,9 +7755,12 @@ class ApexBOSCreatorApp:
                 is_vis = self._is_seg_visible(s0, s1, margin=120)
                 if is_vis and self._is_seg_visible(s0, s1, margin=60):
                     visible_track_screen_pts.append((s0, s1))
-                    pygame.draw.line(self.screen, col1, s0, s1, line_w)
-                    if col1 == COLOR_TRACK_GREEN and el.get("green_path_dir"):
-                        self._draw_track_bar_arrows(s0, s1, el["green_path_dir"])
+                    if el.get("out_of_service"):
+                        self._draw_dotted_line(col1, s0, s1, line_w)
+                    else:
+                        pygame.draw.line(self.screen, col1, s0, s1, line_w)
+                        if col1 == COLOR_TRACK_GREEN and el.get("green_path_dir"):
+                            self._draw_track_bar_arrows(s0, s1, el["green_path_dir"])
 
                 if not is_vis:
                     continue
@@ -7638,9 +7883,13 @@ class ApexBOSCreatorApp:
                     if not is_sel and not self._is_point_visible(sx, sy, margin_x=80, margin_y=80):
                         continue
 
-            label = el.get("label", "")
+            raw_label = el.get("label", "")
+            label, fn_delta = parse_label_font_tag(raw_label)
             disp_tag = f"{eid} ({label})" if label else eid
             lpos = el.get("label_pos", "top")
+            el_font_reg = self._get_element_label_font(bold=False, font_delta=fn_delta) if (fn_delta and self.show_labels) else (self._get_adjusted_font(12, font_delta=fn_delta, bold=False) if fn_delta else lbl_font_reg)
+            el_font_bold = self._get_element_label_font(bold=True, font_delta=fn_delta) if (fn_delta and self.show_labels) else (self._get_adjusted_font(12, font_delta=fn_delta, bold=True) if fn_delta else lbl_font_bold)
+            el_font_sm = self._get_adjusted_font(12, font_delta=fn_delta, bold=False) if fn_delta else self.font_sm
 
             if is_sel and etype not in SYSTEM_LIST_TYPES:
                 pygame.draw.circle(self.screen, COLOR_SELECT_RING, (sx, sy), int(15 * self.zoom) + 5, 2)
@@ -7666,7 +7915,7 @@ class ApexBOSCreatorApp:
                 if show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels):
                     pos_tag = el.get("position", "top")[0].upper()
                     disp_str = f"{eid}[{pos_tag}:{el.get('direction','E')}]" if self.show_labels else eid
-                    s_surf = self._render_cached_text(lbl_font_reg, disp_str, COLOR_TEXT)
+                    s_surf = self._render_cached_text(el_font_reg, disp_str, COLOR_TEXT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, s_surf.get_width(), s_surf.get_height(), lpos, r_sig + 5)
                     self.screen.blit(s_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
@@ -7677,6 +7926,9 @@ class ApexBOSCreatorApp:
                     top_y = sy - (r_sig + 2)
 
             elif etype == "track":
+                if el.get("out_of_service"):
+                    oos_occ = bool(el.get("occupied") or el.get("hw_occupied") or el.get("inferred_occupied") or el.get("collision_warning"))
+                    self._draw_oos_center_badge(sx, sy, oos_occ)
                 if draw_handles_all or is_sel or (self.dragging_track_end is not None and self.dragging_track_end[0] == eid):
                     s0, s1 = track_screen_pts[eid]
                     for end_idx, (esx, esy) in enumerate((s0, s1)):
@@ -7697,7 +7949,7 @@ class ApexBOSCreatorApp:
                 if (show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels)) and self._is_point_visible(sx, sy, 140, 50):
                     len_mi = el.get("length_miles", 0.5)
                     tk_title = f"{disp_tag} [{len_mi}mi]" if self.show_labels else disp_tag
-                    id_surf = self._render_cached_text(lbl_font_bold, tk_title, COLOR_TEXT)
+                    id_surf = self._render_cached_text(el_font_bold, tk_title, COLOR_TEXT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, id_surf.get_width(), id_surf.get_height(), lpos, int(15 * self.zoom))
                     self.screen.blit(id_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
@@ -7745,7 +7997,7 @@ class ApexBOSCreatorApp:
                 if show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels):
                     align_char = "N" if el.get("state", 0) == 0 else "R"
                     t_title = f"{disp_tag}[{align_char}]" if self.show_labels else disp_tag
-                    t_surf = self._render_cached_text(lbl_font_bold, t_title, COLOR_EDIT_ACCENT)
+                    t_surf = self._render_cached_text(el_font_bold, t_title, COLOR_EDIT_ACCENT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, t_surf.get_width(), t_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(t_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
@@ -7763,7 +8015,7 @@ class ApexBOSCreatorApp:
                 pygame.draw.line(self.screen, col, (sx - sz, sy + sz), (sx + sz, sy - sz), 3)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    c_surf = self._render_cached_text(self.font_sm, f"{disp_tag}[{gate}]", col)
+                    c_surf = self._render_cached_text(el_font_sm, f"{disp_tag}[{gate}]", col)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, c_surf.get_width(), c_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(c_surf, (lbl_x, lbl_y))
                     if lpos == "top":
@@ -7808,7 +8060,7 @@ class ApexBOSCreatorApp:
                     pygame.draw.circle(self.screen, col, (sx, sy - sz - 3), max(5, int(6.5 * self.zoom)), 1)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    b_surf = self._render_cached_text(self.font_sm, f"{disp_tag}{rad_tag}(Ch{el.get('channel')})", col)
+                    b_surf = self._render_cached_text(el_font_sm, f"{disp_tag}{rad_tag}(Ch{el.get('channel')})", col)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
                     if lpos == "top":
@@ -7821,7 +8073,7 @@ class ApexBOSCreatorApp:
                 pygame.draw.rect(self.screen, COLOR_LANDMARK, (sx - w // 2, sy - h // 2, w, h), border_radius=3)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    s_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_LANDMARK)
+                    s_surf = self._render_cached_text(el_font_sm, disp_tag, COLOR_LANDMARK)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, s_surf.get_width(), s_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(s_surf, (lbl_x, lbl_y))
                     if lpos == "top":
@@ -7835,7 +8087,7 @@ class ApexBOSCreatorApp:
                 pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy + h // 2, (sx + w // 2), sy + h // 2), 2)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    b_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_TEXT_DIM)
+                    b_surf = self._render_cached_text(el_font_sm, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
                     if lpos == "top":
@@ -7849,7 +8101,7 @@ class ApexBOSCreatorApp:
                 pygame.draw.polygon(self.screen, COLOR_LANDMARK, pts, 2)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    d_surf = self._render_cached_text(self.font_sm, disp_tag, COLOR_TEXT_DIM)
+                    d_surf = self._render_cached_text(el_font_sm, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, d_surf.get_width(), d_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(d_surf, (lbl_x, lbl_y))
                     if lpos == "top":
@@ -7859,7 +8111,11 @@ class ApexBOSCreatorApp:
 
             elif etype == "label":
                 if self.show_labels:
-                    l_font = self.font_sm if self.zoom < 0.65 else self.font_lg
+                    if fn_delta:
+                        l_base = 12 if self.zoom < 0.65 else 17
+                        l_font = self._get_adjusted_font(l_base, font_delta=fn_delta, bold=(self.zoom >= 0.65))
+                    else:
+                        l_font = self.font_sm if self.zoom < 0.65 else self.font_lg
                     l_surf = self._render_cached_text(l_font, label or eid, COLOR_LANDMARK)
                     self.screen.blit(l_surf, (sx - l_surf.get_width() // 2, sy))
 
@@ -7873,7 +8129,7 @@ class ApexBOSCreatorApp:
                 self.screen.blit(ltr_surf, (sx - ltr_surf.get_width() // 2, sy - ltr_surf.get_height() // 2))
                 if show_elem_labels or (is_sel and self.show_labels):
                     pair_tag = f"->{paired_id}" if paired_id else ""
-                    j_surf = self._render_cached_text(self.font_sm, f"{eid}[{letter}{pair_tag}]", COLOR_EDIT_ACCENT)
+                    j_surf = self._render_cached_text(el_font_sm, f"{eid}[{letter}{pair_tag}]", COLOR_EDIT_ACCENT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, j_surf.get_width(), j_surf.get_height(), lpos, rad + 4)
                     self.screen.blit(j_surf, (lbl_x, lbl_y))
                     if lpos == "top":
@@ -7889,7 +8145,7 @@ class ApexBOSCreatorApp:
                 pygame.draw.rect(clk_surf, (22, 28, 38, 220), (0, 0, w, h), border_radius=6)
                 pygame.draw.rect(clk_surf, (45, 145, 235), (0, 0, w, h), 2, border_radius=6)
                 title_txt = f"PTC CLOCK - {disp_tag}" if label else f"PTC DATE/TIME [{eid}]"
-                hdr_surf = self.font_sm.render(title_txt, True, (190, 215, 245))
+                hdr_surf = el_font_sm.render(title_txt, True, (190, 215, 245))
                 clk_surf.blit(hdr_surf, (8, 4))
                 dt_str = el.get("datetime_str") or el.get("last_datetime_str") or "--- --:--:-- UTC"
                 val_surf = self.font_md.render(dt_str, True, (100, 240, 255))

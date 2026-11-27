@@ -78,19 +78,134 @@ DEFAULT_ENGINE_PARSERS = [
     "x2_base_rules.json",
     "x01_rules.json",
     "x05_rules.json",
-    "x70_rules.json",
     "x06_rules.json",
     "x04_rules.json",
-]
-DEFAULT_SPY_RULES = [
-    "x33_rule.json",
-    "x2_base_rules.json",
-    "x01_rules.json",
-    "x05_rules.json",
+    "ctc_rules.json",
     "x70_rules.json",
-    "x06_rules.json",
-    "x04_rules.json",
 ]
+DEFAULT_SPY_RULES = list(DEFAULT_ENGINE_PARSERS)
+
+
+def _norm_rule_key(item: Any) -> str:
+    """Normalizes a parser rule path/filename to a canonical lowercase basename for deduplication."""
+    if not isinstance(item, str):
+        return ""
+    return os.path.basename(item.replace("\\", "/").strip()).lower()
+
+
+def merge_rule_list(
+    existing: Optional[List[Any]],
+    defaults: List[Any],
+    prev_defaults: Optional[List[Any]] = None,
+) -> Tuple[List[Any], List[Any]]:
+    """
+    Safely merges default parser/rule filenames into a user's existing rule list:
+      * Preserves every existing user rule and their exact relative order.
+      * Matches by normalized basename so 'config/ctc_rules.json' and 'ctc_rules.json'
+        are never duplicated.
+      * If `prev_defaults` is provided, rules that were already in `prev_defaults` but
+        are absent from `existing` are treated as intentionally removed by the user and
+        are NOT re-added.
+      * Newly introduced default rules are inserted at their strategic relative position
+        (immediately before the earliest subsequent default rule already present in
+        `existing`, e.g. inserting 'ctc_rules.json' before 'x70_rules.json'), or appended
+        if no subsequent default rule is present.
+    Returns (merged_list, added_items).
+    """
+    merged: List[Any] = copy.deepcopy(list(existing)) if isinstance(existing, list) else []
+    added: List[Any] = []
+
+    if not isinstance(defaults, list) or not defaults:
+        return merged, added
+
+    present_keys: Set[str] = set()
+    for it in merged:
+        k = _norm_rule_key(it)
+        if k:
+            present_keys.add(k)
+
+    prev_keys: Set[str] = set()
+    if isinstance(prev_defaults, list):
+        for it in prev_defaults:
+            k = _norm_rule_key(it)
+            if k:
+                prev_keys.add(k)
+
+    for d_idx, item in enumerate(defaults):
+        key = _norm_rule_key(item)
+        if key:
+            if key in present_keys:
+                continue
+            if prev_defaults is not None and key in prev_keys:
+                # Rule was already shipped in previous defaults and user removed it; respect choice.
+                continue
+        else:
+            if item in merged:
+                continue
+
+        # Find the earliest subsequent default rule that already exists in `merged`
+        # so specific rules (e.g. ctc_rules.json) are placed BEFORE generic fallbacks (e.g. x70_rules.json).
+        insert_pos: Optional[int] = None
+        for later in defaults[d_idx + 1:]:
+            later_key = _norm_rule_key(later)
+            for idx, cur in enumerate(merged):
+                if (later_key and _norm_rule_key(cur) == later_key) or (not later_key and cur == later):
+                    insert_pos = idx
+                    break
+            if insert_pos is not None:
+                break
+
+        val = copy.deepcopy(item)
+        if insert_pos is not None:
+            merged.insert(insert_pos, val)
+        else:
+            merged.append(val)
+        if key:
+            present_keys.add(key)
+        added.append(val)
+
+    return merged, added
+
+
+def resolve_default_parser_rules(
+    base_dir: Optional[str] = None,
+    defaults_path: Optional[str] = None,
+    section: str = "engine",
+) -> List[str]:
+    """
+    Returns the canonical ordered default parser/rule list for `engine` or `spy`,
+    combining built-in defaults with any newly added rules in config.defaults.json.
+    """
+    builtin = list(DEFAULT_SPY_RULES if section == "spy" else DEFAULT_ENGINE_PARSERS)
+    key = "rules" if section == "spy" else "parsers"
+    search_dir = os.path.abspath(base_dir) if base_dir else os.getcwd()
+    candidates = []
+    if defaults_path:
+        candidates.append(defaults_path)
+    candidates.append(os.path.join(search_dir, CONFIG_DEFAULTS_FILENAME))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_DEFAULTS_FILENAME))
+
+    for cp in candidates:
+        if not os.path.isfile(cp):
+            continue
+        try:
+            with open(cp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            file_list = (data.get(section) or {}).get(key)
+            if not isinstance(file_list, list) or not file_list:
+                continue
+            file_ver = parse_version(data.get("version"))
+            cur_ver = parse_version(VERSION)
+            if file_ver and cur_ver and file_ver >= cur_ver:
+                merged, _ = merge_rule_list(file_list, builtin)
+            else:
+                merged, _ = merge_rule_list(builtin, file_list)
+            return merged
+        except Exception:
+            continue
+    return builtin
 
 
 
@@ -244,6 +359,195 @@ def extract_sdr_regions_from_config(cfg: Any) -> Dict[str, Dict[str, float]]:
                 "radius_km": round(clean["region_radius_mi"] * MILES_TO_KM, 2),
             }
     return out
+
+
+PRIVATE_LOC_GRID_DEG = 0.0025  # ~275 m quantization for opt-in private server localization
+
+
+def sanitize_private_sdr_sensor(section: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Validates optional opt-in private localization anchor fields (`loc_optin`, `loc_lat`, `loc_lon`).
+    Returns None unless `loc_optin` is explicitly True and coordinates are valid.
+    Quantizes coordinates to ~275 m (`0.0025 deg`) so exact street address is never persisted.
+    """
+    if not isinstance(section, dict) or not bool(section.get("loc_optin", False)):
+        return None
+    lat_raw = section.get("loc_lat")
+    lon_raw = section.get("loc_lon")
+    if lat_raw is None or lon_raw is None:
+        return None
+    try:
+        lat_f = float(lat_raw)
+        lon_f = float(lon_raw)
+    except (ValueError, TypeError):
+        return None
+    if not (math.isfinite(lat_f) and math.isfinite(lon_f)):
+        return None
+    if not (-85.0 <= lat_f <= 85.0 and -180.0 <= lon_f <= 180.0):
+        return None
+    if lat_f == 0.0 and lon_f == 0.0:
+        return None
+    q_lat = round(round(lat_f / PRIVATE_LOC_GRID_DEG) * PRIVATE_LOC_GRID_DEG, 5)
+    q_lon = round(round(lon_f / PRIVATE_LOC_GRID_DEG) * PRIVATE_LOC_GRID_DEG, 5)
+    q_lat = max(-85.0, min(85.0, q_lat))
+    q_lon = ((q_lon + 180.0) % 360.0) - 180.0
+    return {
+        "loc_optin": True,
+        "loc_lat": q_lat,
+        "loc_lon": q_lon,
+    }
+
+
+def extract_sdr_sensors_from_config(cfg: Any) -> Dict[str, Dict[str, float]]:
+    """
+    Extracts opt-in private localization sensor anchors from unified config.json keyed by protocol:
+      - 'ptc'  <- cfg['grabber']
+      - 'atcs' <- cfg['latch']
+      - 'fred' <- cfg['fred']
+    Returns empty dict unless the user explicitly opted in (`loc_optin: True`).
+    """
+    if not isinstance(cfg, dict):
+        return {}
+    out: Dict[str, Dict[str, float]] = {}
+    for sec_name, proto_key in (("grabber", "ptc"), ("latch", "atcs"), ("fred", "fred")):
+        sec = cfg.get(sec_name)
+        clean = sanitize_private_sdr_sensor(sec)
+        if clean:
+            out[proto_key] = {
+                "lat": clean["loc_lat"],
+                "lon": clean["loc_lon"],
+            }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Cross-Platform ANSI / VT100 Terminal Capability Detection & Sanitization
+# ---------------------------------------------------------------------------
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_ansi(text: str) -> str:
+    """Removes ANSI CSI escape sequences (colors, cursor movement, screen clears) from text."""
+    return _ANSI_ESCAPE_RE.sub("", str(text or ""))
+
+
+def supports_256_color() -> bool:
+    """
+    Returns True if the active terminal reliably renders 256-color SGR codes (\\033[48;5;Nm).
+    Classic Windows conhost / older builds should prefer standard 16-color SGR codes.
+    """
+    term = str(os.environ.get("TERM") or "").strip().lower()
+    colorterm = str(os.environ.get("COLORTERM") or "").strip().lower()
+    if "256color" in term or colorterm in ("truecolor", "24bit"):
+        return True
+    if os.name == "nt":
+        if os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM") or os.environ.get("ConEmuANSI", "").upper() == "ON":
+            return True
+        try:
+            ver = sys.getwindowsversion()
+            # Windows 10 Anniversary/Creators+ (build >= 14931) supports 256/24-bit SGR when VT is active
+            return int(getattr(ver, "build", 0) or 0) >= 14931
+        except Exception:
+            return False
+    return False
+
+
+def init_terminal_mode(
+    no_tui: bool = False,
+    no_color: bool = False,
+    force_tui: bool = False,
+    force_color: bool = False,
+    announce_fallback: bool = True,
+) -> Tuple[bool, bool, str]:
+    """
+    Cross-platform ANSI/VT100 terminal capability detector and initializer.
+    Returns (use_tui, use_color, reason):
+      - Reconfigures stdout to UTF-8 (errors='replace') when available.
+      - On Windows, explicitly enables ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004)
+        on STD_OUTPUT_HANDLE and reads back GetConsoleMode to verify bit 0x0004 stuck.
+      - If the terminal cannot render ANSI control sequences (e.g., Windows Legacy Console
+        ForceV2=0, Windows 7/8, non-TTY piped stdout, or TERM=dumb), automatically switches
+        to plain text-only scroll mode: (use_tui=False, use_color=False).
+      - Respects explicit --no-tui / --no-color / NO_COLOR and --force-tui / --force-color.
+    """
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    no_color_env = bool(os.environ.get("NO_COLOR"))
+    stdout_tty = bool(hasattr(sys.stdout, "isatty") and sys.stdout.isatty())
+
+    vt_supported = False
+    reason = "unknown"
+
+    if os.name == "nt":
+        term_l = str(os.environ.get("TERM") or "").strip().lower()
+        is_msys_pty = bool(os.environ.get("MSYSTEM")) and term_l not in ("", "dumb")
+        has_vt_emulator = bool(
+            os.environ.get("WT_SESSION")
+            or os.environ.get("ANSICON")
+            or os.environ.get("ConEmuANSI", "").upper() == "ON"
+            or os.environ.get("TERM_PROGRAM")
+            or is_msys_pty
+        )
+        if stdout_tty:
+            try:
+                import ctypes
+                from ctypes import wintypes
+                kernel32 = ctypes.windll.kernel32
+                h_out = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+                mode = wintypes.DWORD()
+                if h_out and h_out != -1 and kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
+                    if (mode.value & 0x0004) == 0:
+                        kernel32.SetConsoleMode(h_out, mode.value | 0x0004)
+                    verify_mode = wintypes.DWORD()
+                    if kernel32.GetConsoleMode(h_out, ctypes.byref(verify_mode)) and (verify_mode.value & 0x0004):
+                        vt_supported = True
+                        reason = "win32_vt"
+                    else:
+                        vt_supported = False
+                        reason = "win32_legacy_console"
+                else:
+                    vt_supported = has_vt_emulator
+                    reason = "win32_pty_env" if has_vt_emulator else "win32_no_console_mode"
+            except Exception:
+                vt_supported = has_vt_emulator
+                reason = "win32_vt_fallback" if has_vt_emulator else "win32_vt_error"
+        elif is_msys_pty:
+            # Native Windows Python reports isatty()==False on Git Bash / mintty pipes
+            vt_supported = True
+            reason = "win32_msys_pty"
+        else:
+            vt_supported = False
+            reason = "non_tty"
+    else:
+        term_l = str(os.environ.get("TERM") or "").strip().lower()
+        if not stdout_tty:
+            vt_supported = False
+            reason = "non_tty"
+        elif term_l in ("", "dumb"):
+            vt_supported = False
+            reason = "dumb_term"
+        else:
+            vt_supported = True
+            reason = "posix_vt"
+
+    use_tui = True if force_tui else (False if no_tui else vt_supported)
+    use_color = True if force_color else (False if (no_color or no_color_env) else vt_supported)
+
+    if announce_fallback and (not vt_supported) and (not no_tui) and (not no_color) and (not force_tui):
+        try:
+            sys.stdout.write(
+                f"[*] Terminal does not support ANSI control sequences ({reason}) "
+                f"-> auto-switched to plain text scroll mode (--no-tui --no-color).\n"
+            )
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    return use_tui, use_color, reason
 
 
 def distribute_channels_across_workers(channel_list: List[int], worker_count: int) -> List[List[int]]:
@@ -937,6 +1241,8 @@ def generate_unified_config(
     latch_ppm: Optional[int] = None,
     fred_gain: Optional[str] = None,
     fred_ppm: Optional[int] = None,
+    parsers: Optional[List[str]] = None,
+    spy_rules: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Generates the unified configuration dictionary.
@@ -1109,6 +1415,7 @@ def generate_unified_config(
             "rtl_tcp_host": chosen_tcp_host,
             "rtl_tcp_port": chosen_tcp_port,
             "dedup_ttl": 0.4,
+            "filter_ctrl": True,
             "processes": proc_allocations,
         },
         "latch": {
@@ -1156,7 +1463,7 @@ def generate_unified_config(
             "time_scale": 360.0,
             "inferred_timeout_sec": 120,
             "train_logic_interval_sec": 7.0,
-            "parsers": list(DEFAULT_ENGINE_PARSERS),
+            "parsers": list(parsers) if parsers is not None else list(DEFAULT_ENGINE_PARSERS),
             "connections": {
                 "mcast_group": engine_mcast_grp,
                 "mcast_port": engine_mcast_prt,
@@ -1206,23 +1513,32 @@ def generate_unified_config(
             "connect_endpoints": flux_sources_str,
             "dvr_size": 2000,
             "filter_channel": "",
-            "rules": list(DEFAULT_SPY_RULES),
+            "rules": list(spy_rules) if spy_rules is not None else list(DEFAULT_SPY_RULES),
         },
         "packfig": {
             "default_rules": "signals_default.json",
         },
     }
 
-    # Optional privacy-blurred SDR reception regions (never raw GPS)
+    # Optional privacy-blurred SDR reception regions (never raw GPS unless explicit opt-in quantized ~275m)
     _clean_grab_reg = sanitize_sdr_region(grabber_region, default_radius_mi=DEFAULT_PTC_RX_RADIUS_MI)
     if _clean_grab_reg:
         cfg["grabber"].update(_clean_grab_reg)
+    _priv_grab = sanitize_private_sdr_sensor(grabber_region)
+    if _priv_grab:
+        cfg["grabber"].update(_priv_grab)
     _clean_latch_reg = sanitize_sdr_region(latch_region, default_radius_mi=DEFAULT_ATCS_RX_RADIUS_MI)
     if _clean_latch_reg:
         cfg["latch"].update(_clean_latch_reg)
+    _priv_latch = sanitize_private_sdr_sensor(latch_region)
+    if _priv_latch:
+        cfg["latch"].update(_priv_latch)
     _clean_fred_reg = sanitize_sdr_region(fred_region, default_radius_mi=DEFAULT_FRED_RX_RADIUS_MI)
     if _clean_fred_reg:
         cfg["fred"].update(_clean_fred_reg)
+    _priv_fred = sanitize_private_sdr_sensor(fred_region)
+    if _priv_fred:
+        cfg["fred"].update(_priv_fred)
 
     return cfg
 
@@ -1350,34 +1666,53 @@ def parse_version(ver: Any) -> Tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", str(ver or "")))
 
 
-def _merge_into(target: Dict[str, Any], defaults: Dict[str, Any], path: str, added: List[str]):
+def _merge_into(
+    target: Dict[str, Any],
+    defaults: Dict[str, Any],
+    path: str,
+    added: List[str],
+    prev_defaults: Optional[Dict[str, Any]] = None,
+):
+    prev_dict = prev_defaults if isinstance(prev_defaults, dict) else None
     for key, dval in defaults.items():
         here = f"{path}.{key}" if path else key
+        prev_sub = prev_dict.get(key) if prev_dict is not None else None
         if key not in target:
             target[key] = copy.deepcopy(dval)
             added.append(here)
         elif isinstance(target[key], dict) and isinstance(dval, dict):
-            _merge_into(target[key], dval, here, added)
+            _merge_into(target[key], dval, here, added, prev_sub if isinstance(prev_sub, dict) else None)
         elif key in MERGE_LIST_KEYS and isinstance(target[key], list) and isinstance(dval, list):
-            for item in dval:
-                if item not in target[key]:
-                    target[key].append(copy.deepcopy(item))
+            merged_list, new_items = merge_rule_list(
+                target[key],
+                dval,
+                prev_defaults=prev_sub if isinstance(prev_sub, list) else None,
+            )
+            if new_items:
+                target[key] = merged_list
+                for item in new_items:
                     added.append(f"{here}[+{item}]")
 
 
-def migrate_unified_config(current: Dict[str, Any], defaults: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def migrate_unified_config(
+    current: Dict[str, Any],
+    defaults: Dict[str, Any],
+    prev_defaults: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Deep-merges a user's config with the new version's defaults:
       * user values always win (scalars, lists, sections);
       * keys that are new in `defaults` are appended with their default value;
-      * list keys in MERGE_LIST_KEYS (parsers, rules) get new standard entries appended;
+      * list keys in MERGE_LIST_KEYS (parsers, rules) safely insert newly shipped entries
+        at their strategic order (e.g. ctc_rules.json before x70_rules.json) while
+        preserving all user custom rules, ordering, and intentionally removed old defaults;
       * "version" is advanced; blank secrets are filled from the shared ones or newly generated.
     Returns (merged_config, report{"added": [...], "notes": [...], "old_version", "new_version"}).
     """
     merged = copy.deepcopy(current)
     added: List[str] = []
     notes: List[str] = []
-    _merge_into(merged, defaults, "", added)
+    _merge_into(merged, defaults, "", added, prev_defaults=prev_defaults)
 
     old_version = str(current.get("version", ""))
     merged["version"] = VERSION
@@ -1470,10 +1805,13 @@ def migrate_config_file(
     defaults_path: Optional[str] = None,
     backup: bool = True,
     sync_legacy: bool = True,
+    prev_defaults_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Migrates config.json in place after an update: timestamped backup, deep merge with the new
     defaults, version bump, and re-sync of the legacy config files.
+    If `prev_defaults_path` is provided, parser/rule lists preserve intentional user removals
+    of previously shipped defaults while inserting newly shipped defaults in strategic order.
     Returns a report dict with status "no_config" | "current" | "migrated" | "error".
     """
     path = config_path or CONFIG_FILENAME
@@ -1487,7 +1825,21 @@ def migrate_config_file(
     except Exception as exc:
         return {"status": "error", "path": path, "error": str(exc)}
 
-    merged, report = migrate_unified_config(current, _load_defaults(path, defaults_path))
+    prev_defaults: Optional[Dict[str, Any]] = None
+    if prev_defaults_path and os.path.isfile(prev_defaults_path):
+        try:
+            with open(prev_defaults_path, "r", encoding="utf-8") as pf:
+                loaded_prev = json.load(pf)
+            if isinstance(loaded_prev, dict):
+                prev_defaults = loaded_prev
+        except Exception:
+            prev_defaults = None
+
+    merged, report = migrate_unified_config(
+        current,
+        _load_defaults(path, defaults_path),
+        prev_defaults=prev_defaults,
+    )
     if merged == current:
         return {"status": "current", "path": path, **report}
 

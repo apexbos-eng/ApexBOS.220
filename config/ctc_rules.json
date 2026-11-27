@@ -1,0 +1,141 @@
+[
+    {
+        "type": "u8",
+        "name": "_ptc_"
+    },
+    {
+        "type": "u16",
+        "name": "_size_"
+    },
+    {
+        "type": "u8",
+        "name": "_type_",
+        "format": "x",
+        "expected": 112
+    },
+    {
+        "type": "u8",
+        "name": "_flags_"
+    },
+    {
+        "type": "int_bits",
+        "name": "_src_",
+        "length": 24,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "_dst_",
+        "length": 24,
+        "format": "i"
+    },
+    {
+        "type": "u8",
+        "name": "_ser_no_"
+    },
+    {
+        "type": "u8",
+        "name": "_seq_"
+    },
+    {
+        "type": "int_bits",
+        "name": "_prio_",
+        "length": 4,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "_sgm_cnt_",
+        "length": 4,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "_src_n_",
+        "length": 24,
+        "format": "i"
+    },
+    {
+        "type": "int_bits",
+        "name": "_dst_n_",
+        "length": 24,
+        "format": "i"
+    },
+    {
+        "type": "skip",
+        "length": 4
+    },
+    {
+        "type": "u16",
+        "name": "_emp_size_",
+        "format": "i"
+    },
+    {
+        "type": "skip",
+        "length": 7
+    },
+    {
+        "type": "string_0",
+        "name": "_ctc_src_"
+    },
+    {
+        "type": "string_0",
+        "name": "_ctc_dst_"
+    },
+    {
+        "type": "skip",
+        "length": 1
+    },
+    {
+        "type": "u16",
+        "name": "_emp_type_",
+        "format": "X",
+        "expected_in": [7120,7121,7122,7123,7124,7125,7126,7127,7128]
+    },
+    {
+        "type": "calc",
+        "name": "_ctc_id_",
+        "expression": "_ctc_dst_ if _ctc_src_.find('ctc') >= 0 else _ctc_src_"
+    },
+    {
+        "type": "calc",
+        "name": "_kc_",
+        "expression": "'K' if _ctc_dst_.find('ctc') >= 0 else 'C'"
+    },
+    {
+        "type": "u8",
+        "name": "_emp_ver_"
+    },
+    {
+        "type": "skip",
+        "length": 8
+    },
+    {
+        "type": "u32",
+        "name": "_timestamp_"
+    },
+    {
+        "type": "skip",
+        "length": 1
+    },
+    {
+        "type": "skip",
+        "length": 4
+    },
+    {
+        "type": "int_bits",
+        "name": "_ctc_rules_",
+        "length": "end",
+        "format": "i"
+    },
+    {
+        "type": "calc",
+        "name": "_str_rules_",
+        "expression": "','.join([f'{kc}{t}{o}' for v, kc in ((_ctc_rules_, _kc_),) if v for t, b in enumerate((v & ((1 << 128) - 1)).to_bytes(16, 'little'), 1) if b for o in (1, 2, 3, 4, 5, 6, 7, 8) if b & (256 >> o)])"
+    },
+    {
+        "type": "printf",
+        "name": "_scroll_ptc_",
+        "format": "CTC EMP 0x{_emp_type_}: {_ctc_id_}: {_kc_}: {_str_rules_}"
+    }
+]

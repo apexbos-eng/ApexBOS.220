@@ -1,7 +1,7 @@
 # ApexBOS.220 Privacy Policy & Open Source Notice
 
 **Effective Date:** November 16, 2026  
-**Last Updated:** November 16, 2026  
+**Last Updated:** November 27, 2026  
 **License:** [MIT License](LICENSE)
 
 ---
@@ -22,7 +22,7 @@ Privacy and local user sovereignty are fundamental architectural principles of t
 ## 2. Information Handled by the Application
 
 ### 2.1 Over-the-Air Radio Frequency (RF) Data
-The software interfaces with software-defined radio (SDR) hardware (e.g., RTL-SDR, Airspy, HackRF) to receive publicly broadcast radio frequency transmissions on the 220–222 MHz band. These signals:
+The software interfaces with software-defined radio (SDR) hardware (e.g., RTL-SDR, SDRplay RSP1B/1A/dx/duo, Airspy, HackRF, and SoapySDR devices) to receive publicly broadcast railway radio frequency transmissions across the 220–222 MHz (PTC), 452/457 MHz (EOT/HOT/DPU/RLC), and 896/935 MHz (ATCS) bands. These signals:
 - Originate from publicly transmitting trackside and locomotive radio transceivers.
 - Are processed locally in volatile system memory (RAM) for demodulation, bit synchronization, and protocol decoding.
 - Contain equipment status telemetry (e.g., signal aspects, switch positions, mileposts, locomotive IDs); they do not contain personal identifying information of software users.
@@ -39,6 +39,11 @@ When networking features are enabled:
 - **Local Network / Multicast:** Modules such as Grabber, Flux, Engine, and Viewer communicate over local network loopback (`127.0.0.1`), local area network (LAN) interfaces, or user-specified UDP multicast groups (e.g., `224.1.1.1` or `239.1.1.1`).
 - **Cloud Banc Relays:** If you deploy or connect to a remote Banc server, telemetry bursts are transmitted over an encrypted TCP connection using your configured Fernet key and TOTP credentials. This connection is strictly direct between your client node and the Banc server endpoint you configure; no data is routed through or visible to the developer or any third party.
 - **Network Identity Hashing:** To keep whitelisted home-network identities stable across computers on the same LAN, clients locally compute a one-way 12-character SHA-256 hash of the local default gateway's MAC address (with local-only fallbacks). The raw router MAC address is never transmitted in plaintext, and no external IP/identity lookup service is contacted.
+
+### 2.4 Privacy-Preserving Multi-SDR RF Localization (`rf_localizer.py`)
+When multiple feeder stations connect to a user-hosted `ApexBOSBanc` server, optional multi-SDR RF triangulation enforces strict anti-doxxing and k-anonymity protections:
+- **Opt-In Private Sensor Anchors:** Submitting a coarse sensor coordinate is strictly opt-in during setup; server-side anchors are stored under opaque random `sensor_id`s decoupled from user identities and are **never** returned by any Banc GET API.
+- **k-Anonymity & Quantization:** Single-SDR observations (`k = 1`) never produce a published location estimate. Published estimates omit all sensor IDs, sensor coordinates, and per-SDR RSSI values, quantize output coordinates, enforce minimum containment radii, and apply anti-triangulation query rate limits and minimum query radius floors.
 
 ---
 

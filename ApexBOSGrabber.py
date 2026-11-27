@@ -239,7 +239,7 @@ def get_large_block_font():
         return LARGE_BLOCK_FONT_ASCII
 
 
-def get_failure_rate_bg_and_tag(rate):
+def get_failure_rate_bg_and_tag(rate, use_256_color: bool = True):
     """
     Returns FailureRateStyle (bg_ansi, label_str, status_color, fg_contrast) depending on failure rate:
     - rate is None: Dark neutral gray background, bold white text (-- [NO SYNC])
@@ -249,6 +249,20 @@ def get_failure_rate_bg_and_tag(rate):
     - 66.0% < rate <= 98.0%: Dark orange background, bold white text (66.1% - 98%)
     - rate > 98.0%: Red background, bold white text (>98.1%)
     """
+    if not use_256_color:
+        # Standard 16-color SGR fallback for older Windows conhost / non-256color terminals
+        if rate is None:
+            return FailureRateStyle("\033[100m", "NO SYNC", COLOR_DIM, FG_CONTRAST_WHITE)
+        elif rate <= 15.0:
+            return FailureRateStyle("\033[42m", "OPTIMAL (<15%)", COLOR_GREEN, FG_CONTRAST_WHITE)
+        elif rate <= 45.0:
+            return FailureRateStyle("\033[43m", "MODERATE (15-45%)", "\033[32m", FG_CONTRAST_BLACK)
+        elif rate <= 66.0:
+            return FailureRateStyle("\033[43m", "ELEVATED (45-66%)", COLOR_YELLOW, FG_CONTRAST_BLACK)
+        elif rate <= 98.0:
+            return FailureRateStyle("\033[41m", "HIGH (66-98%)", COLOR_YELLOW, FG_CONTRAST_WHITE)
+        else:
+            return FailureRateStyle("\033[41m", "CRITICAL (>98.1%)", COLOR_RED, FG_CONTRAST_WHITE)
     if rate is None:
         return FailureRateStyle(BG_FAIL_GRAY, "NO SYNC", COLOR_DIM, FG_CONTRAST_WHITE)
     elif rate <= 15.0:
@@ -267,6 +281,9 @@ DEFAULT_CHUNK_SIZE = 148000  # I/Q samples
 DEFAULT_CHROMA_IQ_PORT = 18099
 DEFAULT_CHROMA_CTRL_PORT = 18098
 CHROMA_WIDEBAND_RATE = 2304000  # 12 * 192 kS/s (covers full PTC Ch 97-176 cleanly)
+RTLSDR_MAX_SAFE_SAMPLE_RATE = 2496000  # 13 * 192 kS/s (max reliable RTL2832U USB rate)
+RSP_MIN_SAMPLE_RATE = 2112000  # 11 * 192 kS/s (safely above SDRplay 2.0 MS/s ADC floor)
+PASSBAND_SAFE_HALF_RATIO = 0.44  # Keep monitored channels within +/-44% of Nyquist (anti-alias guard)
 SLIDING_WINDOW_SECONDS = 60.0
 SHORT_SLIDING_WINDOW_SECONDS = 5.0
 
@@ -462,6 +479,78 @@ def calculate_optimal_center_freq(channel_list, max_bandwidth: int = DEFAULT_SAM
     cluster = [f for f in freqs if f - min(freqs) <= max_bandwidth - 25000]
     raw_cf = int(round((min(cluster) + max(cluster)) / 2.0))
     return avoid_channel_center_dc_offset(raw_cf, cluster, channel_spacing_hz=25000, grid_base_hz=217587500)
+
+
+def channels_fit_in_passband(
+    channel_list,
+    center_freq: int,
+    sample_rate: int,
+    half_ratio: float = PASSBAND_SAFE_HALF_RATIO,
+) -> bool:
+    """
+    Returns True if every channel in channel_list sits comfortably inside
+    [center_freq - sample_rate * half_ratio, center_freq + sample_rate * half_ratio]
+    with anti-aliasing edge margin.
+    """
+    if not channel_list:
+        return True
+    if not sample_rate or int(sample_rate) <= 0:
+        return False
+    half_safe = int(float(sample_rate) * float(half_ratio))
+    cf = int(center_freq)
+    return all(abs(itc_channel_frequency(ch) - cf) <= half_safe for ch in channel_list)
+
+
+def calculate_required_sample_rate(
+    channel_list,
+    base_rate: int,
+    stream_kind: str = "rtlsdr",
+    is_sdrplay: bool = False,
+    wideband_active: bool = False,
+) -> int:
+    """
+    Computes the minimum 192 kS/s-aligned SDR sample rate that accommodates all channels
+    in channel_list inside +/-44% of Nyquist (leaving generous analog/digital anti-alias
+    edge margin so edge channels do not fold or snap to a narrow sub-cluster).
+    """
+    sk = str(stream_kind or "rtlsdr").strip().lower()
+    if is_sdrplay or sk == "rsptcp":
+        min_hw = RSP_MIN_SAMPLE_RATE
+        max_hw = 3840000  # 20 * 192 kS/s
+    elif sk in ("pipe", "tcp", "rtlsdr"):
+        min_hw = 960000
+        max_hw = RTLSDR_MAX_SAFE_SAMPLE_RATE
+    elif sk == "soapy":
+        min_hw = 960000
+        max_hw = 3840000
+    else:
+        min_hw = DEFAULT_SAMPLE_RATE
+        max_hw = max(int(base_rate or DEFAULT_SAMPLE_RATE), RTLSDR_MAX_SAFE_SAMPLE_RATE)
+
+    base_r = max(DEFAULT_SAMPLE_RATE, int(base_rate or DEFAULT_SAMPLE_RATE))
+    span = 0
+    if channel_list:
+        freqs = [itc_channel_frequency(c) for c in channel_list]
+        span = max(freqs) - min(freqs)
+
+    if sk == "stdin":
+        if span + 50000 > base_r:
+            needed = int(math.ceil((span + 50000) / 192000.0) * 192000)
+        else:
+            needed = base_r
+    else:
+        if span > 0:
+            padded_span = max(span + 160000, int(math.ceil(span / (2.0 * PASSBAND_SAFE_HALF_RATIO))))
+            needed = int(math.ceil(padded_span / 192000.0) * 192000)
+        else:
+            needed = min_hw
+
+    target = max(base_r, needed, min_hw)
+    if wideband_active:
+        target = max(target, int(CHROMA_WIDEBAND_RATE))
+    if target % 192000 != 0:
+        target = int(math.ceil(target / 192000.0) * 192000)
+    return min(target, max_hw)
 
 
 def _parse_channel_token(raw_token) -> Tuple[Optional[int], bool]:
@@ -1239,6 +1328,18 @@ def fec_decode_itc_packet(packed_bytes: bytes, return_details: bool = False):
     return False, 0, b""
 
 
+DEFAULT_FILTERED_OUTBOUND_TYPES = frozenset((0x01, 0x04, 0x05))  # QSTAT/ACK (0x01), ACQ (0x04), CNTL (0x05)
+
+
+def should_filter_outbound_packet(pkt_type: int, filter_enabled: bool = True) -> bool:
+    """
+    Returns True if `pkt_type` should be withheld from ZMQ/UDP outbound transmission
+    while still being counted in Grabber statistics.
+    Filters QSTAT/ACK (0x01), ACQ (0x04), and CNTL (0x05) when enabled (default: ON).
+    """
+    return bool(filter_enabled and pkt_type in DEFAULT_FILTERED_OUTBOUND_TYPES)
+
+
 # ---------------------------------------------------------------------------
 # Telemetry Parser
 # ---------------------------------------------------------------------------
@@ -1312,8 +1413,8 @@ def extract_packet_telemetry(packet_type: int, payload: bytes) -> dict:
                 sw_map = {0: "I", 1: "N", 2: "R", 3: "X"}
                 info["switch"] = sw_map.get(sw_byte & 3, "?")
 
-        elif (packet_type == 0x70 or packet_type == 0x71 or packet_type == 0x50 or packet_type == 0x51) and len(payload) >= 6:
-            info["emsg_name"] = f"Class D type: 0x{packet_type:x}"
+        elif ((0x50 <= packet_type <= 0x5F) or (0x70 <= packet_type <= 0x7F)) and len(payload) >= 6:
+            info["emsg_name"] = f"EMP Class D (0x{packet_type:02X})"
         else:
             if len(payload) >= 3:
                 tid = (payload[0] << 16) | (payload[1] << 8) | payload[2]
@@ -1936,15 +2037,43 @@ class DirectRtlTcpSource:
             msg = bytes([cmd_id]) + struct.pack(">I", int(arg_val) & 0xFFFFFFFF)
         self.sock.sendall(msg)
 
+    def _drain_stale_buffer(self, wait_sec: float = 0.035):
+        """Discard stale pre-retune TCP bytes while preserving 2-byte I/Q sample alignment."""
+        if not self.sock:
+            return
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+        total_drained = 0
+        self.sock.setblocking(False)
+        try:
+            while True:
+                drain = self.sock.recv(65536)
+                if not drain:
+                    break
+                total_drained += len(drain)
+        except (BlockingIOError, socket.error):
+            pass
+        self.sock.setblocking(True)
+        self.sock.settimeout(2.0)
+        rem = total_drained % 2
+        if rem:
+            try:
+                self.sock.recv(2 - rem)
+            except Exception:
+                pass
+
     def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
+        rf_changed = False
         if rate is not None:
             new_r = sanitize_rtlsdr_sample_rate(int(rate))
             if new_r != self.sample_rate:
                 self.sample_rate = new_r
                 self._send_command(0x02, self.sample_rate)
-        if freq is not None:
+                rf_changed = True
+        if freq is not None and int(freq) != self.center_freq:
             self.center_freq = int(freq)
             self._send_command(0x01, self.center_freq)
+            rf_changed = True
         if gain is not None:
             self.gain_db, self.gain_tenths = parse_gain_value(gain)
             if self.gain_tenths == 0:
@@ -1962,6 +2091,8 @@ class DirectRtlTcpSource:
                 self._send_command(0x0E, 1 if self.bias_tee else 0)
             except Exception:
                 pass
+        if rf_changed:
+            self._drain_stale_buffer()
 
     def read_exact_bytes(self, byte_count: int) -> bytes:
         if not self.sock:
@@ -2026,6 +2157,7 @@ class DirectRtlSdrSource:
         self.sdr.sample_rate = hw_rate
         self.sdr.center_freq = self.center_freq
         self.sdr.freq_correction = self.ppm
+        self._apply_tuner_bandwidth()
 
         if self.gain_tenths == 0:
             self.sdr.gain = 'auto'
@@ -2039,22 +2171,50 @@ class DirectRtlSdrSource:
             except Exception:
                 pass
 
+    def _apply_tuner_bandwidth(self):
+        """Tighten R820T/R820T2 hardware analog IF filter to suppress out-of-band Nyquist aliasing."""
+        if not self.sdr:
+            return
+        bw = int(min(max(300000, int(self.sample_rate * 0.92)), 2400000))
+        try:
+            if hasattr(self.sdr, "set_bandwidth"):
+                self.sdr.set_bandwidth(bw)
+            else:
+                self.sdr.bandwidth = bw
+        except Exception:
+            pass
+
     def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
         if not self.sdr:
             return
+        rf_changed = False
         if rate is not None:
             hw_rate = sanitize_rtlsdr_sample_rate(int(rate))
             if hw_rate != self.sample_rate:
                 self.sample_rate = hw_rate
                 try:
                     self.sdr.sample_rate = self.sample_rate
-                    self._buffer.clear()
+                    self._apply_tuner_bandwidth()
+                    rf_changed = True
                 except Exception:
                     pass
         if freq is not None and int(freq) != self.center_freq:
             self.center_freq = int(freq)
             try:
                 self.sdr.center_freq = self.center_freq
+                rf_changed = True
+            except Exception:
+                pass
+        if rf_changed:
+            self._buffer.clear()
+            try:
+                if hasattr(self.sdr, "reset_buffer"):
+                    self.sdr.reset_buffer()
+            except Exception:
+                pass
+            try:
+                if hasattr(self.sdr, "read_bytes"):
+                    self.sdr.read_bytes(16384)
             except Exception:
                 pass
         if gain is not None:
@@ -2292,15 +2452,45 @@ class DirectRspTcpSource:
         except Exception:
             pass
 
+    def _drain_stale_buffer(self, wait_sec: float = 0.035):
+        """Discard stale pre-retune TCP bytes while preserving exact I/Q sample alignment."""
+        if not self.sock:
+            return
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+        self._prefetched.clear()
+        total_drained = 0
+        self.sock.setblocking(False)
+        try:
+            while True:
+                drain = self.sock.recv(65536)
+                if not drain:
+                    break
+                total_drained += len(drain)
+        except (BlockingIOError, socket.error):
+            pass
+        self.sock.setblocking(True)
+        self.sock.settimeout(2.0)
+        bps = max(2, int(self.bytes_per_sample))
+        rem = total_drained % bps
+        if rem:
+            try:
+                self._recv_exact(bps - rem)
+            except Exception:
+                pass
+
     def update_hardware_params(self, freq=None, gain=None, ppm=None, bias_tee=None, rate=None):
+        rf_changed = False
         if rate is not None:
             aligned = self._align_rsp_rate(int(rate))
             if aligned != self.sample_rate:
                 self.sample_rate = aligned
                 self._send_command(0x02, self.sample_rate)
+                rf_changed = True
         if freq is not None and int(freq) != self.center_freq:
             self.center_freq = int(freq)
             self._send_command(0x01, self.center_freq)
+            rf_changed = True
         if gain is not None:
             self.gain_db, self.gain_tenths = parse_gain_value(gain)
             self._apply_gain_commands()
@@ -2310,6 +2500,8 @@ class DirectRspTcpSource:
         if bias_tee is not None and bool(bias_tee) != self.bias_tee:
             self.bias_tee = bool(bias_tee)
             self._apply_bias_tee_command()
+        if rf_changed:
+            self._drain_stale_buffer()
 
     def read_exact_bytes(self, byte_count: int) -> bytes:
         if not self.sock:
@@ -2635,6 +2827,7 @@ def native_demod_worker(
     afc_enabled: bool = False,
     afc_limit_hz: float = 500.0,
     dedup_ttl_sec: float = 1.0,
+    filter_ctrl_packets: bool = True,
 ):
     """
     Dedicated worker process implementing native demodulation & decoding:
@@ -2686,10 +2879,12 @@ def native_demod_worker(
     channel_freq_offsets = {ch: 0.0 for ch in active_channels}
     afc_enabled = bool(afc_enabled)
     afc_limit_hz = abs(float(afc_limit_hz))
+    filter_ctrl_packets = bool(filter_ctrl_packets)
     recent_packet_cache = collections.deque(maxlen=250)
 
     total_bursts_detected = 0
     total_packets_decoded = 0
+    total_filtered_packets = 0
     total_dropped_bursts = 0
     total_samples_proc = 0
     total_banks_proc = 0
@@ -2748,6 +2943,9 @@ def native_demod_worker(
                     elif req.get("cmd") == "set_dedup":
                         if "ttl_sec" in req:
                             dedup_ttl_sec = max(0.0, float(req["ttl_sec"]))
+                    elif req.get("cmd") == "set_filter":
+                        if "enabled" in req:
+                            filter_ctrl_packets = bool(req["enabled"])
                     elif req.get("cmd") == "set_max_errors":
                         if "max_errors" in req:
                             max_sync_errors = max(0, int(req["max_errors"]))
@@ -2794,6 +2992,8 @@ def native_demod_worker(
             if chunk_center != current_center_freq:
                 current_center_freq = chunk_center
                 channelizer.reset()
+                channel_buffers_fr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
+                channel_buffers_hr = {ch: np.zeros(0, dtype=np.complex64) for ch in active_channels}
 
             bps = 4 if sample_format == "s16" else 2
             total_samples_proc += len(raw_bank) // bps
@@ -2801,7 +3001,11 @@ def native_demod_worker(
             queue_backlog = safe_queue_size(data_queue, 0)
 
             # 3. Channelize and demodulate across assigned channels with per-channel frequency offset compensation
+            nyquist_guard_hz = channelizer.input_rate * 0.485
             for ch in active_channels:
+                # Strict Nyquist guard: never alias-decode an out-of-band channel onto another channel
+                if abs(itc_channel_frequency(ch) - current_center_freq) > nyquist_guard_hz:
+                    continue
                 ch_df = channel_freq_offsets.get(ch, 0.0) if afc_enabled else 0.0
                 y_fr, y_hr = channelizer.channelize(
                     raw_bank, current_center_freq, ch, ch_freq_offset_hz=ch_df, sample_format=sample_format
@@ -2977,53 +3181,65 @@ def native_demod_worker(
                                     "crc_bad": total_crc_bad,
                                 },
                             }
-                            meta_bytes = json.dumps(metadata).encode("utf-8")
-
-                            # Determine ZMQ & UDP payloads according to no_rssi configuration
-                            if no_rssi:
-                                hex_output_bytes = pure_hex_bytes
-                                zmq_frames = [mosfet_frame, pure_hex_bytes, meta_bytes]
+                            # Check outbound filter (QSTAT/ACK 0x01, ACQ 0x04, CNTL 0x05):
+                            # Filtered packets are still counted in Grabber statistics & telemetry,
+                            # but are NOT transmitted over ZMQ or UDP.
+                            is_filtered_out = should_filter_outbound_packet(pkt_type, filter_ctrl_packets)
+                            if is_filtered_out:
+                                total_filtered_packets += 1
                             else:
-                                hex_rssi_str = f"{raw_hex_str} RSSI:{burst_rssi:.1f}"
-                                hex_output_bytes = hex_rssi_str.encode("ascii")
-                                rssi_frame = f"RSSI:{burst_rssi:.1f}".encode("ascii")
-                                zmq_frames = [mosfet_frame, hex_output_bytes, meta_bytes, rssi_frame]
+                                meta_bytes = json.dumps(metadata).encode("utf-8")
 
-                            # 1. Publish to ZMQ PUB socket
-                            if pub_socket is not None:
-                                if not pub_bound:
+                                # Determine ZMQ & UDP payloads according to no_rssi configuration
+                                if no_rssi:
+                                    hex_output_bytes = pure_hex_bytes
+                                    zmq_frames = [mosfet_frame, pure_hex_bytes, meta_bytes]
+                                else:
+                                    hex_rssi_str = f"{raw_hex_str} RSSI:{burst_rssi:.1f}"
+                                    hex_output_bytes = hex_rssi_str.encode("ascii")
+                                    rssi_frame = f"RSSI:{burst_rssi:.1f}".encode("ascii")
+                                    zmq_frames = [mosfet_frame, hex_output_bytes, meta_bytes, rssi_frame]
+
+                                # 1. Publish to ZMQ PUB socket
+                                if pub_socket is not None:
+                                    if not pub_bound:
+                                        try:
+                                            pub_socket.bind(f"tcp://*:{zmq_bind_port}")
+                                            pub_bound = True
+                                        except Exception:
+                                            pass
+                                    if pub_bound:
+                                        try:
+                                            pub_socket.send_multipart(zmq_frames, flags=zmq.NOBLOCK)
+                                        except Exception:
+                                            pass
+
+                                # 2. Transmit to UDP socket
+                                if udp_socket:
                                     try:
-                                        pub_socket.bind(f"tcp://*:{zmq_bind_port}")
-                                        pub_bound = True
+                                        udp_socket.sendto(hex_output_bytes + b"\n", ("127.0.0.1", udp_dest_port))
                                     except Exception:
                                         pass
-                                if pub_bound:
-                                    try:
-                                        pub_socket.send_multipart(zmq_frames, flags=zmq.NOBLOCK)
-                                    except Exception:
-                                        pass
 
-                            # 2. Transmit to UDP socket
-                            if udp_socket:
-                                try:
-                                    udp_socket.sendto(hex_output_bytes + b"\n", ("127.0.0.1", udp_dest_port))
-                                except Exception:
-                                    pass
-
-                            # Notify stats queue
+                            # Notify stats queue (always counted in Grabber statistics even when filtered)
                             metrics_queue.put({
                                 "type": "packet_event",
                                 "worker_idx": worker_index,
                                 "channel": ch,
+                                "freq_hz": metadata["freq_hz"],
                                 "rate": mode_label,
                                 "pkt_type": pkt_type,
                                 "desc": telemetry.get("type_name", f"Type {pkt_type:#04x}"),
                                 "rssi": burst_rssi,
                                 "snr": metadata["snr_db"],
+                                "sync_errors": sync_err,
+                                "length": len(payload),
                                 "hex": raw_hex_str,
                                 "telemetry": telemetry,
+                                "timestamp": metadata["timestamp"],
                                 "time_str": datetime.now().strftime("%H:%M:%S.%f")[:-3],
                                 "freq_offset_hz": total_burst_df,
+                                "filtered": is_filtered_out,
                             })
 
             # Periodic worker metrics report with deltas for sliding window
@@ -3057,6 +3273,7 @@ def native_demod_worker(
                     "worker_idx": worker_index,
                     "bursts": total_bursts_detected,
                     "packets": total_packets_decoded,
+                    "filtered": total_filtered_packets,
                     "dropped": total_dropped_bursts,
                     "peak_rssi": peak_burst_rssi,
                     "backlog": queue_backlog,
@@ -3153,13 +3370,14 @@ def sdr_stream_reader_worker(
     chroma_ctx = None
     chroma_xpub = None
     chroma_subs = 0
+    chroma_pkt_subs = 0
     last_chroma_send = 0.0
     chroma_meta: Dict[str, Any] = dict(initial_meta or {})
     if zmq is not None and chroma_port and int(chroma_port) > 0:
         try:
             chroma_ctx = zmq.Context()
             chroma_xpub = chroma_ctx.socket(zmq.XPUB)
-            chroma_xpub.setsockopt(zmq.SNDHWM, 2)
+            chroma_xpub.setsockopt(zmq.SNDHWM, 64)
             chroma_xpub.setsockopt(zmq.LINGER, 0)
             chroma_xpub.bind(f"tcp://127.0.0.1:{int(chroma_port)}")
         except Exception:
@@ -3214,6 +3432,20 @@ def sdr_stream_reader_worker(
             sample_format = stream.sample_format
             bytes_per_sample = stream.bytes_per_sample
             bytes_per_chunk = chunk_samples * bytes_per_sample
+
+        # Sync actual hardware sample_rate & center_freq back from initialized stream
+        if stream is not None:
+            actual_sr = getattr(stream, "sample_rate", None)
+            actual_cf = getattr(stream, "center_freq", None)
+            if actual_sr and int(actual_sr) != cur_sample_rate:
+                cur_sample_rate = int(actual_sr)
+                dec_f = max(1, cur_sample_rate // 192000)
+                target_samps = max(16384, int(round(cur_sample_rate * base_chunk_sec)))
+                align = max(256, dec_f * 256)
+                target_samps = ((target_samps + align - 1) // align) * align
+                bytes_per_chunk = target_samps * bytes_per_sample
+            if actual_cf and int(actual_cf) != center_freq:
+                center_freq = int(actual_cf)
     except Exception as e:
         metrics_queue.put({
             "type": "error",
@@ -3239,27 +3471,42 @@ def sdr_stream_reader_worker(
     try:
         while not shutdown_flag.is_set():
             # Process hardware command requests
+            rf_retuned = False
             while not control_queue.empty():
                 try:
                     cmd_obj = control_queue.get_nowait()
                     cmd = cmd_obj.get("cmd")
                     if cmd == "set_freq":
-                        center_freq = int(cmd_obj["freq"])
-                        if stream:
-                            stream.update_hardware_params(freq=center_freq)
+                        new_freq = int(cmd_obj["freq"])
+                        if new_freq != center_freq:
+                            center_freq = new_freq
+                            if stream:
+                                stream.update_hardware_params(freq=center_freq)
+                                actual_cf = getattr(stream, "center_freq", None)
+                                if actual_cf:
+                                    center_freq = int(actual_cf)
+                            rf_retuned = True
                     elif cmd == "set_rate":
                         new_rate = int(cmd_obj["rate"])
                         new_freq = int(cmd_obj["freq"]) if cmd_obj.get("freq") is not None else center_freq
-                        cur_sample_rate = new_rate
-                        center_freq = new_freq
-                        # Keep chunk duration proportional and aligned to 512 bytes & decimation factor
-                        dec_f = max(1, cur_sample_rate // 192000)
-                        target_samps = max(16384, int(round(cur_sample_rate * base_chunk_sec)))
-                        align = max(256, dec_f * 256)
-                        target_samps = ((target_samps + align - 1) // align) * align
-                        bytes_per_chunk = target_samps * bytes_per_sample
-                        if stream:
-                            stream.update_hardware_params(freq=center_freq, rate=cur_sample_rate)
+                        if new_rate != cur_sample_rate or new_freq != center_freq:
+                            cur_sample_rate = new_rate
+                            center_freq = new_freq
+                            if stream:
+                                stream.update_hardware_params(freq=center_freq, rate=cur_sample_rate)
+                                actual_sr = getattr(stream, "sample_rate", None)
+                                actual_cf = getattr(stream, "center_freq", None)
+                                if actual_sr:
+                                    cur_sample_rate = int(actual_sr)
+                                if actual_cf:
+                                    center_freq = int(actual_cf)
+                            # Keep chunk duration proportional and aligned to 512 bytes & decimation factor
+                            dec_f = max(1, cur_sample_rate // 192000)
+                            target_samps = max(16384, int(round(cur_sample_rate * base_chunk_sec)))
+                            align = max(256, dec_f * 256)
+                            target_samps = ((target_samps + align - 1) // align) * align
+                            bytes_per_chunk = target_samps * bytes_per_sample
+                            rf_retuned = True
                     elif cmd == "set_gain":
                         gain = cmd_obj["gain"]
                         g_db, g_tenths = parse_gain_value(gain)
@@ -3277,8 +3524,50 @@ def sdr_stream_reader_worker(
                         meta_upd = cmd_obj.get("meta")
                         if isinstance(meta_upd, dict):
                             chroma_meta.update(meta_upd)
+                    elif cmd == "chroma_pkt":
+                        if chroma_xpub is not None and (chroma_pkt_subs > 0 or chroma_subs > 0):
+                            pkt_meta = cmd_obj.get("meta")
+                            if isinstance(pkt_meta, dict):
+                                try:
+                                    chroma_xpub.send_multipart(
+                                        [b"PKT", json.dumps(pkt_meta).encode("utf-8")],
+                                        flags=zmq.NOBLOCK,
+                                    )
+                                except Exception:
+                                    pass
                 except queue.Empty:
                     break
+
+            if rf_retuned:
+                # Drain stale pre-retune banks so demod workers and Chroma never mix old/new tuning
+                for q in worker_queues:
+                    while True:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                        except Exception:
+                            break
+                if stream is not None and stream_kind != "stdin":
+                    try:
+                        settle_bytes = min(bytes_per_chunk, 32768 * bytes_per_sample)
+                        stream.read_exact_bytes(settle_bytes)
+                    except Exception:
+                        pass
+                try:
+                    metrics_queue.put({
+                        "type": "reader_status",
+                        "stream": stream_kind,
+                        "center_freq": center_freq,
+                        "sample_rate": cur_sample_rate,
+                        "sample_format": sample_format,
+                        "gain_db": g_db,
+                        "gain": g_tenths,
+                        "ppm": ppm,
+                        "bias_tee": bias,
+                    })
+                except Exception:
+                    pass
 
             # Drain XPUB subscription events (non-blocking) to track active Chroma listeners
             if chroma_xpub is not None:
@@ -3287,10 +3576,17 @@ def sdr_stream_reader_worker(
                     try:
                         sub_ev = chroma_xpub.recv(flags=zmq.NOBLOCK)
                         if sub_ev:
+                            topic = sub_ev[1:]
                             if sub_ev[0] == 1:
-                                chroma_subs += 1
+                                if topic in (b"", b"IQ"):
+                                    chroma_subs += 1
+                                if topic in (b"", b"PKT"):
+                                    chroma_pkt_subs += 1
                             elif sub_ev[0] == 0:
-                                chroma_subs = max(0, chroma_subs - 1)
+                                if topic in (b"", b"IQ"):
+                                    chroma_subs = max(0, chroma_subs - 1)
+                                if topic in (b"", b"PKT"):
+                                    chroma_pkt_subs = max(0, chroma_pkt_subs - 1)
                     except Exception:
                         break
                 if chroma_subs != prev_subs:
@@ -3399,9 +3695,20 @@ def sdr_stream_reader_worker(
 def init_cross_platform_terminal(no_color_flag: bool = False) -> bool:
     """
     Initializes terminal capabilities for Windows 10/11, Linux, and macOS.
-    Enables ANSI Virtual Terminal Processing on Windows if available.
+    Enables ANSI Virtual Terminal Processing on Windows with read-back verification.
     Returns True if ANSI escape sequences (colors, cursor positioning) are supported.
     """
+    try:
+        import config_loader as _cfg_term
+        _use_tui, _use_color, _ = _cfg_term.init_terminal_mode(
+            no_tui=False,
+            no_color=bool(no_color_flag),
+            announce_fallback=False,
+        )
+        return bool(_use_color)
+    except Exception:
+        pass
+
     try:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -3412,39 +3719,31 @@ def init_cross_platform_terminal(no_color_flag: bool = False) -> bool:
         return False
 
     if os.name == "nt":
-        vt_ok = False
+        if not (hasattr(sys.stdout, "isatty") and sys.stdout.isatty()):
+            return False
         try:
             import ctypes
             from ctypes import wintypes
             kernel32 = ctypes.windll.kernel32
-            # 1. Try STD_OUTPUT_HANDLE (-11)
             h_out = kernel32.GetStdHandle(-11)
             mode = wintypes.DWORD()
-            if kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
-                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-                if kernel32.SetConsoleMode(h_out, mode.value | 0x0004):
-                    vt_ok = True
-
-            # 2. Also try CONOUT$ handle directly
-            h_con = kernel32.CreateFileW("CONOUT$", 0x40000000 | 0x80000000, 2, None, 3, 0, None)
-            if h_con and h_con != -1:
-                mode_c = wintypes.DWORD()
-                if kernel32.GetConsoleMode(h_con, ctypes.byref(mode_c)):
-                    if kernel32.SetConsoleMode(h_con, mode_c.value | 0x0004):
-                        vt_ok = True
-                kernel32.CloseHandle(h_con)
+            if h_out and h_out != -1 and kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
+                if (mode.value & 0x0004) == 0:
+                    kernel32.SetConsoleMode(h_out, mode.value | 0x0004)
+                verify = wintypes.DWORD()
+                if kernel32.GetConsoleMode(h_out, ctypes.byref(verify)) and (verify.value & 0x0004):
+                    return True
         except Exception:
             pass
+        return False
 
-        # Windows Terminal (WT_SESSION) or ConEmu/VSCode terminal natively supports VT
-        if os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM"):
-            return True
-        return vt_ok
+    return bool(hasattr(sys.stdout, "isatty") and sys.stdout.isatty()) and (
+        str(os.environ.get("TERM") or "").strip().lower() not in ("", "dumb")
+    )
 
-    # Linux / macOS
-    if sys.stdout.isatty() or os.environ.get("TERM") not in (None, "", "dumb"):
-        return True
-    return False
+
+# Backwards-compatible alias used by auxiliary demodulators
+enable_ansi_colors = init_cross_platform_terminal
 
 
 class TerminalCommandListener(threading.Thread):
@@ -3866,7 +4165,23 @@ class LazyPidAutoTuner:
 class ApexBOSGrabberApplication:
     def __init__(self, cli_args):
         self.args = cli_args
-        self.use_color = init_cross_platform_terminal(cli_args.no_color)
+        req_no_tui = bool(getattr(cli_args, "no_tui", False))
+        req_no_color = bool(getattr(cli_args, "no_color", False))
+        try:
+            import config_loader as _cfg_term
+            _use_tui, _use_color, _ = _cfg_term.init_terminal_mode(
+                no_tui=req_no_tui,
+                no_color=req_no_color,
+            )
+            self.no_tui = not _use_tui
+            self.use_color = _use_color
+            self.use_256_color = bool(_use_color and _cfg_term.supports_256_color())
+        except Exception:
+            _ansi_ok = init_cross_platform_terminal(req_no_color)
+            self.use_color = _ansi_ok and (not req_no_color)
+            self.no_tui = req_no_tui or (not _ansi_ok)
+            self.use_256_color = self.use_color
+        self._last_plain_status = ""
         self.sample_rate = cli_args.rate
         self.chunk_size = cli_args.bank_size
         self.gain_db, self.gain_tenths = parse_gain_value(cli_args.gain)
@@ -3911,28 +4226,33 @@ class ApexBOSGrabberApplication:
         self.worker_count = len(self.zmq_ports)
         self.udp_ports = [cli_args.udp_port or p for p in self.zmq_ports]
 
-        # Auto-scale sample rate if channel span exceeds default rate and user did not explicitly set --rate
-        if cli_args.rate == DEFAULT_SAMPLE_RATE and span + 50000 > self.sample_rate:
-            needed_rate = int(math.ceil((span + 50000) / 192000.0) * 192000)
-            self.sample_rate = max(needed_rate, 960000)
-            self.rate_auto_scaled = True
-        else:
-            self.rate_auto_scaled = False
-
-        # Ensure sample rate is hardware-compliant for active SDR source
-        # - RTL2832U (pipe, tcp, rtlsdr): >= 960,000 S/s (multiple of 192,000)
-        # - SDRplay RSP1B/RSP1A/RSPdx/RSPduo (rsptcp, soapy driver=sdrplay): >= 2,112,000 S/s (native 2-10 MS/s ADC)
+        # Ensure sample rate is hardware-compliant and gives clean anti-alias margin around all channels:
+        # - RTL2832U (pipe, tcp, rtlsdr): 960 kS/s .. 2,496 kS/s (multiples of 192 kS/s)
+        # - SDRplay RSP1B/RSP1A/RSPdx/RSPduo (rsptcp, soapy driver=sdrplay): >= 2,112 kS/s
         self.soapy_args = str(getattr(cli_args, "soapy_args", None) or "").strip()
         is_sdrplay_hw = (self.stream_kind == "rsptcp") or (
             self.stream_kind == "soapy" and "sdrplay" in self.soapy_args.lower()
         )
-        if self.stream_kind in ("pipe", "tcp", "rtlsdr", "rsptcp", "soapy"):
-            min_hardware_rate = DirectRspTcpSource.RSP_MIN_RATE if is_sdrplay_hw else 960000
-            if self.sample_rate < min_hardware_rate:
-                self.sample_rate = min_hardware_rate
-                self.rate_auto_scaled = True
-            elif self.sample_rate % 192000 != 0:
-                self.sample_rate = int(math.ceil(self.sample_rate / 192000.0) * 192000)
+        self._is_sdrplay_hw = is_sdrplay_hw
+        if cli_args.rate == DEFAULT_SAMPLE_RATE:
+            auto_rate = calculate_required_sample_rate(
+                self.channels,
+                self.sample_rate,
+                stream_kind=self.stream_kind,
+                is_sdrplay=is_sdrplay_hw,
+                wideband_active=False,
+            )
+            self.rate_auto_scaled = (auto_rate != self.sample_rate)
+            self.sample_rate = auto_rate
+        else:
+            self.rate_auto_scaled = False
+            if self.stream_kind in ("pipe", "tcp", "rtlsdr", "rsptcp", "soapy"):
+                min_hardware_rate = RSP_MIN_SAMPLE_RATE if is_sdrplay_hw else 960000
+                if self.sample_rate < min_hardware_rate:
+                    self.sample_rate = min_hardware_rate
+                    self.rate_auto_scaled = True
+                elif self.sample_rate % 192000 != 0:
+                    self.sample_rate = int(math.ceil(self.sample_rate / 192000.0) * 192000)
 
         self.center_freq = calculate_optimal_center_freq(self.channels, max_bandwidth=self.sample_rate)
         self.base_sample_rate = int(self.sample_rate)
@@ -3995,6 +4315,7 @@ class ApexBOSGrabberApplication:
         # Dashboard metrics state
         self.total_bursts = 0
         self.total_packets = 0
+        self.total_filtered_packets = 0
         self.peak_rssi = -100.0
         self.peak_rssi_window = collections.deque()
         self.packet_timestamps = collections.deque()
@@ -4019,6 +4340,13 @@ class ApexBOSGrabberApplication:
             self.afc_enabled = bool(raw_afc)
         self.afc_limit_hz = abs(float(getattr(cli_args, "afc_limit", 500.0)))
         self.dedup_ttl = float(getattr(cli_args, "dedup_ttl", 1.0))
+
+        # Outbound packet filter for QSTAT/ACK (0x01), ACQ (0x04), CNTL (0x05) - enabled by default
+        raw_flt = getattr(cli_args, "filter_ctrl", True)
+        if isinstance(raw_flt, str):
+            self.filter_ctrl_packets = raw_flt.strip().lower() in ("1", "on", "true", "yes", "enable", "start")
+        else:
+            self.filter_ctrl_packets = bool(raw_flt)
 
         # Automatic PPM adjustment based on sliding window average frequency offset (Δf)
         # Enabled by default: evaluates every 7s, adjusting PPM ±1 until |avg Δf| < 100 Hz
@@ -4520,6 +4848,27 @@ class ApexBOSGrabberApplication:
                     self.last_auto_ppm_time = time.time()
                     self.status_banner = "Auto-PPM enabled (target: |Δf| < 100 Hz, 7s interval)"
 
+        elif cmd in ("filter", "flt", "filter-ctrl", "filter_ctrl"):
+            if len(tokens) > 1:
+                sub = tokens[1].lower()
+                if sub in ("1", "on", "true", "yes", "enable", "start"):
+                    self.filter_ctrl_packets = True
+                elif sub in ("0", "off", "false", "no", "disable", "stop"):
+                    self.filter_ctrl_packets = False
+                elif sub in ("status", "info"):
+                    st = "ON" if self.filter_ctrl_packets else "OFF"
+                    self.status_banner = f"Outbound Filter (0x01/0x04/0x05): {st} ({self.total_filtered_packets:,} filtered, all counted in stats)"
+                    return
+                else:
+                    self.status_banner = f"Invalid filter option '{tokens[1]}'. Use 'filter on' or 'filter off'"
+                    return
+            else:
+                self.filter_ctrl_packets = not self.filter_ctrl_packets
+            for q in self.worker_ctrl_queues:
+                q.put({"cmd": "set_filter", "enabled": self.filter_ctrl_packets})
+            st = "ON (withholding 0x01/0x04/0x05 from ZMQ/UDP; still counted in stats)" if self.filter_ctrl_packets else "OFF (forwarding all packet types)"
+            self.status_banner = f"Outbound Filter -> {st}"
+
         elif cmd in ("scan", "search"):
             self.status_banner = "Channel search: run 'python ApexBOSScanner.py' or 'python ApexBOSGrabber.py --scan'"
 
@@ -4527,7 +4876,7 @@ class ApexBOSGrabberApplication:
             self.shutdown_flag.set()
 
         elif cmd in ("?", "h", "help"):
-            self.status_banner = "Commands: p <ppm> | g <gain|auto> | b <0|1> | e <err> | autopm <on|off> | tune <on|off> | afc <on|off> | dedup <sec> | + <ch> | - <ch> | chans | scan | q"
+            self.status_banner = "Commands: p <ppm> | g <gain|auto> | b <0|1> | e <err> | autopm <on|off> | tune <on|off> | afc <on|off> | dedup <sec> | filter <on|off> | + <ch> | - <ch> | chans | scan | q"
 
     def _pick_channel_to_keep(self, pool: Optional[List[int]] = None) -> int:
         """
@@ -4635,18 +4984,54 @@ class ApexBOSGrabberApplication:
         return dropped
 
     def _update_pipeline_channels(self):
-        if self.wideband_active:
-            # Keep wideband center if all monitored channels fit safely inside passband
-            wb_center = 221000000
-            half_safe = int(self.sample_rate * 0.46)
-            if self.channels and all(abs(itc_channel_frequency(c) - wb_center) <= half_safe for c in self.channels):
-                new_freq = wb_center
-            else:
-                new_freq = calculate_optimal_center_freq(self.channels, max_bandwidth=self.sample_rate)
+        # Stability rule: if all monitored channels already sit comfortably inside the
+        # active SDR capture passband (+/-44% of Nyquist), NEVER retune center_freq or
+        # sample_rate. Avoiding unnecessary LO/rate retunes eliminates waterfall shifts,
+        # stale-IQ transients, and moving IF/alias images when toggling in-band channels.
+        is_sdrplay_hw = bool(getattr(self, "_is_sdrplay_hw", False)) or (
+            self.stream_kind == "rsptcp"
+            or (self.stream_kind == "soapy" and "sdrplay" in str(getattr(self, "soapy_args", "")).lower())
+        )
+        cur_rate = int(self.sample_rate)
+        cur_freq = int(self.center_freq)
+
+        if channels_fit_in_passband(self.channels, cur_freq, cur_rate):
+            target_rate = cur_rate
+            new_freq = cur_freq
         else:
-            new_freq = calculate_optimal_center_freq(self.channels, max_bandwidth=self.sample_rate)
-        if new_freq != self.center_freq:
-            self.center_freq = new_freq
+            # An edge channel sits outside the current passband: expand sample rate in
+            # 192 kS/s steps (up to hardware limit) so all channels fit with anti-alias margin.
+            req_rate = calculate_required_sample_rate(
+                self.channels,
+                getattr(self, "base_sample_rate", cur_rate),
+                stream_kind=self.stream_kind,
+                is_sdrplay=is_sdrplay_hw,
+                wideband_active=bool(self.wideband_active),
+            )
+            target_rate = max(cur_rate, req_rate)
+            if self.wideband_active and channels_fit_in_passband(self.channels, 221000000, target_rate):
+                new_freq = 221000000
+            else:
+                new_freq = calculate_optimal_center_freq(self.channels, max_bandwidth=target_rate)
+
+        rate_changed = (target_rate != cur_rate)
+        freq_changed = (new_freq != cur_freq)
+        if rate_changed:
+            self.sample_rate = int(target_rate)
+            self.center_freq = int(new_freq)
+            self.reader_ctrl_queue.put({
+                "cmd": "set_rate",
+                "rate": self.sample_rate,
+                "freq": self.center_freq,
+            })
+            for q in self.worker_ctrl_queues:
+                q.put({
+                    "cmd": "set_rate",
+                    "rate": self.sample_rate,
+                    "center_freq": self.center_freq,
+                })
+        elif freq_changed:
+            self.center_freq = int(new_freq)
             self.reader_ctrl_queue.put({"cmd": "set_freq", "freq": self.center_freq})
 
         buckets = distribute_channels_across_workers(self.channels, self.worker_count)
@@ -4703,32 +5088,33 @@ class ApexBOSGrabberApplication:
     def set_wideband_mode(self, enabled: bool) -> Tuple[bool, str]:
         """Dynamically expands Grabber sample rate to 2.304 MS/s (Ch 97-176) for Chroma, or reverts to minimal rate."""
         enabled = bool(enabled)
+        is_sdrplay_hw = bool(getattr(self, "_is_sdrplay_hw", False)) or (
+            self.stream_kind == "rsptcp"
+            or (self.stream_kind == "soapy" and "sdrplay" in str(getattr(self, "soapy_args", "")).lower())
+        )
         if enabled:
-            target_rate = max(int(self.base_sample_rate), int(CHROMA_WIDEBAND_RATE))
+            target_rate = calculate_required_sample_rate(
+                self.channels,
+                self.base_sample_rate,
+                stream_kind=self.stream_kind,
+                is_sdrplay=is_sdrplay_hw,
+                wideband_active=True,
+            )
             wb_center = 221000000
-            half_safe = int(target_rate * 0.46)
-            if self.channels and all(abs(itc_channel_frequency(c) - wb_center) <= half_safe for c in self.channels):
+            if self.channels and channels_fit_in_passband(self.channels, wb_center, target_rate):
                 target_center = wb_center
             else:
                 target_center = calculate_optimal_center_freq(self.channels, max_bandwidth=target_rate)
             self.wideband_active = True
         else:
-            # Compute minimum safe rate for active channels
-            if self.channels:
-                freqs = [itc_channel_frequency(c) for c in self.channels]
-                span = max(freqs) - min(freqs)
-                needed = int(math.ceil((span + 50000) / 192000.0) * 192000)
-                if self.stream_kind == "rsptcp" or (
-                    self.stream_kind == "soapy" and "sdrplay" in str(getattr(self, "soapy_args", "")).lower()
-                ):
-                    min_hw = DirectRspTcpSource.RSP_MIN_RATE
-                elif self.stream_kind in ("pipe", "tcp", "rtlsdr", "soapy"):
-                    min_hw = 960000
-                else:
-                    min_hw = DEFAULT_SAMPLE_RATE
-                target_rate = max(int(self.base_sample_rate), needed, min_hw)
-            else:
-                target_rate = int(self.base_sample_rate)
+            # Compute minimum safe anti-alias rate for active channels
+            target_rate = calculate_required_sample_rate(
+                self.channels,
+                self.base_sample_rate,
+                stream_kind=self.stream_kind,
+                is_sdrplay=is_sdrplay_hw,
+                wideband_active=False,
+            )
             target_center = calculate_optimal_center_freq(self.channels, max_bandwidth=target_rate)
             self.wideband_active = False
 
@@ -4883,6 +5269,7 @@ class ApexBOSGrabberApplication:
                         "bursts": m.get("bursts", 0),
                         "dropped": m.get("dropped", 0),
                         "packets": m.get("packets", 0),
+                        "filtered": m.get("filtered", 0),
                         "peak_rssi": m.get("peak_rssi", -100.0),
                         "backlog": m.get("backlog", 0),
                         "samples_proc": m.get("samples_proc", 0),
@@ -4935,6 +5322,36 @@ class ApexBOSGrabberApplication:
 
                 elif m_type == "packet_event":
                     self.total_packets += 1
+                    if m.get("filtered"):
+                        self.total_filtered_packets += 1
+                        # Forward filtered packet metadata ONLY to Chroma's gated XPUB tap (never to Flux/Engine/UDP)
+                        # so Chroma's waterfall shows every decoded signal even when 0x01/0x04/0x05 are filtered outbound.
+                        if getattr(self, "chroma_sub_count", 0) > 0 and hasattr(self, "reader_ctrl_queue"):
+                            try:
+                                ch_i = int(m.get("channel", 0) or 0)
+                                rssi_v = round(float(m.get("rssi", -100.0)), 2)
+                                self.reader_ctrl_queue.put_nowait({
+                                    "cmd": "chroma_pkt",
+                                    "meta": {
+                                        "channel": ch_i,
+                                        "freq_hz": m.get("freq_hz") or (itc_channel_frequency(ch_i) if ch_i > 0 else 0),
+                                        "freq_offset_hz": m.get("freq_offset_hz", 0.0),
+                                        "rssi_dbfs": rssi_v,
+                                        "rssi": rssi_v,
+                                        "snr_db": m.get("snr", round(max(0.0, rssi_v + 45.0), 1)),
+                                        "rate": m.get("rate", "FR"),
+                                        "type": int(m.get("pkt_type", 0) or 0),
+                                        "type_name": m.get("desc", ""),
+                                        "sync_errors": int(m.get("sync_errors", 0) or 0),
+                                        "length": int(m.get("length", 0) or 0),
+                                        "hex": m.get("hex", ""),
+                                        "timestamp": m.get("timestamp") or datetime.now().isoformat(),
+                                        "telemetry": m.get("telemetry") or {},
+                                        "filtered": True,
+                                    },
+                                })
+                            except Exception:
+                                pass
                     now_t = time.time()
                     self.packet_timestamps.append(now_t)
                     self.worker_packet_timestamps[m["worker_idx"]].append(now_t)
@@ -4964,6 +5381,18 @@ class ApexBOSGrabberApplication:
                         m.get("telemetry", {}),
                         heard_channel=m.get("channel")
                     )
+
+                    if getattr(self, "no_tui", False):
+                        t_s = m.get("time_str") or datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                        ch_s = m.get("channel", "?")
+                        rt_s = m.get("rate", "FR")
+                        desc_s = m.get("desc", f"0x{int(m.get('pkt_type', 0)):02X}")
+                        rssi_s = float(m.get("rssi", -100.0))
+                        df_s = float(m.get("freq_offset_hz", 0.0))
+                        tel = m.get("telemetry") or {}
+                        id_s = tel.get("wiu_id") or tel.get("tid") or tel.get("base_id") or tel.get("emsg_name") or ""
+                        id_part = f" | {id_s}" if id_s else ""
+                        print(f"[{t_s}] Ch {ch_s} {rt_s} | {desc_s}{id_part} | RSSI:{rssi_s:5.1f} dBFS | dF:{df_s:+6.1f} Hz", flush=True)
 
                 elif m_type == "error":
                     self.status_banner = f"ERROR: {m.get('msg')}"
@@ -5166,6 +5595,7 @@ class ApexBOSGrabberApplication:
                     self.afc_enabled,
                     self.afc_limit_hz,
                     self.dedup_ttl,
+                    self.filter_ctrl_packets,
                 ),
                 daemon=True,
             )
@@ -5210,11 +5640,21 @@ class ApexBOSGrabberApplication:
         # 2b. Start non-blocking Chroma Control ZMQ REP socket
         self._start_chroma_ctrl_socket()
 
-        # 3. Start Command Listener Thread
-        self.cmd_thread = TerminalCommandListener(self.handle_terminal_input, self.shutdown_flag, app=self)
-        self.cmd_thread.start()
+        # 3. Start Command Listener Thread (interactive TUI only)
+        if not getattr(self, "no_tui", False) and sys.stdin and sys.stdin.isatty():
+            self.cmd_thread = TerminalCommandListener(self.handle_terminal_input, self.shutdown_flag, app=self)
+            self.cmd_thread.start()
+        else:
+            self.cmd_thread = None
+            print(
+                f"[*] ApexBOSGrabber ({VERSION}) running in plain text scroll mode "
+                f"| {self.stream_kind.upper()} @ {self.center_freq/1e6:.4f} MHz "
+                f"({self.sample_rate/1e6:.3f} MS/s) | Ch: {self.channels}",
+                flush=True,
+            )
 
         last_render = time.time()
+        last_plain_hb = last_render
         try:
             while not self.shutdown_flag.is_set():
                 self.process_metrics()
@@ -5262,9 +5702,22 @@ class ApexBOSGrabberApplication:
                 # Automated PPM adjustment based on sliding window average Δf (7s interval)
                 self.step_auto_ppm(now)
 
-                if now - last_render >= 0.5:
-                    self.render_screen(now)
-                    last_render = now
+                if not getattr(self, "no_tui", False):
+                    if now - last_render >= 0.5:
+                        self.render_screen(now)
+                        last_render = now
+                else:
+                    if self.status_banner and self.status_banner != getattr(self, "_last_plain_status", ""):
+                        self._last_plain_status = self.status_banner
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Status: {self.status_banner}", flush=True)
+                    if (now - last_plain_hb) >= 30.0:
+                        last_plain_hb = now
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] Heartbeat | Pkts:{self.total_packets} "
+                            f"({len(self.packet_timestamps)}/min) | Peak:{self.peak_rssi:.1f} dBFS | "
+                            f"PPM:{self.ppm:+d} | Ch:{self.channels}",
+                            flush=True,
+                        )
 
                 time.sleep(0.05)
 
@@ -5525,7 +5978,10 @@ class ApexBOSGrabberApplication:
             + self.colorize(COLOR_BOLD, ":")
         )
         if self.use_color:
-            style = get_failure_rate_bg_and_tag(short_demod_fail_pct)
+            style = get_failure_rate_bg_and_tag(
+                short_demod_fail_pct,
+                use_256_color=getattr(self, "use_256_color", True),
+            )
             bg_code = style.bg
             status_lbl = style.tag
             status_color = style.status_color
@@ -5615,9 +6071,17 @@ class ApexBOSGrabberApplication:
             f"Unique: {self.colorize(COLOR_GREEN + COLOR_BOLD, f'{overall_ppm:,}')} Pkts/m (dedup)  |  "
             f"Raw Demod: {self.colorize(COLOR_CYAN + COLOR_BOLD, f'{win_crc_g:,}')} Pkts/m (pre-dedup)"
         )
+        flt_on = bool(getattr(self, "filter_ctrl_packets", True))
+        flt_cnt = int(getattr(self, "total_filtered_packets", 0))
+        flt_badge = (
+            self.colorize(COLOR_CYAN + COLOR_BOLD, f"ON ({flt_cnt:,} filtered)")
+            if flt_on
+            else self.colorize(COLOR_DIM, f"OFF ({flt_cnt:,} filtered)")
+        )
         lines.append(
             f"  Lifetime Unique Packets  : "
-            f"{self.colorize(COLOR_WHITE + COLOR_BOLD, f'{total_p:,}')} (deduplicated lifetime)"
+            f"{self.colorize(COLOR_WHITE + COLOR_BOLD, f'{total_p:,}')} (deduplicated)  |  "
+            f"Filter 0x01/04/05: {flt_badge}"
         )
         lines.append(self.colorize(COLOR_DIM, "-" * 80))
 
@@ -5684,11 +6148,12 @@ class ApexBOSGrabberApplication:
                 df_str = f"{raw_df:>10s}"[:10]
 
                 desc_str = f"{desc:<8s}"[:8]
-                desc_colored = self.colorize(COLOR_GREEN, desc_str)
+                desc_colored = self.colorize(COLOR_DIM if ev.get("filtered") else COLOR_GREEN, desc_str)
+                flt_tag = self.colorize(COLOR_DIM, " [FLT]") if ev.get("filtered") else ""
 
                 lines.append(
                     f"   [{t_str}] Ch {ch:3d} ({rate:>3s}) | RSSI:{rssi:5.1f} SNR:{snr:4.1f} {df_str} | "
-                    f"{desc_colored} | {self.colorize(COLOR_YELLOW, detail_str)}"
+                    f"{desc_colored} | {self.colorize(COLOR_YELLOW, detail_str)}{flt_tag}"
                 )
             for _ in range(6 - len(recent)):
                 lines.append("")
@@ -5707,7 +6172,7 @@ class ApexBOSGrabberApplication:
         lines.append(
             self.colorize(
                 COLOR_DIM,
-                "           'afc <on|off>', 'dedup <sec>', '+ <ch>', '- <ch>', 'chans', 'q' to quit"
+                "           'afc <on|off>', 'dedup <sec>', 'filter <on|off>', '+ <ch>', '- <ch>', 'chans', 'q' to quit"
             )
         )
 
@@ -5761,6 +6226,7 @@ def get_grabber_default_config() -> dict:
         "afc_limit": 500.0,
         "auto_ppm": True,
         "dedup_ttl": 1.0,
+        "filter_ctrl": True,
         "chans": None,
         "chans_file": None,
         "channel_timeout": 300.0,
@@ -5846,6 +6312,12 @@ class ApexBOSGrabberArgumentParser(argparse.ArgumentParser):
                     clean_cfg["dedup_ttl"] = clean_cfg["dedup_window"]
                 if "dedup_sec" in clean_cfg and "dedup_ttl" not in clean_cfg:
                     clean_cfg["dedup_ttl"] = clean_cfg["dedup_sec"]
+                if "filter_ctrl_packets" in clean_cfg and "filter_ctrl" not in clean_cfg:
+                    clean_cfg["filter_ctrl"] = clean_cfg["filter_ctrl_packets"]
+                if "filter_ack" in clean_cfg and "filter_ctrl" not in clean_cfg:
+                    clean_cfg["filter_ctrl"] = clean_cfg["filter_ack"]
+                if "filter_ctrl" in clean_cfg and isinstance(clean_cfg["filter_ctrl"], str):
+                    clean_cfg["filter_ctrl"] = clean_cfg["filter_ctrl"].strip().lower() in ("1", "on", "true", "yes", "enable")
                 if "rtl_port" in clean_cfg and "port" not in clean_cfg:
                     clean_cfg["port"] = clean_cfg["rtl_port"]
                 if "pyrtlsdr" in clean_cfg and "rtlsdr" not in clean_cfg:
@@ -5986,6 +6458,19 @@ def build_cli_parser():
     )
     parser.add_argument("--afc-limit", "--afc-window", "--max-afc-offset", dest="afc_limit", type=float, default=500.0, help="Maximum allowable per-channel frequency correction in Hz (default: 500.0 Hz, cap: ±500 Hz)")
     parser.add_argument("--dedup-window", "--dedup-ttl", "--dedup-sec", dest="dedup_ttl", type=float, default=1.0, help="Duplicate packet deduplication expiration window in seconds (default: 1.0s, after 1.0s duplicate is re-emitted)")
+    parser.add_argument(
+        "--filter-ctrl", "--filter-ack",
+        dest="filter_ctrl",
+        action="store_true",
+        default=True,
+        help="Filter out QSTAT/ACK (0x01), ACQ (0x04), and CNTL (0x05) from ZMQ/UDP output while still counting them in Grabber stats (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-filter-ctrl", "--no-filter", "--send-all",
+        dest="filter_ctrl",
+        action="store_false",
+        help="Disable outbound filtering and transmit QSTAT/ACK (0x01), ACQ (0x04), and CNTL (0x05) packets over ZMQ/UDP",
+    )
 
     # Channels
     parser.add_argument("--chans", default=None, help="Comma-separated channels (e.g. '101,102.,107' or '101-134'); suffix 'l', 'p', or '.' locks channel in")
@@ -6017,6 +6502,7 @@ def build_cli_parser():
         dest="dwell",
         help="Observation dwell time per channel in seconds for scan mode (--scan) (default: 2.0s)",
     )
+    parser.add_argument("--no-tui", action="store_true", help="Run in plain text scrolling log mode instead of interactive TUI")
     parser.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
     parser.add_argument("--full", action="store_true", help="Print full packet hex and details")
     parser.add_argument("--all", action="store_true", help="Print all messages including unknown transmitters")

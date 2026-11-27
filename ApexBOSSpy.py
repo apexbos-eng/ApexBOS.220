@@ -93,9 +93,20 @@ except ImportError:
 def init_cross_platform_terminal(no_color_flag: bool = False) -> bool:
     """
     Initializes terminal capabilities for Windows 10/11, Linux, and macOS.
-    Forces UTF-8 stdout encoding and enables ANSI Virtual Terminal Processing on Windows.
-    Returns True if ANSI escape sequences (colors, cursor positioning) are supported.
+    Forces UTF-8 stdout encoding and enables ANSI Virtual Terminal Processing on Windows
+    with read-back verification. Returns True if ANSI escape sequences are supported.
     """
+    try:
+        import config_loader as _cfg_term
+        _, _use_color, _ = _cfg_term.init_terminal_mode(
+            no_tui=False,
+            no_color=bool(no_color_flag),
+            announce_fallback=False,
+        )
+        return bool(_use_color)
+    except Exception:
+        pass
+
     try:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -106,40 +117,26 @@ def init_cross_platform_terminal(no_color_flag: bool = False) -> bool:
         return False
 
     if os.name == "nt":
-        vt_ok = False
+        if not (hasattr(sys.stdout, "isatty") and sys.stdout.isatty()):
+            return False
         try:
             import ctypes
             from ctypes import wintypes
             kernel32 = ctypes.windll.kernel32
-            # 1. STD_OUTPUT_HANDLE (-11)
             h_out = kernel32.GetStdHandle(-11)
             mode = wintypes.DWORD()
-            if kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
-                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-                # DISABLE_NEWLINE_AUTO_RETURN = 0x0008
-                if kernel32.SetConsoleMode(h_out, mode.value | 0x0004 | 0x0008):
-                    vt_ok = True
-
-            # 2. Also try CONOUT$ handle directly
-            h_con = kernel32.CreateFileW("CONOUT$", 0x40000000 | 0x80000000, 2, None, 3, 0, None)
-            if h_con and h_con != -1:
-                mode_c = wintypes.DWORD()
-                if kernel32.GetConsoleMode(h_con, ctypes.byref(mode_c)):
-                    if kernel32.SetConsoleMode(h_con, mode_c.value | 0x0004):
-                        vt_ok = True
-                kernel32.CloseHandle(h_con)
+            if h_out and h_out != -1 and kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
+                if (mode.value & 0x0004) == 0:
+                    kernel32.SetConsoleMode(h_out, mode.value | 0x0004)
+                verify = wintypes.DWORD()
+                if kernel32.GetConsoleMode(h_out, ctypes.byref(verify)) and (verify.value & 0x0004):
+                    return True
         except Exception:
             pass
-
-        try:
-            os.system("")
-        except Exception:
-            pass
-
-        if os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM"):
-            return True
-        return vt_ok
-    return True
+        return False
+    return bool(hasattr(sys.stdout, "isatty") and sys.stdout.isatty()) and (
+        str(os.environ.get("TERM") or "").strip().lower() not in ("", "dumb")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -414,9 +411,10 @@ DEFAULT_SPY_PARSER_RULES = [
     "x2_base_rules.json",
     "x01_rules.json",
     "x05_rules.json",
-    "x70_rules.json",
     "x06_rules.json",
     "x04_rules.json",
+    "ctc_rules.json",
+    "x70_rules.json",
 ]
 
 
@@ -443,47 +441,86 @@ class RulesRegistry:
         self._lock = threading.RLock()
         self.load_rules(self.custom_paths)
 
+    def _resolve_ordered_rule_files(self) -> Tuple[List[str], Optional[str]]:
+        """Resolves rule files in strict configured/specified order. Returns (ordered_paths, config_path_used)."""
+        candidate_files: List[str] = []
+        cfg_used: Optional[str] = None
+        paths_to_search = self.custom_paths or []
+        if paths_to_search:
+            for p in paths_to_search:
+                if os.path.isdir(p):
+                    candidate_files.extend(sorted(glob.glob(os.path.join(p, "*rule*.json"))))
+                    candidate_files.extend(sorted(glob.glob(os.path.join(p, "x*.json"))))
+                elif any(c in p for c in ("*", "?")):
+                    candidate_files.extend(sorted(glob.glob(p)))
+                elif os.path.exists(p):
+                    candidate_files.append(p)
+        else:
+            config_dir = os.path.join(PROJECT_ROOT, "config")
+            cfg_rule_entries: List[str] = []
+            for cfg_cand in (os.path.join(os.getcwd(), "config.json"), os.path.join(PROJECT_ROOT, "config.json")):
+                if os.path.exists(cfg_cand):
+                    try:
+                        with open(cfg_cand, "r", encoding="utf-8") as cf:
+                            cfg_obj = json.load(cf)
+                        if isinstance(cfg_obj, dict):
+                            eng_sub = cfg_obj.get("engine") if isinstance(cfg_obj.get("engine"), dict) else {}
+                            raw_list = eng_sub.get("parsers") if isinstance(eng_sub.get("parsers"), list) else cfg_obj.get("parsers")
+                            if isinstance(raw_list, list) and raw_list:
+                                cfg_rule_entries = [str(x) for x in raw_list if isinstance(x, str) and str(x).strip()]
+                                cfg_used = cfg_cand
+                                break
+                    except Exception:
+                        pass
+
+            search_order = cfg_rule_entries if cfg_rule_entries else list(DEFAULT_SPY_PARSER_RULES)
+            found_ordered = []
+            for fname in search_order:
+                if os.path.isabs(fname) and os.path.exists(fname):
+                    found_ordered.append(fname)
+                    continue
+                for d in (os.getcwd(), config_dir, PROJECT_ROOT):
+                    p = os.path.join(d, fname)
+                    if os.path.exists(p):
+                        found_ordered.append(p)
+                        break
+            if found_ordered:
+                candidate_files.extend(found_ordered)
+            else:
+                if os.path.exists(config_dir):
+                    candidate_files.extend(sorted(glob.glob(os.path.join(config_dir, "*rule*.json"))))
+                    candidate_files.extend(sorted(glob.glob(os.path.join(config_dir, "x*.json"))))
+                candidate_files.extend(sorted(glob.glob(os.path.join(PROJECT_ROOT, "*rule*.json"))))
+
+        seen_norm = set()
+        unique_files: List[str] = []
+        for fpath in candidate_files:
+            if os.path.basename(fpath).lower() == "atcs_rules.json":
+                continue
+            norm_p = os.path.normcase(os.path.abspath(fpath))
+            if norm_p not in seen_norm:
+                seen_norm.add(norm_p)
+                unique_files.append(fpath)
+        return unique_files, cfg_used
+
     def load_rules(self, rule_paths: Optional[List[str]] = None) -> int:
-        """Discovers and instantiates PacketParser instances from JSON files."""
+        """Discovers and instantiates PacketParser instances from JSON files in strict configured order."""
         with self._lock:
             if rule_paths:
                 self.custom_paths = list(rule_paths)
             self.parsers.clear()
             self._file_mtimes.clear()
-            candidate_files: List[str] = []
+            self._cfg_mtime: Tuple[Optional[str], float] = (None, 0.0)
 
-            paths_to_search = self.custom_paths or []
-            if paths_to_search:
-                for p in paths_to_search:
-                    if os.path.isdir(p):
-                        candidate_files.extend(glob.glob(os.path.join(p, "*rule*.json")))
-                        candidate_files.extend(glob.glob(os.path.join(p, "x*.json")))
-                    elif any(c in p for c in ("*", "?")):
-                        candidate_files.extend(glob.glob(p))
-                    elif os.path.exists(p):
-                        candidate_files.append(p)
-            else:
-                config_dir = os.path.join(PROJECT_ROOT, "config")
-                found_defaults = []
-                for fname in DEFAULT_SPY_PARSER_RULES:
-                    for d in (config_dir, PROJECT_ROOT):
-                        p = os.path.join(d, fname)
-                        if os.path.exists(p):
-                            found_defaults.append(p)
-                            break
-                if found_defaults:
-                    candidate_files.extend(found_defaults)
-                else:
-                    if os.path.exists(config_dir):
-                        candidate_files.extend(glob.glob(os.path.join(config_dir, "*rule*.json")))
-                        candidate_files.extend(glob.glob(os.path.join(config_dir, "x*.json")))
-                    candidate_files.extend(glob.glob(os.path.join(PROJECT_ROOT, "*rule*.json")))
+            unique_files, cfg_used = self._resolve_ordered_rule_files()
+            if cfg_used and os.path.exists(cfg_used):
+                try:
+                    self._cfg_mtime = (cfg_used, os.path.getmtime(cfg_used))
+                except OSError:
+                    self._cfg_mtime = (cfg_used, 0.0)
 
-            unique_files = sorted(set(candidate_files))
             for fpath in unique_files:
                 name = os.path.basename(fpath)
-                if name.lower() == "atcs_rules.json":
-                    continue
                 try:
                     mtime = os.path.getmtime(fpath)
                     with open(fpath, "r", encoding="utf-8") as f:
@@ -498,9 +535,18 @@ class RulesRegistry:
             return len(self.parsers)
 
     def check_and_reload_modified(self) -> Optional[int]:
-        """Checks if any rule files were modified, added, or removed; reloads if changed."""
+        """Checks if any rule files or config.json parser order changed; reloads if modified."""
         with self._lock:
-            # 1. Check existing files for modifications or deletions
+            cfg_p, cfg_mt = getattr(self, "_cfg_mtime", (None, 0.0))
+            if cfg_p:
+                if not os.path.exists(cfg_p):
+                    return self.load_rules(self.custom_paths)
+                try:
+                    if os.path.getmtime(cfg_p) != cfg_mt:
+                        return self.load_rules(self.custom_paths)
+                except OSError:
+                    pass
+
             for fpath, old_mtime in list(self._file_mtimes.items()):
                 if not os.path.exists(fpath):
                     return self.load_rules(self.custom_paths)
@@ -510,27 +556,8 @@ class RulesRegistry:
                 except OSError:
                     pass
 
-            # 2. Check if new files appeared in candidate directories
-            candidate_files = []
-            paths_to_search = self.custom_paths or []
-            if paths_to_search:
-                for p in paths_to_search:
-                    if os.path.isdir(p):
-                        candidate_files.extend(glob.glob(os.path.join(p, "*rule*.json")))
-                        candidate_files.extend(glob.glob(os.path.join(p, "x*.json")))
-                    elif any(c in p for c in ("*", "?")):
-                        candidate_files.extend(glob.glob(p))
-                    elif os.path.exists(p):
-                        candidate_files.append(p)
-            else:
-                config_dir = os.path.join(PROJECT_ROOT, "config")
-                if os.path.exists(config_dir):
-                    candidate_files.extend(glob.glob(os.path.join(config_dir, "*rule*.json")))
-                    candidate_files.extend(glob.glob(os.path.join(config_dir, "x*.json")))
-                candidate_files.extend(glob.glob(os.path.join(PROJECT_ROOT, "*rule*.json")))
-
-            unique_files = sorted(set(candidate_files))
-            if len(unique_files) != len(self._file_mtimes):
+            cur_files, _ = self._resolve_ordered_rule_files()
+            if cur_files != list(self._file_mtimes.keys()):
                 return self.load_rules(self.custom_paths)
 
         return None
@@ -544,22 +571,23 @@ class RulesRegistry:
             candidates.append(bytes(raw_bytes[5:]))
 
         with self._lock:
-            # Prioritize candidates in order across all registered parsers
+            # Strictly evaluate registered parsers in configured order and stop on first valid match
+            # (never reorder self.parsers, so specific rules always precede generic fallbacks).
             for cand in candidates:
-                for idx, (name, parser) in enumerate(self.parsers):
+                for name, parser in self.parsers:
                     try:
                         res = parser.parse(cand)
                         if isinstance(res, dict) and res.get("is_valid"):
                             parsed_data = res.get("data", {})
-                            # Real packet rules provide Type, _type_, _scroll_ptc_, or Prefix == 73
+                            # Real packet rules provide Type, _type_, _scroll_ptc_, _ctc_id_, _ctc_rules_, or Prefix == 73
                             if parsed_data and (
                                 "_scroll_ptc_" in parsed_data
                                 or "Type" in parsed_data
                                 or "_type_" in parsed_data
+                                or "_ctc_id_" in parsed_data
+                                or "_ctc_rules_" in parsed_data
                                 or parsed_data.get("Prefix") == 73
                             ):
-                                if idx > 0:
-                                    self.parsers.insert(0, self.parsers.pop(idx))
                                 return True, parsed_data, name
                     except Exception:
                         pass

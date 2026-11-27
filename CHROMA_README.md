@@ -1,11 +1,11 @@
-# ApexBOSChroma: PTC 220 MHz RF Spectrum Analyzer & Packet Waterfall
+# ApexBOSChroma: Multi-Band Railway RF Spectrum Analyzer & Packet Waterfall
 
 > [!IMPORTANT]
-> **Disclaimer & Intended Use**: **ApexBOS is NOT a real Positive Train Control (PTC) system and is not affiliated with any railroad or government agency.** ApexBOS is an experimental reference tool designed for amateur train enthusiasts and radio telemetry hobbyists. It attempts to visualize and decode 220 MHz digital telemetry packets to facilitate hobbyist research and observe SDR reception quality. It must never be used for train movement control, safety-critical railway operations, or commercial dispatching.
+> **Disclaimer & Intended Use**: **ApexBOS is NOT a real Positive Train Control (PTC) system and is not affiliated with any railroad or government agency.** ApexBOS is an experimental reference tool designed for amateur train enthusiasts and radio telemetry hobbyists. It attempts to visualize and decode 220 MHz, 450 MHz, and 900 MHz digital telemetry packets to facilitate hobbyist research and observe SDR reception quality. It must never be used for train movement control, safety-critical railway operations, or commercial dispatching.
 
-**ApexBOSChroma** ([ApexBOSChroma.py](ApexBOSChroma.py)) is a real-time, Pygame-powered FFT spectrum analyzer and scrolling waterfall tailored specifically to the **ITC 220 MHz PTC railway telemetry band (Channels 97–176, `220.0125–221.9875 MHz`)**.
+**ApexBOSChroma** ([ApexBOSChroma.py](ApexBOSChroma.py)) is a real-time, Pygame-powered FFT spectrum analyzer and scrolling waterfall tailored specifically to North American railway telemetry bands—**ITC 220 MHz PTC (Channels 97–176)**, **900 MHz ATCS (`935`/`896 MHz`)**, and **450 MHz EOT/HOT/DPU/RLC (`457`/`452 MHz`)**.
 
-Designed in the spirit of GQRX and SDR#, Chroma runs directly **alongside [ApexBOSGrabber](GRABBER_README.md) from the same RTL-SDR dongle** without diminishing Grabber's packet demodulation sensitivity or packets/min—while also supporting **Standalone Direct SDR** operation and an offline **`--mock`** demonstration mode.
+Designed in the spirit of GQRX and SDR#, Chroma runs directly **alongside [ApexBOSGrabber](GRABBER_README.md), [ApexBOSLatch](LATCH_README.md), or [ApexBOSFred](FRED_README.md) from the same SDR** (RTL-SDR, SDRplay RSP1B/1A/dx/duo, or SoapySDR) without diminishing demodulation sensitivity or packets/min—while also supporting **Standalone Direct SDR** operation across all 3 bands and an offline **`--mock`** demonstration mode.
 
 ![ApexBOSChroma Main Screen](images/Chroma/ChromaMainScreen.png)
 
@@ -41,10 +41,11 @@ flowchart LR
     CHROMA <-->|"ZMQ REQ/REP :18098<br/>(PPM / Gain / Bias-T / BW / Chans)"| GRAB_MAIN["Grabber Control Loop"]
 ```
 
-- **Zero Overhead When Closed**: Grabber's IQ tap (`zmq.XPUB` on `tcp://127.0.0.1:18099`) tracks active subscribers via XPUB subscription events. When no Chroma window is open (`chroma_subs == 0`), Grabber performs **zero** copies, serialization, or sends.
-- **Non-Blocking Drop-Oldest IPC**: Even while Chroma is open, the IQ tap uses `SNDHWM=2`, `LINGER=0`, and `zmq.NOBLOCK` throttled to ~26 Hz—if Chroma lags or pauses, frames are dropped silently without ever stalling Grabber's SDR reader or worker queues.
+- **Zero Overhead When Closed**: Grabber's gated tap (`zmq.XPUB` on `tcp://127.0.0.1:18099`, with matching taps on `18299` for Latch and `18399` for Fred) tracks active subscribers via XPUB subscription events. When no Chroma window is open (`chroma_subs == 0`), the demodulator performs **zero** copies, serialization, or sends.
+- **Full All-Packet Visibility (Including Grabber-Filtered Packets)**: Chroma subscribes to both `b"IQ"` and `b"PKT"` on Grabber's XPUB tap (`18099`). Even when Grabber's default outbound filter (`--filter-ctrl`) withholds `QSTAT/ACK` (`0x01`), `ACQ` (`0x04`), and `CNTL` (`0x05`) from Flux/Engine, Grabber still forwards **all** demodulated packets over `b"PKT"` whenever Chroma is open—so the waterfall never appears to "miss" live RF bursts.
+- **Non-Blocking Drop-Oldest IPC & Atomic Retuning**: Even while Chroma is open, the IQ tap uses `SNDHWM=2`, `LINGER=0`, and `zmq.NOBLOCK` throttled to ~26 Hz—if Chroma lags or pauses, frames are dropped silently without ever stalling the SDR reader or worker queues. When toggling Wideband (`W`) or adding/removing channels on the ruler, Chroma keeps its spectrum axes locked to incoming IQ metadata so the trace transitions atomically without frequency jumps.
 - **Unmodified Demodulation DSP**: Grabber's `WindowedSincFilter` channelizer and FEC demodulator remain completely untouched, preserving full packet sensitivity and decode yield.
-- **Out-of-Process Packet Enrichment**: Chroma subscribes directly to Grabber's existing worker `zmq.PUB` sockets and runs `parse_packets.py` rule enrichment and `rrdata.json` Railroad lookups inside Chroma's own process.
+- **Out-of-Process Packet Enrichment**: Chroma runs `parse_packets.py` rule enrichment (including `ctc_rules.json`, `dpu_rules.json`, `atcs_rules.json`, and `rrdata.json` Railroad lookups) inside Chroma's own process.
 
 ---
 
@@ -125,14 +126,17 @@ To keep Grabber's CPU footprint minimal during normal operation while still lett
 
 Every packet demodulated by Grabber's workers is plotted directly onto the scrolling waterfall at its exact carrier frequency ($f_{\text{ch}} + \Delta f$) and **pixel-locked directly to the waterfall ring buffer's row timestamps** so blips and flags glide down in rigid lockstep with their RF bursts at every depth:
 
-| Blip Color | Category | Typical PTC Traffic |
+| Blip Color | Category | Typical Railway Telemetry Traffic |
 | :---: | :--- | :--- |
+| **Black Dot (White Halo)** | `EMP` | Class D Edge Message Protocol / CTC packets (`0x50–0x5F`, `0x70–0x7F`), labeled `EMP 0x70 src->dst` |
 | **Green** | `WIU` | Wayside Interface Unit status packets (`0x33`, `0x34`) |
 | **Cyan** | `BASE` | Base station beacons & status (`0x02`) |
-| **Orange** | `CNTL` | Locomotive / wayside control messages (`0x01`, `0x04`, `0x05`) |
+| **Orange** | `CNTL` | Locomotive / wayside control messages (`0x04`, `0x05`) |
 | **Violet** | `TIME` | Time sync / network timing (`0x06`) |
-| **Yellow** | `QSTAT` | Query / status messages |
+| **Yellow** | `QSTAT` | Query / status messages (`0x01`) |
 | **Light Blue** | `ACK` | Acknowledgements |
+| **Sky Blue** | `ATCS` | 900 MHz ATCS Spec 200 packets (when viewing `--band atcs` / `atcs_mcp`) |
+| **Pink / Amber / Teal** | `EOT` / `HOT` / `DPU` / `RLC` | 450 MHz EOT, HOT, Distributed Power, and Remote Control Locomotive frames (`--band fred` / `fred452`) |
 
 - **Automatic Label Enrichment**: Using `parse_packets.py`, `ptc_status_parser.json`, `config/*rule*.json`, and `rrdata.json`, Chroma annotates blips with concise flags such as `RR:WIU 401001`, `RR:401001->401999`, or `BASE 10A4C2`, with automatic overlap avoidance. Toggle markers with **`Blips`** (`B`) and text flags with **`IDs`** (`I`).
 - **Hover & Click Inspection**: Hover over any blip (or press **`Space`** to pause and click a blip to pin it) to inspect full RF & protocol metadata including $\Delta f$, RSSI, SNR, WIU/Route IDs, sync errors, byte length, and raw HEX. Press **`Esc`** to dismiss a pinned card.

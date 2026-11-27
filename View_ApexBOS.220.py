@@ -47,17 +47,74 @@ try:
 except ImportError:
     lz4_frame = None
 
+from collections import deque
+from typing import Dict, Optional, Tuple, Any, List
+
 CHUNK_MAGIC_ZLIB = b"ABZ1"
 CHUNK_MAGIC_LZ4 = b"ABL1"
 CHUNK_HEADER_FMT = "!4sIIHH"
 CHUNK_HEADER_SIZE = struct.calcsize(CHUNK_HEADER_FMT)  # 16 bytes
 MAX_UDP_CHUNK_SIZE = 1400  # MTU-safe chunk size: prevents IP packet fragmentation across physical LAN/Wi-Fi
-from collections import deque
-from typing import Dict, Optional, Tuple, Any, List
+
+# Precomputed compass unit vectors (both upper & lower keys to avoid per-signal .upper() in hot draw loops)
+SIGNAL_DIR_OFFSETS: Dict[str, Tuple[float, float]] = {
+    "E": (1.0, 0.0), "e": (1.0, 0.0),
+    "W": (-1.0, 0.0), "w": (-1.0, 0.0),
+    "N": (0.0, -1.0), "n": (0.0, -1.0),
+    "S": (0.0, 1.0), "s": (0.0, 1.0),
+    "NE": (0.7071, -0.7071), "ne": (0.7071, -0.7071),
+    "SE": (0.7071, 0.7071), "se": (0.7071, 0.7071),
+    "NW": (-0.7071, -0.7071), "nw": (-0.7071, -0.7071),
+    "SW": (-0.7071, 0.7071), "sw": (-0.7071, 0.7071),
+}
+_SIGNAL_DIR_PX_CACHE: Dict[int, Dict[str, Tuple[int, int]]] = {}
+_SIGNAL_CHEVRON_CACHE: Dict[int, Dict[str, Tuple[int, int, int, int, int, int]]] = {}
+
+
+def _get_signal_dir_pixel_offsets(ext: int) -> Dict[str, Tuple[int, int]]:
+    """Returns cached integer (dx, dy) directional line endpoint offsets for zoomed-out signals."""
+    table = _SIGNAL_DIR_PX_CACHE.get(ext)
+    if table is None:
+        table = {d: (int(round(ux * ext)), int(round(uy * ext))) for d, (ux, uy) in SIGNAL_DIR_OFFSETS.items()}
+        _SIGNAL_DIR_PX_CACHE[ext] = table
+    return table
+
+
+def _get_signal_chevron_offsets(sz: int) -> Dict[str, Tuple[int, int, int, int, int, int]]:
+    """Returns cached integer 3-vertex chevron offsets for detailed zoomed-in signals."""
+    table = _SIGNAL_CHEVRON_CACHE.get(sz)
+    if table is None:
+        h = sz // 2
+        e_pts = (-h, -sz, sz, 0, -h, sz)
+        w_pts = (h, -sz, -sz, 0, h, sz)
+        n_pts = (-sz, h, 0, -sz, sz, h)
+        s_pts = (-sz, -h, 0, sz, sz, -h)
+        table = {
+            "E": e_pts, "e": e_pts, "NE": e_pts, "ne": e_pts, "SE": e_pts, "se": e_pts,
+            "W": w_pts, "w": w_pts, "NW": w_pts, "nw": w_pts, "SW": w_pts, "sw": w_pts,
+            "N": n_pts, "n": n_pts,
+            "S": s_pts, "s": s_pts,
+        }
+        _SIGNAL_CHEVRON_CACHE[sz] = table
+    return table
 
 import pygame
 import mosfet_client
 from banc_coverage_modal import BancCoverageMapModal
+try:
+    from dispatcher_engine import ctc_id_matches, parse_label_font_tag
+except Exception:
+    def ctc_id_matches(element_ctc_spec: Any, packet_ctc_id: Any) -> bool:
+        es = str(element_ctc_spec or "").strip().lower()
+        ps = str(packet_ctc_id or "").strip().lower()
+        return bool(es and ps and any(p.strip() in ps for p in es.split(",") if p.strip()))
+
+    def parse_label_font_tag(raw_label: Any) -> Tuple[str, int]:
+        text = str(raw_label or "")
+        rx = re.compile(r"<fn\s*([+-]\s*\d+)\s*>", re.IGNORECASE)
+        delta = sum(int(m.group(1).replace(" ", "")) for m in rx.finditer(text))
+        clean = re.sub(r"\s{2,}", " ", rx.sub("", text)).strip()
+        return clean, delta
 from train_logic import (
     fade_rgb_by_age,
     RF_TRAIN_TIMEOUT_SEC,
@@ -2745,6 +2802,8 @@ class DispatcherPygameRenderer:
                     "occ_bit_offset": el.get("occ_bit_offset"),
                     "cmd_bit_offset": el.get("cmd_bit_offset"),
                     "sig_bit_offset": el.get("sig_bit_offset"),
+                    "ctc_id": el.get("ctc_id", ""),
+                    "ctc_rules": el.get("ctc_rules", ""),
                 }
             if eid in self.temp_wiu_overrides:
                 ovr = self.temp_wiu_overrides[eid]
@@ -3182,6 +3241,18 @@ class DispatcherPygameRenderer:
     def get_elem_label(self, el: dict) -> str:
         return self.prefs.get_label(el["id"], el.get("label", el["id"]))
 
+    def get_minimal_elem_display_label(self, el: dict) -> Tuple[str, int]:
+        """
+        Returns minimal (display_text, font_delta) for Viewer canvas captions:
+          - Strips any <fn+-N> relative font-size adjustment tag and returns its delta.
+          - If a display name is specified, returns ONLY that name.
+          - If no name is specified (empty), returns ONLY the Element ID.
+        """
+        raw_lbl = str(self.get_elem_label(el) or "").strip()
+        clean_name, font_delta = parse_label_font_tag(raw_lbl)
+        eid = str(el.get("id", ""))
+        return (clean_name if clean_name else eid), font_delta
+
     def get_element_inactivity(self, el: dict, ref_now: float) -> Tuple[bool, float]:
         last_ts = float(el.get("last_packet_ts", 0.0) or 0.0)
         if last_ts <= 0.0:
@@ -3189,15 +3260,19 @@ class DispatcherPygameRenderer:
         age = max(0.0, ref_now - last_ts)
         return (age >= self.stale_timeout_sec), age
 
-    def _get_element_label_font(self, bold: bool = False) -> pygame.font.Font:
-        """Returns a reduced, zoom-scaled font (clamped to [7, 14]) for track, signal, and turnout names."""
-        sz = max(7, min(14, int(round(9.0 * self.zoom))))
+    def _get_adjusted_font(self, base_size: int, font_delta: int = 0, bold: bool = False) -> pygame.font.Font:
+        sz = max(5, min(72, int(base_size) + int(font_delta)))
         key = (sz, bool(bold))
         if not hasattr(self, "_elem_label_font_cache"):
             self._elem_label_font_cache = {}
         if key not in self._elem_label_font_cache:
             self._elem_label_font_cache[key] = pygame.font.SysFont("Consolas,DejaVu Sans Mono,monospace", sz, bold=bold)
         return self._elem_label_font_cache[key]
+
+    def _get_element_label_font(self, bold: bool = False, font_delta: int = 0) -> pygame.font.Font:
+        """Returns a reduced, zoom-scaled font (clamped to [7, 14] before <fn+-N> delta) for track, signal, and turnout names."""
+        base_sz = max(7, min(14, int(round(9.0 * self.zoom))))
+        return self._get_adjusted_font(base_sz, font_delta=font_delta, bold=bold)
 
     def _render_cached_text(self, font: pygame.font.Font, text: str, color: Tuple[int, int, int]) -> pygame.Surface:
         cache = getattr(self, "_text_surf_cache", None)
@@ -3225,11 +3300,14 @@ class DispatcherPygameRenderer:
             return False
         return True
 
-    def render_aged_label(self, text: str, el: dict, ref_now: float, active_rgb: Tuple[int, int, int] = (245, 250, 255)) -> pygame.Surface:
+    def render_aged_label(self, text: str, el: dict, ref_now: float, active_rgb: Tuple[int, int, int] = (245, 250, 255), font_delta: int = 0) -> pygame.Surface:
         is_stale, age = self.get_element_inactivity(el, ref_now)
         use_zoom_font = el.get("elem_type") in ("track", "signal", "turnout")
         if age < 3.5:
-            font = self._get_element_label_font(bold=True) if use_zoom_font else self.font_sm_bold
+            if use_zoom_font:
+                font = self._get_element_label_font(bold=True, font_delta=font_delta)
+            else:
+                font = self._get_adjusted_font(12, font_delta=font_delta, bold=True) if font_delta else self.font_sm_bold
             return self._render_cached_text(font, text, active_rgb)
 
         ratio = min(1.0, max(0.0, (age - 3.5) / max(1.0, self.stale_timeout_sec)))
@@ -3238,7 +3316,12 @@ class DispatcherPygameRenderer:
         g = int(active_rgb[1] * (1.0 - ratio) + barely_visible_gray[1] * ratio) & ~3
         b = int(active_rgb[2] * (1.0 - ratio) + barely_visible_gray[2] * ratio) & ~3
         is_bold = ratio < 0.35
-        font = self._get_element_label_font(bold=is_bold) if use_zoom_font else (self.font_sm_bold if is_bold else self.font_sm_thin)
+        if use_zoom_font:
+            font = self._get_element_label_font(bold=is_bold, font_delta=font_delta)
+        elif font_delta:
+            font = self._get_adjusted_font(12, font_delta=font_delta, bold=is_bold)
+        else:
+            font = self.font_sm_bold if is_bold else self.font_sm_thin
         return self._render_cached_text(font, text, (r, g, b))
 
     def _get_label_rect(self, sx: int, sy: int, w: int, h: int, pos: str, offset: int) -> Tuple[int, int]:
@@ -4077,7 +4160,7 @@ class DispatcherPygameRenderer:
         state = self.current_state()
         target = self._lookup_any_element(state, elem_id) if state else None
         if target:
-            for k in ("wiu_id", "occ_bit_offset", "cmd_bit_offset", "sig_bit_offset"):
+            for k in ("wiu_id", "occ_bit_offset", "cmd_bit_offset", "sig_bit_offset", "ctc_id", "ctc_rules"):
                 if k in target:
                     v = target.get(k)
                     self.inspector_edit_buffers[k] = str(v) if v is not None else ""
@@ -4089,7 +4172,9 @@ class DispatcherPygameRenderer:
         ovr: Dict[str, Any] = {}
         for k, raw in self.inspector_edit_buffers.items():
             s = raw.strip()
-            if s == "" or s.lower() == "none":
+            if k in ("ctc_id", "ctc_rules"):
+                ovr[k] = "" if (s == "" or s.lower() == "none") else s
+            elif s == "" or s.lower() == "none":
                 ovr[k] = None
             elif s.lstrip("-").isdigit():
                 ovr[k] = int(s)
@@ -4101,7 +4186,7 @@ class DispatcherPygameRenderer:
             self._apply_local_temp_overrides_to_state(state)
         self._send_temp_override_to_engine("SET_TEMP_OVERRIDE", {"id": eid, **ovr})
         self.inspector_active_field = None
-        self.status_toast = f"Applied temporary WIU/Bit overrides for '{eid}' (session-only, lost on exit)."
+        self.status_toast = f"Applied temporary WIU/Bit/CTC overrides for '{eid}' (session-only, lost on exit)."
 
     def _revert_inspector_temp_overrides(self):
         eid = self.readonly_inspector_id
@@ -4117,12 +4202,13 @@ class DispatcherPygameRenderer:
                     self.inspector_edit_buffers[k] = str(v) if v is not None else ""
         self._send_temp_override_to_engine("REVERT_TEMP_OVERRIDE", {"id": eid})
         self.inspector_active_field = None
-        self.status_toast = f"Reverted '{eid}' WIU ID & bit offsets to original values."
+        self.status_toast = f"Reverted '{eid}' WIU/Bit/CTC overrides to original values."
 
     def _handle_inspector_edit_keydown(self, event: pygame.event.Event):
         fld = self.inspector_active_field
         if not fld:
             return
+        is_text_fld = fld in ("ctc_id", "ctc_rules")
         if event.key == pygame.K_ESCAPE:
             self.inspector_active_field = None
         elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
@@ -4137,6 +4223,21 @@ class DispatcherPygameRenderer:
                 self.inspector_edit_buffers[fld] = ""
             else:
                 self.inspector_edit_buffers[fld] = self.inspector_edit_buffers.get(fld, "")[:-1]
+        elif is_text_fld and (event.mod & pygame.KMOD_CTRL) and event.key == pygame.K_v:
+            try:
+                import tkinter as tk
+                r = tk.Tk()
+                r.withdraw()
+                clip = r.clipboard_get()
+                r.destroy()
+                if clip:
+                    clean = "".join(ch for ch in str(clip) if ch.isprintable())
+                    self.inspector_edit_buffers[fld] = self.inspector_edit_buffers.get(fld, "") + clean
+            except Exception:
+                pass
+        elif is_text_fld:
+            if event.unicode and event.unicode.isprintable():
+                self.inspector_edit_buffers[fld] = self.inspector_edit_buffers.get(fld, "") + event.unicode
         elif event.unicode and (event.unicode.isdigit() or event.unicode in "-"):
             self.inspector_edit_buffers[fld] = self.inspector_edit_buffers.get(fld, "") + event.unicode
 
@@ -4707,7 +4808,7 @@ class DispatcherPygameRenderer:
                 int(round(active_col[2] * (1.0 - fade_ratio) + dark_col[2] * fade_ratio)),
             )
 
-        if el.get("green_path"):
+        if el.get("green_path") and not el.get("out_of_service"):
             active_col = COLOR_TRACK_GREEN
             dark_col = (18, 110, 48)
             if last_ts <= 0.0 or age < 3.5:
@@ -4881,6 +4982,50 @@ class DispatcherPygameRenderer:
             for i in range(len(scr_pts) - 1):
                 self._draw_link_green_arrows(scr_pts[i], scr_pts[i + 1], green_dir)
 
+    def _draw_dotted_line(
+        self,
+        color: Tuple[int, int, int],
+        s0: Tuple[int, int],
+        s1: Tuple[int, int],
+        line_w: int,
+    ):
+        """Draws a crisp dotted/dashed line segment between s0 and s1 (used for Out-of-Service tracks)."""
+        x0, y0 = s0
+        x1, y1 = s1
+        dx = x1 - x0
+        dy = y1 - y0
+        length = math.hypot(dx, dy)
+        if length < 2.0:
+            pygame.draw.line(self.screen, color, s0, s1, line_w)
+            return
+        ux = dx / length
+        uy = dy / length
+        dot_len = max(3.0, 4.0 * self.zoom)
+        step_len = max(7.0, 9.5 * self.zoom)
+        draw_line = pygame.draw.line
+        screen = self.screen
+        t = 0.0
+        while t < length:
+            t_end = min(length, t + dot_len)
+            draw_line(
+                screen,
+                color,
+                (int(x0 + ux * t), int(y0 + uy * t)),
+                (int(x0 + ux * t_end), int(y0 + uy * t_end)),
+                line_w,
+            )
+            t += step_len
+
+    def _draw_oos_center_badge(self, sx: int, sy: int, is_occupied: bool):
+        """Draws centered 'OOS' letters at the midpoint of an Out-of-Service track segment."""
+        oos_font = self._get_element_label_font(bold=True)
+        txt_col = COLOR_TRACK_RED if is_occupied else COLOR_TRACK_WHITE
+        oos_surf = self._render_cached_text(oos_font, "OOS", txt_col)
+        ow, oh = oos_surf.get_width(), oos_surf.get_height()
+        bg_rect = pygame.Rect(sx - ow // 2 - 3, sy - oh // 2 - 1, ow + 6, oh + 2)
+        pygame.draw.rect(self.screen, COLOR_BG, bg_rect, border_radius=2)
+        self.screen.blit(oos_surf, (sx - ow // 2, sy - oh // 2))
+
     def _draw_section_separators(self, visible_track_screen_pts: List[Tuple[Tuple[int, int], Tuple[int, int]]]):
         """Draws dim perpendicular markers at visible track ends to show track section boundaries."""
         if self.zoom < 0.55:
@@ -4959,9 +5104,14 @@ class DispatcherPygameRenderer:
                 is_vis = self._is_seg_visible(s0, s1, margin=120)
                 if is_vis and self._is_seg_visible(s0, s1, margin=60):
                     visible_track_screen_pts.append((s0, s1))
-                    pygame.draw.line(self.screen, col1, s0, s1, line_w)
-                    if el.get("green_path") and el.get("green_path_dir"):
-                        self._draw_track_bar_arrows(s0, s1, el["green_path_dir"])
+                    if el.get("out_of_service"):
+                        oos_occ = bool(el.get("occupied") or el.get("hw_occupied") or el.get("inferred_occupied") or el.get("collision_warning"))
+                        oos_col = COLOR_TRACK_RED if oos_occ else COLOR_TRACK_WHITE
+                        self._draw_dotted_line(oos_col, s0, s1, line_w)
+                    else:
+                        pygame.draw.line(self.screen, col1, s0, s1, line_w)
+                        if el.get("green_path") and el.get("green_path_dir"):
+                            self._draw_track_bar_arrows(s0, s1, el["green_path_dir"])
 
                 if not is_vis:
                     continue
@@ -5072,9 +5222,20 @@ class DispatcherPygameRenderer:
             groups.setdefault(key, []).append(el)
 
         pos_rank = {"top": 0, "middle": 1, "bottom": 2}
-        r = max(4 if self.zoom < 0.55 else 6, int(7.5 * self.zoom))
+        zoomed_out = self.zoom < 0.55
+        r = max(4 if zoomed_out else 6, int(7.5 * self.zoom))
         spacing = r * 2 + 4
         show_sig_labels = self.show_labels and (self.zoom >= 0.42)
+        screen = self.screen
+        draw_circle = pygame.draw.circle
+        draw_line = pygame.draw.line
+        draw_lines = pygame.draw.lines
+        black_rgb = LAMP_COLORS["BLACK"]
+        ext = r + 3
+        dir_px_map = _get_signal_dir_pixel_offsets(ext) if zoomed_out else None
+        chev_map = None if zoomed_out else _get_signal_chevron_offsets(max(3, r - 2))
+        default_dir_px = (ext, 0)
+        default_chev = None if zoomed_out else chev_map["E"]
 
         for (_, _, direction, protects_id), heads in groups.items():
             heads.sort(key=lambda h: pos_rank.get(str(h.get("position", "top")).lower(), 0))
@@ -5091,7 +5252,7 @@ class DispatcherPygameRenderer:
             else:
                 psx, psy = asx, asy + 20
 
-            is_ns = direction in ("N", "S")
+            is_ns = direction in ("N", "S", "n", "s")
             if is_ns:
                 step_dx = -spacing if psx >= asx else spacing
                 step_dy = 0
@@ -5101,10 +5262,15 @@ class DispatcherPygameRenderer:
 
             is_stale, _ = self.get_element_inactivity(anchor_head, ref_now)
             mast_col = COLOR_TRACK_STALE_GRAY if is_stale else COLOR_SIGNAL_MAST
-            if len(heads) > 1 and self.zoom >= 0.55:
+            if len(heads) > 1 and not zoomed_out:
                 end_x = asx + step_dx * (len(heads) - 1)
                 end_y = asy + step_dy * (len(heads) - 1)
-                pygame.draw.line(self.screen, mast_col, (asx, asy), (end_x, end_y), 3)
+                draw_line(screen, mast_col, (asx, asy), (end_x, end_y), 3)
+
+            if zoomed_out:
+                dir_dx, dir_dy = dir_px_map.get(direction, default_dir_px)
+            else:
+                c0x, c0y, c1x, c1y, c2x, c2y = chev_map.get(direction, default_chev)
 
             head_screen_pts: List[Tuple[int, int]] = []
             for idx, h_el in enumerate(heads):
@@ -5157,18 +5323,30 @@ class DispatcherPygameRenderer:
                     if h_el.get("flashing", False) and not flash_on and fade_ratio < 0.65:
                         lamp_rgb = LAMP_COLORS["BLACK"]
 
-                if self.zoom < 0.55:
-                    pygame.draw.circle(self.screen, lamp_rgb, (hx, hy), r)
+                if zoomed_out:
+                    draw_circle(screen, lamp_rgb, (hx, hy), r)
+                    draw_line(
+                        screen,
+                        mast_col if lamp_rgb == black_rgb else lamp_rgb,
+                        (hx, hy),
+                        (hx + dir_dx, hy + dir_dy),
+                        2,
+                    )
                 else:
-                    pygame.draw.circle(self.screen, (18, 22, 28), (hx, hy), r + 2)
-                    pygame.draw.circle(self.screen, lamp_rgb, (hx, hy), r)
-                    pygame.draw.circle(self.screen, mast_col, (hx, hy), r + 2, 1)
-                    self._draw_signal_direction_arrow(hx, hy, max(3, r - 2), direction)
+                    draw_circle(screen, (18, 22, 28), (hx, hy), r + 2)
+                    draw_circle(screen, lamp_rgb, (hx, hy), r)
+                    draw_circle(screen, mast_col, (hx, hy), r + 2, 1)
+                    draw_lines(
+                        screen,
+                        (15, 18, 22),
+                        False,
+                        ((hx + c0x, hy + c0y), (hx + c1x, hy + c1y), (hx + c2x, hy + c2y)),
+                        2,
+                    )
 
             if (show_sig_labels or anchor_head.get("ctc_active") or (anchor_head["id"] == self.selected_id and self.show_labels)) and head_screen_pts:
-                lbl = self.get_elem_label(anchor_head)
-                disp_tag = f"{anchor_head['id']} ({lbl})" if (lbl and self.show_labels) else anchor_head['id']
-                lbl_surf = self.render_aged_label(disp_tag, anchor_head, ref_now, active_rgb=(215, 230, 250))
+                disp_tag, sig_fn_delta = self.get_minimal_elem_display_label(anchor_head)
+                lbl_surf = self.render_aged_label(disp_tag, anchor_head, ref_now, active_rgb=(215, 230, 250), font_delta=sig_fn_delta)
                 lpos = str(anchor_head.get("label_pos", "top")).lower()
 
                 min_hx = min(pt[0] for pt in head_screen_pts)
@@ -5244,8 +5422,7 @@ class DispatcherPygameRenderer:
                     if not is_sel and not self._is_point_visible(sx, sy, margin_x=120, margin_y=80):
                         continue
 
-            label = self.get_elem_label(el)
-            disp_tag = f"{eid} ({label})" if label else eid
+            disp_tag, lbl_fn_delta = self.get_minimal_elem_display_label(el)
             is_stale, age = self.get_element_inactivity(el, ref_now)
             lpos = el.get("label_pos", "top")
 
@@ -5262,15 +5439,16 @@ class DispatcherPygameRenderer:
 
             if etype == "track":
                 col = frame_colors.get(eid) or self._track_color(el, flash_on, ref_now)
-                if self.zoom >= 0.55 or is_sel:
+                if el.get("out_of_service"):
+                    oos_occ = bool(el.get("occupied") or el.get("hw_occupied") or el.get("inferred_occupied") or el.get("collision_warning"))
+                    self._draw_oos_center_badge(sx, sy, oos_occ)
+                elif self.zoom >= 0.55 or is_sel:
                     r = max(4, int(5 * self.zoom))
                     pygame.draw.circle(self.screen, col, (sx, sy), r)
                     pygame.draw.circle(self.screen, COLOR_BG, (sx, sy), max(2, r - 2))
 
                 if show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels):
-                    len_mi = el.get("length_miles", 0.5)
-                    tk_title = f"{disp_tag} [{len_mi}mi]" if self.show_labels else disp_tag
-                    id_surf = self.render_aged_label(tk_title, el, ref_now, active_rgb=(235, 245, 255))
+                    id_surf = self.render_aged_label(disp_tag, el, ref_now, active_rgb=(235, 245, 255), font_delta=lbl_fn_delta)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, id_surf.get_width(), id_surf.get_height(), lpos, int(15 * self.zoom))
                     self.screen.blit(id_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
@@ -5329,9 +5507,7 @@ class DispatcherPygameRenderer:
                     self._draw_turnout_diamond_arrow(sx, sy, sz, el["green_path_dir"])
 
                 if show_elem_labels or el.get("ctc_active") or (is_sel and self.show_labels):
-                    align_char = "N" if el.get("state", 0) == 0 else "R"
-                    t_title = f"{disp_tag}[{align_char}]" if self.show_labels else disp_tag
-                    t_surf = self.render_aged_label(t_title, el, ref_now, active_rgb=COLOR_EDIT_ACCENT)
+                    t_surf = self.render_aged_label(disp_tag, el, ref_now, active_rgb=COLOR_EDIT_ACCENT, font_delta=lbl_fn_delta)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, t_surf.get_width(), t_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(t_surf, (lbl_x, lbl_y))
                     if el.get("ctc_active"):
@@ -5345,7 +5521,7 @@ class DispatcherPygameRenderer:
                 pygame.draw.line(self.screen, col, (sx - sz, sy + sz), (sx + sz, sy - sz), 3)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    c_surf = self.render_aged_label(f"{disp_tag} [{gate}]", el, ref_now, active_rgb=col)
+                    c_surf = self.render_aged_label(disp_tag, el, ref_now, active_rgb=col, font_delta=lbl_fn_delta)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, c_surf.get_width(), c_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(c_surf, (lbl_x, lbl_y))
 
@@ -5378,9 +5554,7 @@ class DispatcherPygameRenderer:
                     pygame.draw.circle(self.screen, (245, 235, 255), (sx, sy - sz - 3), 2)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    rad_id = el.get("radio_id")
-                    rad_str = f" [ID:{rad_id}]" if rad_id is not None else ""
-                    b_surf = self.render_aged_label(f"{disp_tag}{rad_str} (Ch{el.get('channel')}: {el.get('packets_relayed', 0)})", el, ref_now, active_rgb=active_col)
+                    b_surf = self.render_aged_label(disp_tag, el, ref_now, active_rgb=active_col, font_delta=lbl_fn_delta)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
 
@@ -5390,7 +5564,8 @@ class DispatcherPygameRenderer:
                 pygame.draw.rect(self.screen, COLOR_LANDMARK, rect, border_radius=3)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    s_surf = self._render_cached_text(self.font_sm_thin, disp_tag, COLOR_LANDMARK)
+                    st_font = self._get_adjusted_font(12, font_delta=lbl_fn_delta, bold=False) if lbl_fn_delta else self.font_sm_thin
+                    s_surf = self._render_cached_text(st_font, disp_tag, COLOR_LANDMARK)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, s_surf.get_width(), s_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(s_surf, (lbl_x, lbl_y))
 
@@ -5400,7 +5575,8 @@ class DispatcherPygameRenderer:
                 pygame.draw.line(self.screen, COLOR_LANDMARK, (sx - w // 2, sy + h // 2), (sx + w // 2, sy + h // 2), 2)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    b_surf = self._render_cached_text(self.font_sm_thin, disp_tag, COLOR_TEXT_DIM)
+                    br_font = self._get_adjusted_font(12, font_delta=lbl_fn_delta, bold=False) if lbl_fn_delta else self.font_sm_thin
+                    b_surf = self._render_cached_text(br_font, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, b_surf.get_width(), b_surf.get_height(), lpos, h // 2 + 5)
                     self.screen.blit(b_surf, (lbl_x, lbl_y))
 
@@ -5410,27 +5586,31 @@ class DispatcherPygameRenderer:
                 pygame.draw.polygon(self.screen, COLOR_LANDMARK, pts, 2)
 
                 if show_elem_labels or (is_sel and self.show_labels):
-                    d_surf = self._render_cached_text(self.font_sm_thin, disp_tag, COLOR_TEXT_DIM)
+                    dm_font = self._get_adjusted_font(12, font_delta=lbl_fn_delta, bold=False) if lbl_fn_delta else self.font_sm_thin
+                    d_surf = self._render_cached_text(dm_font, disp_tag, COLOR_TEXT_DIM)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, d_surf.get_width(), d_surf.get_height(), lpos, sz + 5)
                     self.screen.blit(d_surf, (lbl_x, lbl_y))
 
             elif etype == "label":
                 if self.show_labels:
-                    l_font = self.font_sm if self.zoom < 0.65 else self.font_lg
-                    l_surf = self._render_cached_text(l_font, label or eid, COLOR_LANDMARK)
+                    if lbl_fn_delta:
+                        l_base = 12 if self.zoom < 0.65 else 17
+                        l_font = self._get_adjusted_font(l_base, font_delta=lbl_fn_delta, bold=(self.zoom >= 0.65))
+                    else:
+                        l_font = self.font_sm if self.zoom < 0.65 else self.font_lg
+                    l_surf = self._render_cached_text(l_font, disp_tag, COLOR_LANDMARK)
                     self.screen.blit(l_surf, (sx - l_surf.get_width() // 2, sy))
 
             elif etype == "track_jump":
                 letter = str(el.get("letter") or "A").upper()
-                paired_id = el.get("paired_jump_id") or ""
                 rad = max(11, int(13 * self.zoom))
                 pygame.draw.circle(self.screen, (26, 38, 58), (sx, sy), rad)
                 pygame.draw.circle(self.screen, COLOR_EDIT_ACCENT, (sx, sy), rad, 2)
                 ltr_surf = self._render_cached_text(self.font_md, letter, (255, 230, 90))
                 self.screen.blit(ltr_surf, (sx - ltr_surf.get_width() // 2, sy - ltr_surf.get_height() // 2))
                 if show_elem_labels or (is_sel and self.show_labels):
-                    pair_tag = f"->{paired_id}" if paired_id else ""
-                    j_surf = self._render_cached_text(self.font_sm_bold, f"{eid}[{letter}{pair_tag}]", COLOR_EDIT_ACCENT)
+                    j_font = self._get_adjusted_font(12, font_delta=lbl_fn_delta, bold=True) if lbl_fn_delta else self.font_sm_bold
+                    j_surf = self._render_cached_text(j_font, disp_tag, COLOR_EDIT_ACCENT)
                     lbl_x, lbl_y = self._get_label_rect(sx, sy, j_surf.get_width(), j_surf.get_height(), lpos, rad + 4)
                     self.screen.blit(j_surf, (lbl_x, lbl_y))
 
@@ -5450,8 +5630,8 @@ class DispatcherPygameRenderer:
                 pygame.draw.rect(clk_surf, bg_col, (0, 0, w, h), border_radius=6)
                 pygame.draw.rect(clk_surf, border_col, (0, 0, w, h), 2, border_radius=6)
 
-                title_txt = f"PTC CLOCK - {disp_tag}" if label else f"PTC DATE/TIME [{eid}]"
-                hdr_surf = self.font_sm_bold.render(title_txt, True, (190, 215, 245))
+                hdr_font = self._get_adjusted_font(12, font_delta=lbl_fn_delta, bold=True) if lbl_fn_delta else self.font_sm_bold
+                hdr_surf = hdr_font.render(disp_tag, True, (190, 215, 245))
                 clk_surf.blit(hdr_surf, (8, 4))
 
                 val_surf = self.font_md.render(dt_str, True, txt_col)
@@ -5702,11 +5882,17 @@ class DispatcherPygameRenderer:
                         hdr_click_w = max(txt_surf.get_width() + 4, min(next_x - col_x[ci] - 2, 70))
                         self.addr_table_btn_rects[f"sort_{col_key}"] = pygame.Rect(px + col_x[ci], py + 26, hdr_click_w, 18)
 
+            layout_elements = state.get("elements", {})
             layout_wiu_ids = {
                 int(el["wiu_id"])
-                for el in state.get("elements", {}).values()
+                for el in layout_elements.values()
                 if el.get("wiu_id") is not None and str(el.get("wiu_id")).lstrip("-").isdigit()
             }
+            layout_ctc_specs = [
+                str(el.get("ctc_id")).strip()
+                for el in layout_elements.values()
+                if el.get("ctc_id") and str(el.get("ctc_id")).strip()
+            ]
             ref_now_wiu = self.get_reference_now(state)
 
             m_pos = pygame.mouse.get_pos()
@@ -5726,9 +5912,18 @@ class DispatcherPygameRenderer:
                 chs = ",".join(map(str, winfo.get("channels", [])))
                 rr_code = str(winfo.get("rr_code", "DEF"))
                 wid_str = str(wid)
+                is_ctc_row = bool(winfo.get("is_ctc")) or (
+                    not wid_str.lstrip("-").isdigit() and rr_code.upper() == "CTC"
+                )
                 wid_nnn = wid_str[1:4] if len(wid_str) >= 4 else ""
-                rr_name = str(winfo.get("rr_name") or self.rrdata.get(rr_code) or self.rrdata.get(wid_nnn) or rr_code)
-                on_layout = bool(winfo.get("on_layout")) or (str(wid).lstrip("-").isdigit() and int(wid) in layout_wiu_ids)
+                rr_name = "CTC" if is_ctc_row else str(winfo.get("rr_name") or self.rrdata.get(rr_code) or self.rrdata.get(wid_nnn) or rr_code)
+                if is_ctc_row:
+                    if layout_elements:
+                        on_layout = any(ctc_id_matches(spec, wid_str) for spec in layout_ctc_specs)
+                    else:
+                        on_layout = bool(winfo.get("on_layout"))
+                else:
+                    on_layout = bool(winfo.get("on_layout")) or (wid_str.lstrip("-").isdigit() and int(wid_str) in layout_wiu_ids)
                 last_seen = float(winfo.get("last_seen", 0.0) or 0.0)
                 age_s = max(0.0, ref_now_wiu - last_seen) if last_seen > 0 else self.stale_timeout_sec
                 fade = min(1.0, max(0.0, age_s / max(1.0, self.stale_timeout_sec)))
@@ -5743,8 +5938,11 @@ class DispatcherPygameRenderer:
                     g_c = int(round(255 + (116 - 255) * fade))
                     b_c = int(round(255 + (128 - 255) * fade))
                 row_col = (r_c, g_c, b_c)
-                wiu_name = winfo.get("wiu_name") or self.lookup_wiu_name(wid)
-                disp_wiu = winfo.get("wiu_display_name") or format_wiu_display_name(wiu_name, wid)
+                if is_ctc_row:
+                    disp_wiu = wid_str
+                else:
+                    wiu_name = winfo.get("wiu_name") or self.lookup_wiu_name(wid)
+                    disp_wiu = winfo.get("wiu_display_name") or format_wiu_display_name(wiu_name, wid)
 
                 # Row hit-testing for hover pointer
                 row_screen_rect = pygame.Rect(px + 6, py + row_y, w - 12, 18)
@@ -5754,6 +5952,7 @@ class DispatcherPygameRenderer:
                         "wid": wid,
                         "winfo": winfo,
                         "disp_wiu": disp_wiu,
+                        "is_ctc": is_ctc_row,
                         "rect": row_screen_rect,
                     }
                     self.hovered_wiu_row_rect = row_screen_rect
@@ -5769,9 +5968,17 @@ class DispatcherPygameRenderer:
                 max_r = winfo.get("high_watermark_rssi")
                 max_r_str = f"{float(max_r):.1f}dBm" if max_r is not None else "---"
 
+                font_row = self.font_sm_bold if fade < 0.25 else self.font_sm_thin
+                wiu_col_max_px = max(48, col_x[2] - col_x[1] - 6)
+                disp_wiu_cell = disp_wiu
+                if font_row.size(disp_wiu_cell)[0] > wiu_col_max_px:
+                    while len(disp_wiu_cell) > 3 and font_row.size(disp_wiu_cell + "..")[0] > wiu_col_max_px:
+                        disp_wiu_cell = disp_wiu_cell[:-1]
+                    disp_wiu_cell = disp_wiu_cell + ".."
+
                 vals = (
                     avg_r_str,
-                    disp_wiu,
+                    disp_wiu_cell,
                     rr_name[:8],
                     chs[:5],
                     last_r_str,
@@ -5779,7 +5986,6 @@ class DispatcherPygameRenderer:
                     str(winfo.get("last_sequence", 0)),
                     str(winfo.get("packet_count", 0)),
                 )
-                font_row = self.font_sm_bold if fade < 0.25 else self.font_sm_thin
                 for ci, cval in enumerate(vals):
                     if col_x[ci] < w - 14:
                         panel_surf.blit(font_row.render(cval, True, row_col), (col_x[ci], row_y))
@@ -6542,6 +6748,12 @@ class DispatcherPygameRenderer:
                     if not matched and str(r).strip().lower() == wid_str:
                         matched = True
 
+            # Check ctc_id (single substring, comma-separated multi-RR list, or r"regex")
+            if not matched:
+                el_ctc = el.get("ctc_id")
+                if el_ctc and ctc_id_matches(el_ctc, str(wid)):
+                    matched = True
+
             # Check direct element id
             if not matched and str(eid).strip().lower() == wid_str:
                 matched = True
@@ -6568,6 +6780,7 @@ class DispatcherPygameRenderer:
         wid = self.hovered_wiu_row.get("wid")
         winfo = self.hovered_wiu_row.get("winfo", {})
         disp_wiu = self.hovered_wiu_row.get("disp_wiu") or str(wid)
+        is_ctc_row = bool(self.hovered_wiu_row.get("is_ctc")) or bool(winfo.get("is_ctc"))
 
         matches = self._find_layout_elements_for_wiu(wid, elements)
         if not matches:
@@ -6610,7 +6823,11 @@ class DispatcherPygameRenderer:
             p2_y = csy + math.sin(angle - 2.5) * (arr_len * 0.7)
             pygame.draw.polygon(overlay_surf, (*theme_rgb, 240), [(tip_x, tip_y), (p1_x, p1_y), (p2_x, p2_y)])
 
-            tag_txt = f"WIU {disp_wiu} ({primary_id}) (OFF-SCREEN)"
+            tag_txt = (
+                f"CTC {disp_wiu} ({primary_id}) (OFF-SCREEN)"
+                if is_ctc_row
+                else f"WIU {disp_wiu} ({primary_id}) (OFF-SCREEN)"
+            )
             tag_surf = self.font_sm_bold.render(tag_txt, True, theme_rgb)
             tw, th = tag_surf.get_width() + 14, tag_surf.get_height() + 8
             tx = max(10, min(self.width - tw - 10, csx - tw // 2))
@@ -6679,7 +6896,7 @@ class DispatcherPygameRenderer:
         pkt_cnt = winfo.get("packet_count", primary_el.get("packets_received", 0))
         chs = ",".join(map(str, winfo.get("channels", []))) or str(primary_el.get("channel", "---"))
 
-        line1 = f"WIU: {disp_wiu} (ID: {wid})"
+        line1 = f"CTC: {disp_wiu}" if is_ctc_row else f"WIU: {disp_wiu} (ID: {wid})"
         line2 = f"ELEMENT: {primary_id} ({target_etype}) | RSSI AVG: {avg_str} | LAST: {last_str}"
         line3 = f"PACKETS: {pkt_cnt} | CHANNELS: {chs}" + (f" | +{len(matches) - 1} linked" if len(matches) > 1 else "")
 
@@ -6923,8 +7140,29 @@ class DispatcherPygameRenderer:
         rack_h = 44 if is_base else 0
         card_gap = 6
 
-        lbl_w = max((self.font_sm_bold.size(r[0])[0] for r in rows), default=170) + 22
-        val_w = max((self.font_sm_bold.size(r[1])[0] for r in rows), default=220) + 26
+        editable_map = {
+            "WIU ID": "wiu_id",
+            "Occ Bit Offset": "occ_bit_offset",
+            "Switch Bits Offset (2b)": "cmd_bit_offset",
+            "Signal Bits Offset (5b)": "sig_bit_offset",
+            "CTC ID": "ctc_id",
+            "CTC Rules": "ctc_rules",
+        }
+        lbl_w = max(
+            (self.font_sm_bold.size(f"{r[0]} [ Temp Edit ]" if r[0] in editable_map else r[0])[0] for r in rows),
+            default=170,
+        ) + 22
+        val_w = max(
+            (
+                self.font_sm_bold.size(
+                    self.inspector_edit_buffers.get(editable_map[r[0]], r[1]) + "_"
+                    if r[0] in editable_map and editable_map[r[0]] in self.inspector_edit_buffers
+                    else r[1]
+                )[0]
+                for r in rows
+            ),
+            default=220,
+        ) + 26
         title_w = self.font_md.size(title)[0] + 36
 
         # Raw Packet Hex String formatting (small and broken up into 16-byte lines)
@@ -6959,12 +7197,6 @@ class DispatcherPygameRenderer:
         self.inspector_edit_rects.clear()
         self.inspector_apply_ovr_rect = pygame.Rect(0, 0, 0, 0)
         self.inspector_revert_ovr_rect = pygame.Rect(0, 0, 0, 0)
-        editable_map = {
-            "WIU ID": "wiu_id",
-            "Occ Bit Offset": "occ_bit_offset",
-            "Switch Bits Offset (2b)": "cmd_bit_offset",
-            "Signal Bits Offset (5b)": "sig_bit_offset",
-        }
         has_editable = False
 
         if is_base:
@@ -7039,7 +7271,14 @@ class DispatcherPygameRenderer:
                 v_col = (110, 245, 150) if is_telem else COLOR_TEXT
             pygame.draw.rect(self.screen, bg_c, box_rect, border_radius=4)
             pygame.draw.rect(self.screen, bd_c, box_rect, 1, border_radius=4)
-            self.screen.blit(self.font_sm_bold.render(disp_v, True, v_col), (box_rect.x + 8, box_rect.y + 4))
+            prev_clip = self.screen.get_clip()
+            self.screen.set_clip(box_rect.inflate(-6, -2))
+            txt_s = self.font_sm_bold.render(disp_v, True, v_col)
+            txt_x = box_rect.x + 8
+            if is_active_fld and txt_s.get_width() > box_rect.width - 14:
+                txt_x = box_rect.right - 8 - txt_s.get_width()
+            self.screen.blit(txt_s, (txt_x, box_rect.y + 4))
+            self.screen.set_clip(prev_clip)
 
         # Render Raw Packet Hex string section
         hex_y = py + 36 + (rack_h + 10 if is_base else 0) + len(rows) * row_h

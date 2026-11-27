@@ -698,17 +698,18 @@ async def cloud_burst_loop(config, stats, packet_queue):
     buffer = []
     start_time = time.time()
     sdr_regions = config.get("_sdr_regions") if isinstance(config.get("_sdr_regions"), dict) else {}
+    sdr_sensors = config.get("_sdr_sensors") if isinstance(config.get("_sdr_sensors"), dict) else {}
     last_region_sync = 0.0
     region_sync_interval = 600.0  # Refresh private blurred SDR region registration every 10 min
 
-    async def _sync_sdr_regions_once() -> bool:
-        if not sdr_regions or cloud_ip == "None" or not cloud_port:
+    async def _send_private_banc_json(action_name: str, payload_dict: Dict[str, Any]) -> bool:
+        if not payload_dict or cloud_ip == "None" or not cloud_port:
             return False
         try:
             tok = mosfet_auth.generate_token(auth_secret)
-            hdr = f"PUT_SDR_REGION:{stats.identity}:{tok}"
+            hdr = f"{action_name}:{stats.identity}:{tok}"
             enc_hdr = fernet.encrypt(hdr.encode("utf-8"))
-            enc_pay = fernet.encrypt(json.dumps(sdr_regions).encode("utf-8"))
+            enc_pay = fernet.encrypt(json.dumps(payload_dict).encode("utf-8"))
             frame = struct.pack(">I", len(enc_hdr)) + enc_hdr + struct.pack(">I", len(enc_pay)) + enc_pay
             r_reg, w_reg = await asyncio.wait_for(asyncio.open_connection(cloud_ip, cloud_port), timeout=5.0)
             try:
@@ -729,9 +730,18 @@ async def cloud_burst_loop(config, stats, packet_queue):
         except Exception:
             return False
 
+    async def _sync_sdr_regions_once() -> bool:
+        ok_any = False
+        if sdr_regions:
+            ok_any = await _send_private_banc_json("PUT_SDR_REGION", sdr_regions) or ok_any
+        if sdr_sensors:
+            # Opt-in quantized (~275 m) private sensor anchor for server-only k>=3 localization
+            ok_any = await _send_private_banc_json("PUT_SDR_SENSOR", sdr_sensors) or ok_any
+        return ok_any
+
     while True:
-        # Privately register configured blurred SDR regions with Banc on startup & periodically
-        if sdr_regions and not getattr(stats, "upload_paused", False):
+        # Privately register configured blurred SDR regions (and opt-in localization anchors) with Banc
+        if (sdr_regions or sdr_sensors) and not getattr(stats, "upload_paused", False):
             now_reg = time.time()
             if last_region_sync <= 0.0 or (now_reg - last_region_sync) >= region_sync_interval:
                 ok_reg = await _sync_sdr_regions_once()
@@ -808,11 +818,9 @@ async def cloud_burst_loop(config, stats, packet_queue):
                     channel = 0
             
             b2_code, b3_tag, banc_hex, hash_basis = classify_packet_protocol(data, hex_data, channel=channel)
-            if b2_code == PKT_PROTO_PTC:
-                pkt_hash = hash(data) & ((1<<32)-1) # 32-bit positive int (legacy PTC path)
-            else:
-                # Deterministic cross-node 32-bit hash for ATCS / EOT-HOT-DPU-RLC deduplication in Banc
-                pkt_hash = zlib.crc32(hash_basis) & 0xFFFFFFFF
+            # Deterministic cross-node 32-bit CRC32 hash across all protocols (PTC, ATCS, FRED)
+            # so independent SDR/Flux stations produce identical pkt_hash for exact-burst matching in Banc
+            pkt_hash = zlib.crc32(hash_basis) & 0xFFFFFFFF
 
             # Relay true RSSI or fallback to "NA" / 0.0 for backwards compatibility
             if rssi is not None:
@@ -871,13 +879,52 @@ async def cloud_burst_loop(config, stats, packet_queue):
 # ---------------------------------------------------------------------------
 
 async def local_display_loop(stats):
-    """Continuously prints the UI to the local console standard output."""
+    """Continuously prints the UI to the local console standard output (or plain text scroll in --no-tui mode)."""
+    try:
+        import config_loader as _cfg_term
+    except Exception:
+        _cfg_term = None
+
+    no_tui = bool(getattr(stats, "no_tui", False))
+    use_color = bool(getattr(stats, "use_color", True))
+
+    if no_tui:
+        last_line = ""
+        last_print_ts = 0.0
+        try:
+            while True:
+                now_t = time.time()
+                active_ep = sum(1 for e in stats.endpoints.values() if e.get("status") == "CONNECTED")
+                cur_line = (
+                    f"[{datetime.now().strftime('%H:%M:%S')}] ApexBOSFlux | "
+                    f"Sources:{active_ep}/{len(stats.endpoints)} | "
+                    f"TotalPkts:{stats.total_packets} | Buf:{stats.packets_in_buffer} | "
+                    f"Bursts:{stats.cloud_bursts} ({stats.cloud_last_status})"
+                )
+                if cur_line != last_line and (now_t - last_print_ts >= 10.0 or last_print_ts == 0.0):
+                    sys.stdout.write(cur_line + "\n")
+                    sys.stdout.flush()
+                    last_line = cur_line
+                    last_print_ts = now_t
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+        return
+
     try:
         while True:
-            # Clear screen and move cursor to home position
-            sys.stdout.write("\033[2J\033[H")
+            if use_color:
+                sys.stdout.write("\033[2J\033[H")
+            else:
+                try:
+                    os.system("cls" if os.name == "nt" else "clear")
+                except Exception:
+                    sys.stdout.write("\n" * 2)
             buf = getattr(stats, "local_buffer", "")
-            sys.stdout.write(stats.generate_ascii_screen(buf))
+            screen_txt = stats.generate_ascii_screen(buf)
+            if not use_color and _cfg_term is not None:
+                screen_txt = _cfg_term.strip_ansi(screen_txt)
+            sys.stdout.write(screen_txt)
             sys.stdout.flush()
             await asyncio.sleep(1)
     except asyncio.CancelledError:
@@ -1164,6 +1211,8 @@ async def main():
     parser.add_argument("--config", type=str, default="MosFET.json", help="Path to JSON configuration file")
     parser.add_argument("--gen-config", action="store_true", help="Generate an example configuration file with all features")
     parser.add_argument("--display", action="store_true", help="Display the UI locally in the console")
+    parser.add_argument("--no-tui", action="store_true", help="Run console display in plain text scrolling mode")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI terminal colors")
     parser.add_argument("--itcmon", type=str, help="Path to an itcmon.json file to import enabled sources from")
     args = parser.parse_args()
 
@@ -1209,18 +1258,23 @@ async def main():
             if fp > 0:
                 aux_scan_pool.append(("127.0.0.1", fp))
 
-    # Extract optional privacy-blurred SDR reception regions from unified config before unwrapping
+    # Extract optional privacy-blurred SDR reception regions & opt-in localization anchors before unwrapping
     extracted_sdr_regions: Dict[str, Any] = {}
+    extracted_sdr_sensors: Dict[str, Any] = {}
     try:
         import config_loader as _cfg_loader
         extracted_sdr_regions = _cfg_loader.extract_sdr_regions_from_config(config)
+        extracted_sdr_sensors = _cfg_loader.extract_sdr_sensors_from_config(config)
     except Exception:
         extracted_sdr_regions = {}
+        extracted_sdr_sensors = {}
 
     if "flux" in config and isinstance(config["flux"], dict):
         flux_sub = dict(config["flux"])
         if extracted_sdr_regions:
             flux_sub["_sdr_regions"] = extracted_sdr_regions
+        if extracted_sdr_sensors:
+            flux_sub["_sdr_sensors"] = extracted_sdr_sensors
         if "common" in config and isinstance(config["common"], dict):
             common = config["common"]
             if "banc" in common:
@@ -1374,9 +1428,22 @@ async def main():
 
     # Start Local Display Loop if requested
     if args.display:
+        try:
+            import config_loader as _cfg_term
+            _use_tui, _use_color, _ = _cfg_term.init_terminal_mode(
+                no_tui=bool(getattr(args, "no_tui", False)),
+                no_color=bool(getattr(args, "no_color", False)),
+                announce_fallback=True,
+            )
+            stats.no_tui = not _use_tui
+            stats.use_color = _use_color
+        except Exception:
+            stats.no_tui = bool(getattr(args, "no_tui", False))
+            stats.use_color = not bool(getattr(args, "no_color", False))
         stats.local_buffer = ""
         asyncio.create_task(local_display_loop(stats))
-        asyncio.create_task(local_input_loop(stats))
+        if not stats.no_tui:
+            asyncio.create_task(local_input_loop(stats))
 
     # UI Server
     cmd_port = config.get("command_port", 8080)
@@ -1389,16 +1456,20 @@ async def main():
         await server.serve_forever()
 
 if __name__ == "__main__":
+    _flux_vt_ok = False
     try:
-        # Cross-platform support for asyncio + Windows ANSI rendering
+        try:
+            import config_loader as _cfg_term
+            _, _flux_vt_ok, _ = _cfg_term.init_terminal_mode(announce_fallback=False)
+        except Exception:
+            _flux_vt_ok = False
         if sys.platform == 'win32':
-            os.system('color') # Enable ANSI escape codes in Windows cmd/powershell
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
-        # Clear screen on exit cleanly if running display mode
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
+        if _flux_vt_ok:
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
         print("\nApexBOSFlux shut down successfully.")
 
 # ---------------------------------------------------------------------------

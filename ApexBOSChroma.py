@@ -584,6 +584,7 @@ PKT_TYPE_COLORS = {
     "TIME": (195, 115, 255),
     "QSTAT": (250, 225, 70),
     "ACK": (160, 195, 255),
+    "EMP": (0, 0, 0),
     "ATCS": (70, 185, 255),
     "EOT": (255, 85, 155),
     "HOT": (255, 200, 65),
@@ -683,6 +684,9 @@ def classify_blip_category(type_name: str, pkt_type: int) -> str:
         return "RLC"
     if "ATCS" in tn:
         return "ATCS"
+    # EMP (Class D) packets: all 0x50-0x5F and 0x70-0x7F types (0x50, 0x51, 0x70, 0x71, etc.)
+    if (0x50 <= pkt_type <= 0x5F) or (0x70 <= pkt_type <= 0x7F) or "EMP" in tn or "CLASS D" in tn or tn == "UNICAST":
+        return "EMP"
     if pkt_type in (0x33, 0x34) or "WIU" in tn or "WAYSIDE" in tn or "STATUS" in tn:
         return "WIU"
     if pkt_type == 0x02 or "BASE" in tn or "BEACON" in tn:
@@ -827,6 +831,13 @@ class PacketRuleEnricher:
                 short_lbl = f"ATCS {st_n[:10]}{tok_s}"
             else:
                 short_lbl = f"ATCS {str(meta.get('ctc_id') or meta.get('mcp_addr'))[-6:]}{tok_s}"
+        elif cat == "EMP":
+            if src and dst:
+                short_lbl = f"EMP 0x{pkt_type:02X} {src}->{dst}"
+            elif wiu:
+                short_lbl = f"EMP 0x{pkt_type:02X} {wiu}"
+            else:
+                short_lbl = f"EMP 0x{pkt_type:02X}"
         elif src and dst:
             short_lbl = f"{src}->{dst}"
         elif wiu:
@@ -916,6 +927,7 @@ class PacketBlipSubscriber:
             "railroad": en["railroad"],
             "short_label": en["short_label"],
             "telemetry": meta.get("telemetry") or {},
+            "filtered": bool(meta.get("filtered", False)),
         }
         with self.lock:
             self.blips.append(blip)
@@ -1020,10 +1032,17 @@ class GrabberIQClient:
     and REQ/REP control bridge (default tcp://127.0.0.1:18098).
     """
 
-    def __init__(self, iq_port: int = DEFAULT_CHROMA_IQ_PORT, ctrl_port: int = DEFAULT_CHROMA_CTRL_PORT, host: str = "127.0.0.1"):
+    def __init__(
+        self,
+        iq_port: int = DEFAULT_CHROMA_IQ_PORT,
+        ctrl_port: int = DEFAULT_CHROMA_CTRL_PORT,
+        host: str = "127.0.0.1",
+        on_packet_meta: Optional[Any] = None,
+    ):
         self.host = host
         self.iq_port = int(iq_port)
         self.ctrl_port = int(ctrl_port)
+        self._on_packet_meta = on_packet_meta
         self.connected = False
         self.last_rx_ts = 0.0
         self.latest_meta: Dict[str, Any] = {}
@@ -1080,31 +1099,47 @@ class GrabberIQClient:
     def _sub_loop(self):
         ctx = zmq.Context()
         sub = ctx.socket(zmq.SUB)
-        sub.setsockopt(zmq.RCVHWM, 2)
+        sub.setsockopt(zmq.RCVHWM, 64)
         sub.setsockopt(zmq.LINGER, 0)
         sub.setsockopt(zmq.SUBSCRIBE, b"IQ")
+        if self._on_packet_meta is not None:
+            sub.setsockopt(zmq.SUBSCRIBE, b"PKT")
         try:
             sub.connect(f"tcp://{self.host}:{self.iq_port}")
             while not self._stop_ev.is_set():
                 try:
                     if sub.poll(timeout=150):
-                        frames = sub.recv_multipart(flags=zmq.NOBLOCK)
-                        if len(frames) >= 3:
-                            meta = json.loads(frames[1].decode("utf-8"))
-                            iq_bytes = frames[2]
-                            self.connected = True
-                            self.last_rx_ts = time.monotonic()
-                            self.latest_meta.update(meta)
+                        while not self._stop_ev.is_set():
                             try:
-                                self._iq_queue.put_nowait((meta, iq_bytes))
-                            except queue.Full:
-                                try:
-                                    self._iq_queue.get_nowait()
-                                except queue.Empty:
-                                    pass
+                                frames = sub.recv_multipart(flags=zmq.NOBLOCK)
+                            except Exception:
+                                break
+                            if not frames:
+                                continue
+                            topic = frames[0]
+                            if topic == b"IQ" and len(frames) >= 3:
+                                meta = json.loads(frames[1].decode("utf-8"))
+                                iq_bytes = frames[2]
+                                self.connected = True
+                                self.last_rx_ts = time.monotonic()
+                                self.latest_meta.update(meta)
                                 try:
                                     self._iq_queue.put_nowait((meta, iq_bytes))
                                 except queue.Full:
+                                    try:
+                                        self._iq_queue.get_nowait()
+                                    except queue.Empty:
+                                        pass
+                                    try:
+                                        self._iq_queue.put_nowait((meta, iq_bytes))
+                                    except queue.Full:
+                                        pass
+                            elif topic == b"PKT" and len(frames) >= 2 and self._on_packet_meta is not None:
+                                try:
+                                    pkt_meta = json.loads(frames[1].decode("utf-8"))
+                                    if isinstance(pkt_meta, dict) and "channel" in pkt_meta:
+                                        self._on_packet_meta(pkt_meta)
+                                except Exception:
                                     pass
                 except Exception:
                     time.sleep(0.05)
@@ -1770,7 +1805,7 @@ class ApexBOSChromaApp:
         else:
             # Auto-detect running PTC, ATCS (Latch), and EOT/HOT (Fred) demodulators on their assigned ports
             self._probe_aux_demods(initial=True)
-            self.grabber_client = GrabberIQClient(iq_port=self.iq_port, ctrl_port=self.ctrl_port)
+            self.grabber_client = GrabberIQClient(iq_port=self.iq_port, ctrl_port=self.ctrl_port, on_packet_meta=self.blip_sub.add_blip)
             self.grabber_client.start()
             self.blip_sub.start(self._effective_blip_ports())
             state = self.grabber_client.send_control({"cmd": "get_state"}, timeout_ms=350)
@@ -2058,9 +2093,22 @@ class ApexBOSChromaApp:
         target = (not self.wideband_active) if force_val is None else bool(force_val)
         resp = self.grabber_client.send_control({"cmd": "set_wideband", "enabled": target}, timeout_ms=1000)
         if resp and resp.get("ok"):
-            self._sync_state_from_dict(resp)
-            self.fit_to_captured_band()
-            lbl = "WIDEBAND (2.304 MS/s, Ch 97-176)" if self.wideband_active else f"NATIVE ({self.engine.sample_rate/1e6:.3f} MS/s)"
+            # Do not pre-mutate engine.center_freq/sample_rate before retuned IQ arrives;
+            # process_iq_bytes() switches them atomically when the new-rate IQ chunk lands.
+            self._sync_state_from_dict(resp, sync_engine_rf=False)
+            target_sr = int(resp.get("sample_rate") or self.engine.sample_rate)
+            target_cf = int(resp.get("center_freq") or self.engine.center_freq)
+            if self.band == "ptc":
+                if target_sr >= 2000000:
+                    self.view_f_min = self.full_ptc_min_hz
+                    self.view_f_max = self.full_ptc_max_hz
+                else:
+                    half = target_sr * 0.52
+                    self.view_f_min = target_cf - half
+                    self.view_f_max = target_cf + half
+            else:
+                self.fit_to_captured_band()
+            lbl = "WIDEBAND (2.304 MS/s, Ch 97-176)" if self.wideband_active else f"NATIVE ({target_sr/1e6:.3f} MS/s)"
             self.set_toast(f"Grabber Bandwidth -> {lbl}")
         else:
             self.set_toast("Grabber not connected (unable to switch bandwidth).")
@@ -2073,7 +2121,9 @@ class ApexBOSChromaApp:
         else:
             resp = self.grabber_client.send_control({"cmd": "add_channel", "channel": ch})
         if resp and resp.get("ok"):
-            self._sync_state_from_dict(resp)
+            # Keep engine.center_freq/sample_rate locked to the actual incoming IQ metadata
+            # so live spectrum curves never jump or misalign before retuned IQ arrives.
+            self._sync_state_from_dict(resp, sync_engine_rf=False)
             action = "Monitoring" if ch in self.monitored_channels else "Removed"
             self.set_toast(f"{action} PTC Ch {ch} ({itc_channel_frequency(ch)/1e6:.4f} MHz)")
         elif resp and resp.get("error"):
@@ -2148,7 +2198,7 @@ class ApexBOSChromaApp:
         if self.mode == "grabber":
             if self.grabber_client:
                 self.grabber_client.stop()
-            self.grabber_client = GrabberIQClient(iq_port=self.iq_port, ctrl_port=self.ctrl_port)
+            self.grabber_client = GrabberIQClient(iq_port=self.iq_port, ctrl_port=self.ctrl_port, on_packet_meta=self.blip_sub.add_blip)
             self.grabber_client.start()
             self.blip_sub.update_ports(self._effective_blip_ports())
             self.set_toast(f"Switched Chroma band -> {self._band_profile['label']} (IQ:{self.iq_port}, Ctrl:{self.ctrl_port})")
@@ -2656,14 +2706,20 @@ class ApexBOSChromaApp:
                 bx = int(self.freq_to_x(fx, wf_rect))
                 bcol = b["color"]
 
-                # Draw blip diamond / bracket marker
-                pygame.draw.circle(self.screen, (10, 12, 18), (bx, by), 5)
-                pygame.draw.circle(self.screen, bcol, (bx, by), 3)
+                # Draw blip marker (EMP packets render as high-contrast pure black dots)
+                is_emp = (b.get("category") == "EMP")
+                if is_emp:
+                    pygame.draw.circle(self.screen, (245, 248, 255), (bx, by), 5)
+                    pygame.draw.circle(self.screen, (0, 0, 0), (bx, by), 4)
+                else:
+                    pygame.draw.circle(self.screen, (10, 12, 18), (bx, by), 5)
+                    pygame.draw.circle(self.screen, bcol, (bx, by), 3)
                 hit_r = pygame.Rect(bx - 7, by - 7, 14, 14)
                 self.blip_hit_rects.append((hit_r, b))
 
                 if self.show_blip_labels:
-                    lbl_s = self.font_xs.render(b["short_label"], True, bcol)
+                    lbl_fg = (0, 0, 0) if is_emp else bcol
+                    lbl_s = self.font_xs.render(b["short_label"], True, lbl_fg)
                     lw, lh = lbl_s.get_size()
                     lx = min(wf_rect.right - lw - 4, bx + 7)
                     ly = by - lh // 2
@@ -2671,7 +2727,11 @@ class ApexBOSChromaApp:
                     if not any(lrect.colliderect(ob) for ob in occupied_lbl_boxes):
                         occupied_lbl_boxes.append(lrect)
                         bg_s = pygame.Surface((lrect.width, lrect.height), pygame.SRCALPHA)
-                        bg_s.fill((8, 12, 18, 185))
+                        if is_emp:
+                            bg_s.fill((235, 240, 248, 225))
+                            pygame.draw.rect(bg_s, (0, 0, 0, 255), (0, 0, lrect.width, lrect.height), 1)
+                        else:
+                            bg_s.fill((8, 12, 18, 185))
                         self.screen.blit(bg_s, lrect.topleft)
                         self.screen.blit(lbl_s, (lx, ly))
 
@@ -2720,9 +2780,12 @@ class ApexBOSChromaApp:
             cy = max(wf_rect.top + 8, min(wf_rect.bottom - ch - 8, my - ch - 8))
             card = pygame.Surface((cw, ch), pygame.SRCALPHA)
             card.fill((12, 18, 28, 235))
-            pygame.draw.rect(card, inspect_b["color"], (0, 0, cw, ch), 1, border_radius=5)
+            is_emp_card = (inspect_b.get("category") == "EMP")
+            border_col = (220, 228, 240) if is_emp_card else inspect_b["color"]
+            hdr_col = (245, 248, 255) if is_emp_card else inspect_b["color"]
+            pygame.draw.rect(card, border_col, (0, 0, cw, ch), 1, border_radius=5)
             for idx, ln in enumerate(lines):
-                c = inspect_b["color"] if idx == 0 else COLOR_TEXT
+                c = hdr_col if idx == 0 else COLOR_TEXT
                 card.blit(self.font_sm.render(ln, True, c), (10, 7 + idx * 16))
             self.screen.blit(card, (cx, cy))
 

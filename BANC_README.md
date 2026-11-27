@@ -5,7 +5,7 @@
 
 **ApexBOSBanc** is an asynchronous, dual-stack (IPv4 & IPv6) cloud telemetry receiver, remote railroad layout distribution server, and inter-station operator communications hub for the **ApexBOS** Railroad Dispatcher & Trackside Simulation ecosystem.
 
-Operating as a centralized relay backbone, ApexBOSBanc aggregates real-time 220 MHz telemetry RF packet streams relayed from distributed **ApexBOSFlux** edge receiver nodes, serves layout geometries and WIU status tables to **ApexBOS Dispatcher Engine** and **ApexBOSCreator** studios, and arbitrates secure, authenticated dispatcher-to-dispatcher chat messaging across remote terminals.
+Operating as a centralized relay backbone, ApexBOSBanc aggregates real-time multi-band telemetry streams (220 MHz PTC, 900 MHz ATCS, and 450 MHz EOT/HOT/DPU/RLC) relayed from distributed **ApexBOSFlux** edge receiver nodes, serves layout geometries and WIU status tables to **ApexBOS Dispatcher Engine** and **ApexBOSCreator** studios, runs a **privacy-preserving multi-SDR RF Triangulation Engine** ([rf_localizer.py](rf_localizer.py)), and arbitrates secure, authenticated dispatcher-to-dispatcher chat messaging across remote terminals.
 
 ---
 
@@ -82,9 +82,10 @@ The primary screen provides an instant status overview of system health, active 
    - **Active Conns**: Live count of concurrent client TCP sockets connected to the data server.
    - **Total Pkt/Min**: Aggregated rolling packet throughput received across all field Flux relays.
    - **DB Rows & Size**: Instant SQLite row count and disk consumption of active packet buffers.
-3. **Service State Badges**:
+3. **Service State Badges & RF Localizer Status**:
    - **PUT Service**: `[ACTIVE]` (normal ingestion) or `[PAUSED]` (temporarily rejecting new packet bursts with `ERROR:PAUSED`).
    - **GET Service**: `[ACTIVE]` (streaming packets to Engines) or `[PAUSED]`.
+   - **RF Localizer**: Live summary row showing calibrated sensor anchor count (`N anchor(s)`) and active anonymized location estimates (`X WIU, Y Train, Z Other`).
 4. **Active Mirror Relays**:
    - Real-time health monitoring of upstream/downstream Banc mirrors, showing connection state (`ACTIVE`, `PENDING`, or error state) and cumulative transmission errors.
 5. **Top 10 Active Identities**:
@@ -168,11 +169,20 @@ Banc instances can form resilient distributed networks using mirror relays:
 - Built-in **hop and loop suppression**: Relayed packets and messages carry cryptographic relay UIDs (`_relayed: True`, `_relay_uid`) to prevent duplicate rebroadcasts.
 - Automatic reconnection with exponential backoff if a peer server temporarily drops.
 
-### 5. Local Console Display vs. Telnet Remote Management
-- **Local Console (`--display`)**: Renders the animated ANSI dashboard directly into your SSH terminal or command prompt.
+### 5. Local Console Display, ANSI Fallback & Telnet Remote Management
+- **Local Console (`--display`)**: Renders the animated ANSI dashboard directly into your SSH terminal or command prompt, automatically falling back to clean plain-text scroll mode (`--no-tui --no-color`) on Legacy Windows Consoles, `TERM=dumb`, or redirected non-TTY outputs.
 - **Telnet Server (`ui_port: 23010`)**: Allows dispatchers to connect remotely using standard telnet or netcat clients (`telnet <banc-ip> 23010`) to view live metrics and issue administrative commands without accessing the server shell.
 
-### 6. Database Inspection (`--inspect-db <LIMIT>`)
+### 6. Privacy-Preserving Multi-SDR RF Triangulation (`rf_localizer.py`)
+When multiple geographically separated SDR stations feed the same Banc server, `ApexBOSBanc` automatically runs [rf_localizer.py](rf_localizer.py) to estimate transmitter locations without compromising receiver privacy:
+- **Stationary Transmitters (WIUs, Bases, ATCS MCPs, DPU Offboard Repeaters)**: Uses deterministic cross-node burst fingerprinting (3.0 s coincidence window), automatic per-SDR gain-bias calibration against known-GPS WIUs, and zero-input auto-calibration of PTC SDR anchor positions. Estimates enrich unlocated WIUs in **ApexBOS Creator** (`est_gps`) without ever overwriting verified ground-truth GPS.
+- **Moving Trains (EOT, HOT, Direct DPU/DSU)**: Estimates live train positions and headings using RSSI-difference likelihood and exponential kinematic smoothing (filtering strictly to direct `RP==DI` DPU frames to exclude repeater artifacts), feeding the Viewer's **Train Board**.
+- **Strict Anti-Doxxing & k-Anonymity Guarantees**:
+  - Opt-in private sensor coordinates are stored strictly server-side under opaque random `sensor_id`s decoupled from user identities and are **never** returned by any GET API.
+  - Single-SDR observations (`k = 1`) **never** produce a published estimate; `k >= 3` independent sensors produce medium/high-confidence fixes, while `k = 2` produces wide-radius ($\ge 6\text{ km}$) coarse estimates only.
+  - Published coordinates are grid-quantized with minimum containment radii, omit all sensor IDs and per-SDR RSSI values, and enforce anti-triangulation query rate limits and minimum query radius floors ($\ge 10\text{ km}$).
+
+### 7. Database Inspection (`--inspect-db <LIMIT>`)
 Outputs the latest $N$ raw packet records from `banc.db` directly to stdout in JSON format for debugging and verification, then cleanly terminates:
 ```bash
 python ApexBOSBanc.py --config banc.json --inspect-db 20
@@ -325,7 +335,7 @@ tail -f ~/ApexBOSBanc/banc.log
 
 Expected log output:
 ```text
-[*] Starting ApexBOSBanc v26.1113.01 (PID: 12450)
+[*] Starting ApexBOSBanc v26.1127.08 (PID: 12450)
 [INFO ] Initializing SQLite database at 'banc.db'...
 [INFO ] Data server listening on [::]:23009 (dual-stack / IPv6)
 [INFO ] Telnet UI server listening on [::1]:23010

@@ -91,9 +91,10 @@ DEFAULT_CONFIG = {
             "x2_base_rules.json",
             "x01_rules.json",
             "x05_rules.json",
-            "x70_rules.json",
             "x06_rules.json",
             "x04_rules.json",
+            "ctc_rules.json",
+            "x70_rules.json",
         ],
         "connections": {
             "mcast_group": "239.1.1.1",
@@ -123,9 +124,10 @@ DEFAULT_CONFIG = {
         "x2_base_rules.json",
         "x01_rules.json",
         "x05_rules.json",
-        "x70_rules.json",
         "x06_rules.json",
         "x04_rules.json",
+        "ctc_rules.json",
+        "x70_rules.json",
     ],
 }
 
@@ -249,11 +251,7 @@ class DispatcherHostMonitor:
 
         engine_section = config.get("engine", {}) if isinstance(config.get("engine"), dict) else {}
         connections = self._get_connections()
-        self.packet_source = self._init_packet_source(force_banc_source=force_banc_source, initial_source=initial_source)
-        self.force_banc_source = bool(self.packet_source == "banc")
-        self._banc_task = None
-        self._mcast_task = None
-        self._banc_reset_needed = False
+        self._cli_forced_mcast = str(initial_source or "").lower().strip() in ("mcast", "multicast", "flux", "udp")
 
         self.auth_secret = connections.get("auth_secret")
         self.rx_mcast_group = connections.get("mcast_group")
@@ -263,6 +261,29 @@ class DispatcherHostMonitor:
         if raw_rx_prt is None and "mcast_port" not in connections:
             raw_rx_prt = 23003
         self.rx_mcast_port = int(raw_rx_prt) if (raw_rx_prt is not None and str(raw_rx_prt).isdigit()) else None
+
+        if self._cli_forced_mcast and (
+            not self.rx_mcast_group or str(self.rx_mcast_group).lower() == "none" or self.rx_mcast_port is None
+        ):
+            flux_mc = (config.get("flux", {}) if isinstance(config.get("flux"), dict) else {}).get("multicast", {})
+            if not isinstance(flux_mc, dict):
+                flux_mc = {}
+            fb_grp = flux_mc.get("group") or "239.1.1.1"
+            fb_prt = flux_mc.get("port") or 23003
+            if not self.rx_mcast_group or str(self.rx_mcast_group).lower() == "none":
+                self.rx_mcast_group = str(fb_grp)
+            if self.rx_mcast_port is None:
+                try:
+                    self.rx_mcast_port = int(fb_prt)
+                except (ValueError, TypeError):
+                    self.rx_mcast_port = 23003
+
+        self.packet_source = self._init_packet_source(force_banc_source=force_banc_source, initial_source=initial_source)
+        self.force_banc_source = bool(self.packet_source == "banc")
+        self._banc_task = None
+        self._mcast_task = None
+        self._banc_reset_needed = False
+
         self.banc_host = connections.get("banc_host", "none")
         self.banc_port = connections.get("banc_port", 23009)
         self.banc_layout_name: Optional[str] = banc_layout
@@ -501,7 +522,16 @@ class DispatcherHostMonitor:
         connections = self._get_connections()
         group = connections.get("mcast_group")
         port = connections.get("mcast_port")
-        return bool(group and str(group).lower() != "none" and str(group).strip() != "" and port is not None)
+        if bool(group and str(group).lower() != "none" and str(group).strip() != "" and port is not None):
+            return True
+        if getattr(self, "_cli_forced_mcast", False):
+            return bool(
+                getattr(self, "rx_mcast_group", None)
+                and str(self.rx_mcast_group).lower() != "none"
+                and str(self.rx_mcast_group).strip() != ""
+                and getattr(self, "rx_mcast_port", None) is not None
+            )
+        return False
 
     def is_banc_valid(self) -> bool:
         connections = self._get_connections()
@@ -611,7 +641,7 @@ class DispatcherHostMonitor:
                 return False
             self.banc_layout_name = layout_name
             self.active_file = f"banc_{layout_name}.json"
-            self.engine.load_layout_data(layout_data, layout_filename=f"banc_{layout_name}.json")
+            self.engine.load_layout_data(layout_data, layout_filename=f"banc_{layout_name}.json", banc_layout_name=layout_name)
             state = self.engine.get_render_state()
             self.engine.broadcast_state(state)
             self.log_message(
@@ -674,12 +704,40 @@ class DispatcherHostMonitor:
             print(f"[{ts}] [{level.upper():<5}] {text}", flush=True)
 
     def reload_layout(self):
-        if getattr(self, "banc_layout_name", None):
+        # Always follow the layout currently loaded in DispatcherEngine (which may have been
+        # switched dynamically from the Viewer via load_local_layout / load_banc_layout).
+        eng_banc = getattr(self.engine, "banc_layout_name", None)
+        if eng_banc:
+            self.banc_layout_name = eng_banc
+            self.active_file = getattr(self.engine, "layout_filename", f"banc_{eng_banc}.json")
+            self.log_message("INFO", f"Reloading layout '{eng_banc}' from ApexBOSBanc Cloud...")
+            self.load_layout_from_banc(eng_banc)
+            return
+
+        eng_fp = getattr(self.engine, "layout_filepath", None)
+        eng_fn = getattr(self.engine, "layout_filename", None)
+        eng_dir = getattr(self.engine, "config_dir", None)
+        resolved = ""
+        if eng_fp and os.path.isfile(eng_fp):
+            resolved = os.path.abspath(eng_fp)
+            self.banc_layout_name = None
+            self.active_file = resolved
+        elif eng_fn:
+            cand = self._resolve_layout_path(eng_fn, base_dir=eng_dir, config_path=self.config.get("config_path"))
+            if cand and os.path.isfile(cand):
+                resolved = cand
+                self.banc_layout_name = None
+                self.active_file = resolved
+
+        if not resolved and getattr(self, "banc_layout_name", None):
             self.log_message("INFO", f"Reloading layout '{self.banc_layout_name}' from ApexBOSBanc Cloud...")
             self.load_layout_from_banc(self.banc_layout_name)
             return
-        resolved = self._resolve_layout_path(self.active_file, config_path=self.config.get("config_path"))
-        if os.path.exists(resolved):
+
+        if not resolved:
+            resolved = self._resolve_layout_path(self.active_file, config_path=self.config.get("config_path"))
+
+        if resolved and os.path.exists(resolved):
             try:
                 self.engine.load_layout(resolved)
                 state = self.engine.get_render_state()
@@ -1711,6 +1769,7 @@ async def banc_listener(monitor: DispatcherHostMonitor, config: dict):
     seen_window_keys: set = set()
     window_records: deque = deque()
     last_err_log = 0.0
+    last_est_poll = 0.0
     is_startup = True
 
     try:
@@ -1838,6 +1897,17 @@ async def banc_listener(monitor: DispatcherHostMonitor, config: dict):
                 else:
                     if is_startup:
                         is_startup = False
+
+                # Periodically fetch anonymized multi-SDR RF train location estimates from Banc
+                now_est = time.time()
+                if (now_est - last_est_poll) >= 12.0:
+                    last_est_poll = now_est
+                    try:
+                        train_ests = await client.get_estimates(category="train", geo_filter=geo_filter, timeout=3.0)
+                        if train_ests and getattr(monitor, "engine", None) and getattr(monitor.engine, "train_scroller", None):
+                            monitor.engine.train_scroller.apply_rf_location_estimates(train_ests)
+                    except Exception:
+                        pass
 
             except asyncio.CancelledError:
                 raise

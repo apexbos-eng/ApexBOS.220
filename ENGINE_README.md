@@ -5,7 +5,7 @@
 
 The **ApexBOS Dispatcher Engine** (hosted via [ApexBOS.220.py](ApexBOS.220.py) and implemented in [dispatcher_engine.py](dispatcher_engine.py)) is the central computational host of the **ApexBOS** Railroad Dispatcher & Trackside Simulation ecosystem.
 
-Acting as the bridge between raw RF demodulation and live graphical dispatcher boards, the Engine ingests high-speed 220 MHz digital radio telemetry streams from local UDP multicast networks or the **ApexBOSBanc** cloud. It continuously executes track circuit logic, resolves signal aspects, aligns switch points, tracks train movements, predicts headway collisions, and broadcasts compressed state-delta frames to local and remote terminal Viewers ([View_ApexBOS.220.py](View_ApexBOS.220.py)).
+Acting as the bridge between raw RF demodulation and live graphical dispatcher boards, the Engine ingests high-speed multi-band digital radio telemetry streams—**220 MHz PTC** (`ApexBOSGrabber`), **900 MHz ATCS** (`ApexBOSLatch`), and **450 MHz EOT/HOT/DPU/RLC** (`ApexBOSFred`)—from local UDP multicast networks or the **ApexBOSBanc** cloud. It continuously executes track circuit logic, evaluates both PTC WIU status words and CTC boolean rules (including Out-of-Service `; Z...` bits and PTC-over-CTC priority), aligns switch points, tracks PTC and EOT/HOT/DPU trains (with Banc RF-triangulated positions and geographic territory filtering), predicts headway collisions, and broadcasts compressed state-delta frames to local and remote terminal Viewers ([View_ApexBOS.220.py](View_ApexBOS.220.py)).
 
 ```
 +----------------------------------------------------------------------------------------------------+
@@ -163,7 +163,7 @@ The Engine host interface ([ApexBOS.220.py](ApexBOS.220.py)) provides a high-den
 The dashboard is structured into nine operational zones:
 
 1. **Pinned Header & Operator Action Bar (Row 0)**:
-   - Version identifier: `ApexBOS.220 Dispatcher Engine Host (v26.1113.01)`.
+   - Version identifier: `ApexBOS.220 Dispatcher Engine Host (v26.1127.08)`.
    - Active layout file: `Layout: arrow_layout.json`.
    - Single-key commands: `'o' Load Banc`, `'i' Src [MCAST]`, `'d' Dedup (0.40s)`, `'p' Scroll [OFF]`, `'r' Reload`, `'R' Parsers`, `'s' Save`, `'b' Broadcast`.
 2. **Network & Engine Endpoints Bar (Row 1, Cyan)**:
@@ -252,7 +252,7 @@ The Engine supports hybrid telemetry acquisition, capable of operating from loca
 
 1. **Multicast UDP (`mcast`)**:
    - Ingests raw packet datagrams broadcast by [ApexBOSGrabber.py](ApexBOSGrabber.py) or [ApexBOSFlux.py](ApexBOSFlux.py) on group `239.1.1.1:23003`.
-   - Ideal for local installations with on-site SDR receivers.
+   - Ideal for local installations with on-site SDR receivers. Launching via **ApexBOSLauncher's "Start Local Monitoring"** automatically forces `--source mcast`.
 2. **ApexBOSBanc Cloud (`banc`)**:
    - Connects to remote [ApexBOSBanc.py](ApexBOSBanc.py) servers over IPv4 or IPv6 TCP port `23009`.
    - Authenticates using TOTP credentials via [mosfet_auth.py](mosfet_auth.py) and decrypts payloads via Fernet.
@@ -349,11 +349,23 @@ Turnouts determine train routes and signal governance:
 - Transitions switch points between **Normal** (tangent route) and **Reverse** (diverging route).
 - Automatically updates signal interlocks: if a turnout reverses toward Track B, signals governing opposing routes are held at Stop (`top:rd`).
 
-### Track Block Occupancy & Indication Propagation
+### Track Block Occupancy, CTC Rules Engine & Out-of-Service (`; Z...`) Handling
 
-Track circuits report clear or occupied states:
-- Direct Occupancy: Extracted from WIU status words when `has_occ_bit` is true.
-- Dynamic Inferred Occupancy: When trains move across blocks without discrete track circuits, the Engine infers occupancy by analyzing signal drops and train progression.
+Track circuits, turnouts, and signals support both **220 MHz PTC WIU status words** and **CTC / ATCS code-line boolean rules**:
+- **Direct WIU Occupancy & PTC Priority**: Extracted from 220 MHz WIU status words (`has_occ_bit` / `occ_bit_offset`). When an element defines both a 220 MHz `wiu_id` and `ctc_rules`, live PTC WIU telemetry takes priority and automatically falls back to CTC if PTC goes stale.
+- **Multi-Address CTC Matching (`ctc_id`)**: Elements accept one or more comma-separated CTC addresses (`ctc_id`), matched against EMP CTC packets decoded by `config/ctc_rules.json` (ordered before generic `x70_rules.json`) or 900 MHz ATCS packets from `ApexBOSLatch`.
+- **Direction-Aware CTC Boolean Rule Engine (`ctc_rules`)**:
+  - Uses precomputed 128-bit lookup tables, compiled `@lru_cache` AST evaluation, and single-mask bit folding for minimal CPU overhead.
+  - Supports boolean operators (`OR`, `AND`, `AND/OR`, `NOT`, parentheses, and commas).
+  - Honors the packet's `_kc_` field: **`K<n>`** bits match only Indication (`K`) packets, **`C<n>`** bits match only Command (`C`) packets, and **bare letterless integers** (e.g. `11`, `25`) match **both `K` and `C`** packets. Packets whose `_kc_` does not match an element's rule preserve the element's previous state cleanly.
+  - **Out-of-Service (OOS) Clause (`; Z<expr>`)**: Trailing `; Z...` bit expressions (matched on `K` indication packets only) place a track block into an **Out-of-Service** state rendered in the Viewer as dotted white-and-red track with a centered `OOS` badge.
+- **Live Session-Only Temporary Overrides**: Accepts `SET_TEMP_OVERRIDE` and `REVERT_TEMP_OVERRIDE` requests from Viewer's Element Inspector so operators can test `wiu_id`, bit offsets, `ctc_id`, and `ctc_rules` live without editing the layout JSON on disk.
+- **Dynamic Inferred Occupancy**: When trains move across blocks without discrete track circuits, the Engine infers occupancy by analyzing signal drops and train progression.
+
+### Multi-Band EOT / HOT / DPU Train Inference & Geographic Filtering
+
+- **450 MHz EOT/HOT & DPU Integration (`ApexBOSFred`)**: Decodes EOT/HOT (AAR S-9152) and DPU/DSU (`config/dpu_rules.json`) packets into unified **Train Board** rows (brake pressure, motion, battery, lead/remote consist state) and correlates them with PTC tracks and **ApexBOSBanc** multi-SDR RF-triangulated train coordinates/headings.
+- **Banc Geographic Territory Filtering**: When ingesting telemetry from a remote **ApexBOSBanc** hub serving multiple regions, the Engine filters inferred RF trains geographically to the active layout's territory so distant out-of-region trains do not pollute the local board.
 
 ---
 
@@ -541,9 +553,11 @@ python dispatcher_engine.py --layout layouts/arrow_layout.json --mcast-group 224
             "x2_base_rules.json",
             "x01_rules.json",
             "x05_rules.json",
+            "ctc_rules.json",
             "x70_rules.json",
             "x06_rules.json",
-            "x04_rules.json"
+            "x04_rules.json",
+            "dpu_rules.json"
         ]
     },
     "connections": {
@@ -572,8 +586,8 @@ The curses dashboard provides single-keystroke controls for all primary maintena
 | `i` / `I` | **Toggle Ingress Source** | Cycles packet source between `MCAST`, `BANC`, and `BOTH`. |
 | `d` / `D` | **Adjust Dedup TTL** | Prompts to update the packet deduplication window in seconds. |
 | `p` / `P` | **Toggle Packet Scroll** | Toggles real-time decoded packet logging (`[ON]` / `[OFF]`). |
-| `r` | **Reload Layout** | Re-reads the active layout file from disk and refreshes state. |
-| `R` | **Reload Parsers** | Re-compiles all JSON rule files in `config/` without restarting. |
+| `r` | **Reload Layout** | Re-reads whichever layout is **currently active in the Viewer** (including layouts switched via Viewer or loaded from Banc—not just the startup layout) and refreshes state. |
+| `R` | **Reload Parsers** | Re-compiles all JSON rule files in `config/` (including `ctc_rules.json`, `atcs_rules.json`, `dpu_rules.json`, and `rlc_rules.json`) without restarting. |
 | `s` / `S` | **Save Layout** | Saves current element states and layouts to disk. |
 | `b` / `B` | **Force Broadcast** | Forces an immediate state frame transmission to all Viewers. |
 | `c` / `C` | **Clear Log Buffer** | Wipes the message workspace buffer. |

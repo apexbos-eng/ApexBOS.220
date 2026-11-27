@@ -1331,6 +1331,76 @@ class TrainTracker:
         self.trains[train_name] = rec
         return train_name
 
+    def apply_rf_location_estimates(self, estimates: List[dict]) -> int:
+        """
+        Enriches active RF trains (HOT/EOT/DPU) with anonymized multi-SDR RF location
+        and heading estimates fetched from Banc Cloud (GET_ESTIMATES category='train').
+        Returns the number of train rows updated.
+        """
+        if not estimates or not self.trains:
+            return 0
+        by_eot: Dict[str, dict] = {}
+        by_dpu: Dict[str, dict] = {}
+        for est in estimates:
+            if not isinstance(est, dict):
+                continue
+            tx_key = str(est.get("tx_key") or "").strip().lower()
+            uid = str(est.get("unit_id") or "").strip()
+            proto = str(est.get("proto") or "").strip().lower()
+            if not uid or est.get("est_lat") is None or est.get("est_lon") is None:
+                continue
+            if proto in ("eot", "hot") or tx_key.startswith(("eot:", "hot:")):
+                norm_u = uid.zfill(5) if uid.isdigit() else uid
+                prev = by_eot.get(norm_u)
+                # Prefer higher-confidence or newer estimate when both HOT and EOT exist
+                if prev is None or float(est.get("updated_ts", 0.0)) >= float(prev.get("updated_ts", 0.0)):
+                    by_eot[norm_u] = est
+            elif proto == "dpu" or tx_key.startswith("dpu:"):
+                prev = by_dpu.get(uid)
+                if prev is None or float(est.get("updated_ts", 0.0)) >= float(prev.get("updated_ts", 0.0)):
+                    by_dpu[uid] = est
+
+        updated = 0
+        for rec in self.trains.values():
+            if not rec.get("is_rf_train"):
+                continue
+            matched = None
+            eot_id = rec.get("eot_id")
+            if eot_id is not None:
+                norm_e = str(eot_id).strip().zfill(5) if str(eot_id).strip().isdigit() else str(eot_id).strip()
+                matched = by_eot.get(norm_e)
+            if matched is None:
+                dpu_addr = rec.get("dpu_addr") or rec.get("dpu_id")
+                if dpu_addr is not None:
+                    matched = by_dpu.get(str(dpu_addr).strip())
+            if matched is None:
+                continue
+
+            est_lat = float(matched["est_lat"])
+            est_lon = float(matched["est_lon"])
+            est_rad_km = float(matched.get("est_radius_km", 6.0))
+            est_rad_mi = est_rad_km * 0.621371192
+            conf = str(matched.get("confidence") or "low")
+            hdg_deg = matched.get("heading_deg")
+            hdg_card = str(matched.get("heading_cardinal") or "").strip()
+            spd_mph = matched.get("speed_mph")
+
+            rec["est_gps"] = [est_lat, est_lon]
+            rec["est_radius_km"] = round(est_rad_km, 2)
+            rec["est_confidence"] = conf
+            rec["est_heading_deg"] = hdg_deg
+            rec["est_heading_cardinal"] = hdg_card
+            rec["est_speed_mph"] = spd_mph
+            rec["est_sample_count"] = int(matched.get("sample_count", 0))
+            rec["est_updated_ts"] = float(matched.get("updated_ts", 0.0))
+
+            hdg_part = f" {hdg_card}" if hdg_card else ""
+            rec["last_location"] = f"RF~{est_lat:.3f},{est_lon:.3f} (±{est_rad_mi:.1f}mi{hdg_part})"
+            if hdg_card and str(rec.get("direction") or "").strip() in ("", "---", "?", "Unk."):
+                rec["direction"] = f"~{hdg_card}"
+            updated += 1
+        return updated
+
     def delete_train(self, train_key: str) -> Optional[dict]:
         """Deletes a train by its key or assigned identifier."""
         matched_key = None

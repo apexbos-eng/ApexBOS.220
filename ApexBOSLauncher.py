@@ -625,6 +625,8 @@ class ProcessManager:
         ]
         if grabber_cfg.get("auto_tune"):
             args.append("--auto-tune")
+        if grabber_cfg.get("filter_ctrl") is False:
+            args.append("--no-filter-ctrl")
 
         sdr_mode = str(grabber_cfg.get("sdr_mode") or "auto").strip().lower()
         if sdr_mode and sdr_mode != "auto":
@@ -992,6 +994,8 @@ class ProcessManager:
         use_banc = remote_banc_mode if remote_banc_mode is not None else self.is_banc_source()
         if use_banc:
             args.extend(["--source", "banc"])
+        elif remote_banc_mode is False:
+            args.extend(["--source", "mcast"])
 
         title = f"ApexBOS DispatcherEngine (Pair #{pair_idx} | UDP {mcast_port} | TCP {tcp_port})"
         marker = get_stop_marker_path(proc_key)
@@ -1164,12 +1168,12 @@ class ProcessManager:
     def start_local_monitoring(self):
         """
         Macro workflow: Starts single Grabber, Flux, Engine,
-        and Viewer for full local dispatching.
+        and Viewer for full local dispatching using multicast as the Engine packet source.
         """
         dep_mode = str(self.config.get("common", {}).get("deployment_mode") or "local").lower()
         if dep_mode in ("engines_viewers", "client", "display"):
             self.monitoring_mode = "local"
-            self.start_pair(pair_idx=1, remote_banc_mode=False if not self.is_banc_source() else None)
+            self.start_pair(pair_idx=1, remote_banc_mode=False)
             self.set_toast("Started Engine & Viewer (Pair #1).")
             return
 
@@ -1178,7 +1182,7 @@ class ProcessManager:
         time.sleep(0.3)
         self.start_flux()
         time.sleep(0.3)
-        self.start_pair(pair_idx=1, remote_banc_mode=False if not self.is_banc_source() else None)
+        self.start_pair(pair_idx=1, remote_banc_mode=False)
         self.set_toast("Started full Local Monitoring stack.")
 
     def start_remote_monitoring(self):
@@ -1231,6 +1235,8 @@ class ProcessManager:
             args = [py_exe, "ApexBOSGrabber.py", "--chans", chans_str, "--procs", str(procs_arg), "--device", str(device_idx), "--bias-tee", "1"]
             if grabber_cfg.get("auto_tune"):
                 args.append("--auto-tune")
+            if grabber_cfg.get("filter_ctrl") is False:
+                args.append("--no-filter-ctrl")
             sdr_mode = str(grabber_cfg.get("sdr_mode") or "auto").strip().lower()
             if sdr_mode and sdr_mode != "auto":
                 args.extend(["--sdr-mode", sdr_mode])
@@ -1353,7 +1359,7 @@ class ProcessManager:
             return subprocess.list2cmdline([py_exe, "setup_wizard.py"])
 
         if key_low == "update":
-            return subprocess.list2cmdline([py_exe, "update.py", "--relaunch"])
+            return subprocess.list2cmdline([py_exe, "update.py"])
 
         if key_low == "uninstall":
             return subprocess.list2cmdline([py_exe, "uninstall.py"])
@@ -2079,7 +2085,7 @@ class ApexBOSLauncherApp:
     def _run_update_external(self):
         """Stops managed processes, launches update.py in a console, and exits Launcher."""
         self.mgr.stop_all()
-        spawn_in_new_terminal("ApexBOS Updater", "update.py", ["--relaunch"])
+        spawn_in_new_terminal("ApexBOS Updater", "update.py", [])
         self._running = False
 
     def _run_uninstall_external(self):

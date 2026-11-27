@@ -16,7 +16,7 @@ if (-not $isAdmin) {
 Write-Host "======================================================================" -ForegroundColor Cyan
 Write-Host "  ApexBOS Windows 11 Firewall & Multicast Group Setup" -ForegroundColor Cyan
 Write-Host "======================================================================" -ForegroundColor Cyan
-Write-Host "Configured Multicast Groups: 224.1.1.1, 239.1.1.1" -ForegroundColor Cyan
+Write-Host "Configured Multicast Groups: 224.1.1.1" -ForegroundColor Cyan
 Write-Host ""
 
 # 1. Clean up old ApexBOS rules to prevent duplicates
@@ -24,26 +24,26 @@ Write-Host "[1/5] Removing existing ApexBOS firewall rules (if any)..." -Foregro
 Get-NetFirewallRule -DisplayName "ApexBOS *" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
 # 2. Inbound UDP for Flux & Engine Multicast
-Write-Host "[2/5] Creating Inbound UDP Multicast rule for ports: 5007,5017,5027,5037,23003..." -ForegroundColor Yellow
+Write-Host "[2/5] Creating Inbound UDP Multicast rule for ports: 5007,5017,5027,5037..." -ForegroundColor Yellow
 New-NetFirewallRule -DisplayName "ApexBOS Inbound UDP Multicast" `
     -Description "Allows incoming UDP multicast traffic for ApexBOS Flux and Engine." `
     -Direction Inbound `
-    -LocalPort 5007,5017,5027,5037,23003 `
+    -LocalPort 5007,5017,5027,5037 `
     -Protocol UDP `
     -Action Allow `
     -Profile Domain,Private,Public | Out-Null
-Write-Host "      -> Allowed UDP ports: 5007,5017,5027,5037,23003" -ForegroundColor Green
+Write-Host "      -> Allowed UDP ports: 5007,5017,5027,5037" -ForegroundColor Green
 
 # 3. Inbound TCP for Grabber, Engine layout server, Banc, and Flux
-Write-Host "[3/5] Creating Inbound TCP rule for ports: 1234,5008,5018,5028,5038,18101,18102,18113,18131,23009,23010,56781,18000-18175,20101-20175..." -ForegroundColor Yellow
+Write-Host "[3/5] Creating Inbound TCP rule for ports: 1234,5008,5018,5028,5038,18077,18081,23009,23010,56781,18000-18175,20101-20175..." -ForegroundColor Yellow
 New-NetFirewallRule -DisplayName "ApexBOS Inbound TCP Services" `
     -Description "Allows inbound TCP traffic for Grabber workers, Engine layout, and Banc." `
     -Direction Inbound `
-    -LocalPort 1234,5008,5018,5028,5038,18101,18102,18113,18131,23009,23010,56781,18000-18175,20101-20175 `
+    -LocalPort 1234,5008,5018,5028,5038,18077,18081,23009,23010,56781,18000-18175,20101-20175 `
     -Protocol TCP `
     -Action Allow `
     -Profile Domain,Private,Public | Out-Null
-Write-Host "      -> Allowed TCP ports: 1234,5008,5018,5028,5038,18101,18102,18113,18131,23009,23010,56781,18000-18175,20101-20175" -ForegroundColor Green
+Write-Host "      -> Allowed TCP ports: 1234,5008,5018,5028,5038,18077,18081,23009,23010,56781,18000-18175,20101-20175" -ForegroundColor Green
 
 # 4. Inbound IGMP (Protocol 2)
 Write-Host "[4/5] Creating Inbound IGMP rule (Protocol 2)..." -ForegroundColor Yellow

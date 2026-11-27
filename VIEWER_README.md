@@ -208,8 +208,14 @@ The Viewer adheres to rigorous railway signaling and interlocking visual convent
 | **Clear Track** | White | `(185, 195, 210)` | Normal track block. No train detected; no signal route lined across it. |
 | **Route-Authorized** | Bright Green | `(40, 230, 95)` | Green Path: Signal cleared and turnout aligned; block locked for impending movement. |
 | **Occupied Block** | Coral Red | `(245, 50, 50)` | Shunted track circuit or verified train presence detected on the block. |
+| **Out of Service (OOS)** | Dotted White & Red + `OOS` Badge | `(255, 255, 255)` / `(245, 50, 50)` | Track block placed out of service via CTC `; Z...` indication bit; rendered with alternating white/red dashes and a centered `OOS` badge. |
 | **Stale / Inactive** | Dark Gray | `(82, 88, 98)` | No telemetry received from the governing WIU within `--stale-timeout` seconds. |
 | **Collision Threat**| Flashing Red | `(255, 30, 30)` | Imminent head-on, rear-end, or fouling conflict detected by safety logic. |
+
+### Minimal Element Labels, Directional Indicators & `<fn±N>` Font Sizing
+
+- **Minimal Labels**: To keep dense dispatch boards uncluttered, each element renders **only** its custom display Name when configured—falling back to its bare Element ID only when Name is blank—while preserving signal direction indicators.
+- **Per-Element Relative Font Sizing (`<fn+N>` / `<fn-N>`)**: Prefixing or tagging an element's Name with `<fn+N>` or `<fn-N>` (e.g. `<fn+6>Main Yard` or `Siding <fn-2>`) dynamically adjusts its rendered font size relative to the base zoom font in both Creator and Viewer.
 
 ### Multi-Head Signal Stacking (Top, Middle, Bottom)
 
@@ -259,13 +265,16 @@ Between discrete wayside reporting points, the Viewer projects train motion:
 - A dashed blue leader line connects the train badge to its current estimated track segment.
 - A pulsing circular radar ring animates around the inferred lead locomotive position, visually illustrating stopping distance and headway progression.
 
-### Hovering Over a Train: Dynamic Layout Pinpointing
+### Train Board (PTC + EOT/HOT/DPU) & Dynamic Layout Pinpointing
 
-When reviewing trains in the Train Scroller panel, hovering the mouse cursor over any train row activates the **Train Locator Subsystem** (`draw_hovered_train_locator`):
-- **Live Leader Guide Line**: A smooth, semi-transparent guide line is drawn from the hovered row in the panel directly to the train's current track block on the layout canvas.
-- **Route & Path Highlighting**: The track segments representing the train's movement path light up with an accentuated outline, showing cleared route progression.
-- **On-Screen Reticle & Callout**: If the train is within the current viewport, the Viewer animates pulsating radar circles around the locomotive and displays a floating callout badge with the train's assigned symbol, instantaneous speed (MPH), and current tracking status (`Confirmed`, `Inferred`, or `Potential`).
-- **Off-Screen Edge Beacon**: If the train is currently outside the visible camera view, the guide line leads to the screen border, where an edge arrow beacon and off-screen callout badge (`TRN (OFF-SCREEN)`) indicate the exact direction to pan to locate the train.
+The Viewer replaces the older scrolling text ticker with a structured, sortable **Train Board** unifying **220 MHz PTC inferred trains** and **450 MHz EOT/HOT/DPU RF trains** (from [ApexBOSFred](FRED_README.md), enriched with **ApexBOSBanc** multi-SDR RF-triangulated locations and headings when available):
+- **Sortable Columns (`Source`, `Name`, `SPD/PWR`, `DIR`, `SIG`, `TRD`, `Recent`)**: Click any column header to cycle through 3 sort states: natural order (descending for `SIG`/`TRD`/`SPD`/`Recent`, ascending for `Source`/`Name`/`DIR`) $\rightarrow$ reversed order $\rightarrow$ pinned stable `board_order`. Unknown values remain neatly grouped at the bottom.
+- **Pagination & Scrolling**: Scroll via mouse wheel or click `Top`, `PgUp`, and `PgDn` buttons.
+- **Hovering Over a Train (`draw_hovered_train_locator`)**: Hovering the mouse cursor over any train row activates the **Train Locator Subsystem**:
+  - **Live Leader Guide Line**: A smooth, semi-transparent guide line is drawn from the hovered row directly to the train's current track block on the layout canvas.
+  - **Route & Path Highlighting**: The track segments representing the train's movement path light up with an accentuated outline, showing cleared route progression.
+  - **On-Screen Reticle & Callout**: If the train is within the current viewport, the Viewer animates pulsating radar circles around the locomotive and displays a floating callout badge with the train's assigned symbol, instantaneous speed (MPH), and tracking status (`Confirmed`, `Inferred`, or `Potential`).
+  - **Off-Screen Edge Beacon**: If the train is outside the visible camera view, an edge arrow beacon and off-screen callout badge (`TRN (OFF-SCREEN)`) indicate the exact direction to pan.
 
 ### Train Identification Assignment Dialog
 
@@ -284,14 +293,15 @@ When [train_logic.py](train_logic.py) detects an impending conflict:
 
 ## Interactive Inspection, Overlays & Operator HUD
 
-### Element Details Inspector & Raw Hex Payload Copy
+### Element Details Inspector, Live Temp Overrides & Raw Hex Payload Copy
 
 Clicking any layout element or selecting it with `Tab` and pressing `Enter` opens the floating inspector:
 - **Properties Inspected**:
   - Canonical Element ID and Display Label.
-  - Assigned 24-bit WIU Address and Channel Frequency.
-  - Bit offsets: Signal aspect offset, track occupancy offset, switch position offset.
+  - Assigned 24-bit WIU Address (`wiu_id`), CTC Address(es) (`ctc_id`), CTC Rules (`ctc_rules`), and Channel Frequency.
+  - Bit offsets: Signal aspect offset (`sig_bit_offset`), track occupancy offset (`occ_bit_offset`), switch position offset (`cmd_bit_offset`).
   - Adjacency links: Protected block, rear block, normal neighbor, reverse neighbor.
+- **On-the-Fly Session Overrides (WIU / Bit Offsets / CTC)**: Click directly on `wiu_id`, `occ_bit_offset`, `cmd_bit_offset`, `sig_bit_offset`, `ctc_id`, or `ctc_rules` inside the Inspector to edit and apply temporary overrides live against the running Engine (`SET_TEMP_OVERRIDE`) without modifying the saved layout JSON—ideal for identifying live CTC `K`/`C`/`Z` bits or WIU bit offsets on the fly. Click **Revert** at any time to restore the layout's original values (`REVERT_TEMP_OVERRIDE`).
 - **Raw Hex Inspector**: Shows formatted hexadecimal payload bytes. Pressing the **Copy Hex** button copies the payload to the system clipboard for immediate testing in [PackFIG.py](PackFIG.py) or [ApexBOSSpy.py](ApexBOSSpy.py).
 
 ### GPS Position of Elements & GIS Mini-Map Inset (Right-Click)
@@ -474,7 +484,7 @@ python View_ApexBOS.220.py --engine-host 192.168.1.100 --engine-port 5008 --mcas
 | `l` / `L` | Global | **DVR Live Snap**: Snaps playback immediately back to live telemetry. |
 | `m` / `M` | Global | **Coverage Map**: Toggles fullscreen GIS map overlay. |
 | `b` / `B` | Global | **Banc Coverage Modal**: Opens regional cloud coverage modal. |
-| `o` / `O` | Global | **Load Layout**: Prompts to load a local layout JSON file. |
+| `o` / `O` | Global | **Load Layout**: Prompts to load a local or Banc layout; syncs the active layout to Engine so pressing `'r'` in the Engine reloads the currently displayed layout. |
 | `e` / `E` | Global | **Edit Mode**: Toggles visual layout editing and element repositioning. |
 | `r` / `R` | Global | **Reset Camera**: Centers and resets zoom to default layout view. |
 | `f` / `F` | Global / Map | **Fit All**: Zooms and pans to frame all elements on screen. |

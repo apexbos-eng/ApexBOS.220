@@ -64,6 +64,7 @@ CORE_SCRIPTS = [
     "atcs_converter.py",
     "version.py",
     "banc_coverage_modal.py",
+    "rf_localizer.py",
     "config_loader.py",
     "install_utils.py",
 ]
@@ -113,11 +114,41 @@ PARSER_RULE_FILES = [
     "config/x2_base_rules.json",
     "config/x01_rules.json",
     "config/x05_rules.json",
-    "config/x70_rules.json",
     "config/x06_rules.json",
     "config/x04_rules.json",
+    "config/ctc_rules.json",
+    "config/x70_rules.json",
     "config/dpu_rules.json",
 ]
+
+EXCLUDED_RULE_PREFIXES = ("test_", "sample_", "itcmon_")
+
+
+def is_distributable_rule_file(norm_path: str) -> bool:
+    """
+    True if `norm_path` is a shippable packet rule file under config/:
+      - Any config/*rules.json (covers *.rules.json and *_rules.json, e.g. ctc_rules.json)
+      - Any rule explicitly listed in PARSER_RULE_FILES or config_loader defaults
+    Excludes test_*, sample_*, itcmon_*, backups (.bak/.new), and non-JSON files.
+    """
+    norm = os.path.normpath(norm_path).replace("\\", "/")
+    if not norm.startswith("config/") or "/" in norm[len("config/"):]:
+        return False
+    base = os.path.basename(norm)
+    low = base.lower()
+    if any(low.startswith(pref) for pref in EXCLUDED_RULE_PREFIXES):
+        return False
+    if low.endswith(".new") or ".bak" in low:
+        return False
+    if norm in PARSER_RULE_FILES:
+        return True
+    default_bases = {
+        os.path.basename(str(r).replace("\\", "/")).lower()
+        for r in (list(config_loader.DEFAULT_ENGINE_PARSERS) + list(config_loader.DEFAULT_SPY_RULES))
+    }
+    if low in default_bases:
+        return True
+    return low.endswith("rules.json")
 
 EXCLUDED_EXACT_FILES = {
     "channels.json",
@@ -162,6 +193,7 @@ ALLOWED_NEW_DIST_FILES = {
     "enable_firewall.ps1",
     "PRIVACY.md",
     "atcs_converter.py",
+    "rf_localizer.py",
 }
 
 GENERATED_DIST_FILES = {
@@ -226,6 +258,19 @@ def collect_package_files() -> List[str]:
     for cs in config_signals:
         candidates.add(cs.replace("\\", "/"))
 
+    # Dynamically include all distributable config/*rules.json (covers *.rules.json and *_rules.json, e.g. ctc_rules.json)
+    # and any rule file referenced in config_loader default parser lists.
+    for rf in glob.glob(os.path.join("config", "*rules.json")):
+        rf_norm = os.path.normpath(rf).replace("\\", "/")
+        if is_distributable_rule_file(rf_norm):
+            candidates.add(rf_norm)
+    for default_rule in (list(config_loader.DEFAULT_ENGINE_PARSERS) + list(config_loader.DEFAULT_SPY_RULES)):
+        r_base = os.path.basename(str(default_rule).replace("\\", "/").strip())
+        if r_base:
+            r_norm = f"config/{r_base}"
+            if is_distributable_rule_file(r_norm):
+                candidates.add(r_norm)
+
     filtered: List[str] = []
     for f in sorted(candidates):
         norm = os.path.normpath(f).replace("\\", "/")
@@ -239,12 +284,14 @@ def collect_package_files() -> List[str]:
         if norm.endswith(".itcvl") or norm.endswith(".lay") or norm.startswith("frags/"):
             continue
 
-        # 3. Exclude test files, temp files, pycache, and databases
+        # 3. Exclude test files, sample/itcmon rules, temp files, pycache, and databases
         if base.startswith("test_") or base.endswith(".pyc") or base.endswith(".db"):
             continue
+        if norm.startswith("config/") and any(base.lower().startswith(p) for p in EXCLUDED_RULE_PREFIXES):
+            continue
 
-        # 4. Strictly exclude anything that is not a git object (allow new release dist scripts)
-        if git_files and norm not in git_files and norm not in ALLOWED_NEW_DIST_FILES:
+        # 4. Strictly exclude anything that is not a git object (allow new release dist scripts and config rule files)
+        if git_files and norm not in git_files and norm not in ALLOWED_NEW_DIST_FILES and not is_distributable_rule_file(norm):
             print(f"  [SKIP Non-Git Object] {norm}")
             continue
 
@@ -398,7 +445,7 @@ def verify_distribution_zip(zip_path: str) -> bool:
             if not os.path.isfile(p):
                 raise FileNotFoundError(f"Missing required distribution file in ZIP: {req}")
 
-        # 2. Verify layouts/arrow_layout.json, config/signals_340.json, and the 7 rules
+        # 2. Verify layouts/arrow_layout.json, config/signals_340.json, and all default parser rule files
         required_config_files = [
             "layouts/arrow_layout.json",
             "config/signals_340.json",
@@ -406,10 +453,24 @@ def verify_distribution_zip(zip_path: str) -> bool:
             "config/x2_base_rules.json",
             "config/x01_rules.json",
             "config/x05_rules.json",
-            "config/x70_rules.json",
             "config/x06_rules.json",
             "config/x04_rules.json",
+            "config/ctc_rules.json",
+            "config/x70_rules.json",
+            "config/dpu_rules.json",
         ]
+        # Also verify every parser/rule referenced by config.defaults.json exists under config/
+        try:
+            with open(os.path.join(extracted_dir, config_loader.CONFIG_DEFAULTS_FILENAME), "r", encoding="utf-8") as df:
+                tpl_defaults = json.load(df) or {}
+            for r in (tpl_defaults.get("engine", {}).get("parsers", []) + tpl_defaults.get("spy", {}).get("rules", [])):
+                rb = os.path.basename(str(r).replace("\\", "/").strip())
+                if rb:
+                    rel_r = f"config/{rb}"
+                    if rel_r not in required_config_files:
+                        required_config_files.append(rel_r)
+        except Exception:
+            pass
         for req in required_config_files:
             p = os.path.join(extracted_dir, req)
             if not os.path.isfile(p):
@@ -452,6 +513,7 @@ def verify_distribution_zip(zip_path: str) -> bool:
                     and rel_in_repo not in git_files
                     and rel_in_repo not in ALLOWED_NEW_DIST_FILES
                     and rel_in_repo not in GENERATED_DIST_FILES
+                    and not is_distributable_rule_file(rel_in_repo)
                     and not rel_in_repo.startswith("wheels/")
                 ):
                     raise ValueError(f"Non-git object found in ZIP: {name} ({rel_in_repo})")

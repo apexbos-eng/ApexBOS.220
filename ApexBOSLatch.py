@@ -948,8 +948,20 @@ class GrabberStyleDemodMixin:
     def _init_grabber_ui_state(self, args):
         self.start_time = time.time()
         self.shutdown_flag = self._stop_ev
-        self.use_color = getattr(grabber, "enable_ansi_colors", lambda: True)() and (not getattr(args, "no_color", False))
-        self.no_tui = bool(getattr(args, "no_tui", False))
+        req_no_tui = bool(getattr(args, "no_tui", False))
+        req_no_color = bool(getattr(args, "no_color", False))
+        try:
+            import config_loader as _cfg_term
+            _use_tui, _use_color, _ = _cfg_term.init_terminal_mode(
+                no_tui=req_no_tui,
+                no_color=req_no_color,
+            )
+            self.no_tui = not _use_tui
+            self.use_color = _use_color
+        except Exception:
+            _ansi_ok = grabber.init_cross_platform_terminal(req_no_color)
+            self.use_color = _ansi_ok and (not req_no_color)
+            self.no_tui = req_no_tui or (not _ansi_ok)
         self.rate_auto_scaled = False
 
         # Tuning / Control state

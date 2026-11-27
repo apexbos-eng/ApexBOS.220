@@ -30,9 +30,9 @@ flowchart LR
     FLUX -->|"UDP Multicast 239.1.1.1:23003"| ENG["DispatcherEngine + PacketScroller"]
 ```
 
-- **Dedicated SDR Support**: Reuses Grabber's cross-platform SDR drivers—supporting **RTL-SDR** (`--pipe`, `--rtlsdr`, `--rtl-tcp`), **SDRplay RSP1B / RSP1A / RSPdx / RSPduo** (`--rsp-tcp`, `--rsp-16bit`), **SoapySDR** (`--soapy`), and raw `--stdin` playback (`u8` and `s16`).
-- **Unified Wire Format**: Publishes grabber-compatible 4-part ZMQ messages with a self-describing `b'A{...}'` JSON frame carrying `protocol: "atcs"`, 14-digit `mcp_addr`, `_node_id_`, indication hex, RSSI, and formatted `_scroll_ptc_` text. Add `tcp://127.0.0.1:18201` to `flux.sources` in `config.json` to flow ATCS packets straight into your layout board and Packet Scroller.
-- **Chroma Integration**: Launch `python ApexBOSChroma.py --band atcs` (or click **`Band:PTC 220`** in Chroma's toolbar to cycle to **`Band:ATCS 935`**) to view live 935 MHz spectrum, waterfall, ATCS channel markers, and flowing ATCS blips—with zero overhead on Latch when Chroma is closed.
+- **Dedicated SDR Support**: Reuses Grabber's cross-platform SDR drivers—supporting **RTL-SDR** (`--pipe`, `--rtlsdr`, `--rtl-tcp`), **SDRplay RSP1B / RSP1A / RSPdx / RSPduo** (`--rsp-tcp`, `--rsp-16bit`), **SoapySDR** (`--soapy`), and raw `--stdin` playback (`u8` and `s16`), with independent per-SDR Gain and PPM configuration in `config.json` and the Setup Wizard.
+- **Unified Wire Format & Banc Triangulation**: Publishes grabber-compatible 4-part ZMQ messages with a self-describing `b'A{...}'` JSON frame carrying `protocol: "atcs"`, 14-digit `mcp_addr`, `_node_id_`, indication hex, RSSI, and formatted `_scroll_ptc_` text. Add `tcp://127.0.0.1:18201` to `flux.sources` in `config.json` to flow ATCS packets straight into your layout board, Packet Scroller, and Banc's privacy-preserving multi-SDR stationary RF localizer (`896 MHz` MCP uplinks).
+- **Chroma Integration & ANSI Fallback**: Launch `python ApexBOSChroma.py --band atcs` (or click **`Band:PTC 220`** in Chroma's toolbar to cycle to **`Band:ATCS 935`** / **`Band:ATCS 896`**) to view live 935/896 MHz spectrum, waterfall, ATCS channel markers, and flowing ATCS blips—with zero overhead on Latch when Chroma is closed. On non-ANSI or redirected consoles, Latch automatically switches to clean plain-text scroll mode (`--no-tui --no-color`).
 
 ---
 
@@ -112,7 +112,7 @@ python ApexBOSSpy.py --connect 18201
 
 ## Automatic Detection & Setup Wizard Integration
 
-- **Setup Wizard (`setup_wizard.py`)**: Dedicated **Step 7 (ATCS Setup)** lets you include or exclude `ApexBOSLatch`, pick its SDR device index (default `1`), and choose channels using mnemonics (`BCP1`–`BCP6`, `MCP1`–`MCP6`, `F-1`–`F-6`) or numbers (`1`–`6`, `11`–`16`). When included, **ApexBOSLauncher** displays a dedicated **ApexBOSLatch** launch/stop row; when excluded, it is hidden cleanly.
+- **Setup Wizard (`setup_wizard.py`)**: Dedicated **Step 7 (ATCS Setup)** lets you include or exclude `ApexBOSLatch`, pick its SDR device index (default `1`), configure dedicated per-SDR **Gain** and **PPM**, and choose channels using mnemonics (`BCP1`–`BCP6`, `MCP1`–`MCP6`, `F-1`–`F-6`) or numbers (`1`–`6`, `11`–`16`). When included, **ApexBOSLauncher** displays a dedicated **ApexBOSLatch** launch/stop row; when excluded, it is hidden cleanly.
 - **RTL-SDR Bandwidth Clustering & AFC Default**: If both BCP (`935 MHz`) and MCP (`896 MHz`) channels are listed, `ApexBOSLatch` automatically groups channels by frequency proximity and monitors the larger group (preferring **MCP** on an equal tie). Channel AFC is **OFF** by default (`--afc` or `afc on` to enable).
 - **Auto-Detection in Engine, Spy, & Chroma**: Whenever `ApexBOSLatch` is running on its configured port (`18201` / `18298`), **ApexBOS.220 (Engine)**, **ApexBOSSpy**, and **ApexBOSChroma** automatically detect it and display decoded ATCS packet information alongside PTC without disturbing existing PTC functionality.
 
@@ -122,7 +122,7 @@ python ApexBOSSpy.py --connect 18201
 
 Both **DispatcherEngine** and **ApexBOSSpy** automatically watch `config/atcs_rules.json` (hot-reloading on edits).
 
-- **When `config/atcs_rules.json` is present**, ATCS packets are decoded using your station/class/bit-map definitions (or an ApexBOS `PacketParser` JSON rule list) and applied to layout elements via `ctc_id` and `ctc_rules` (e.g., `K11 OR C11,K25`).
+- **When `config/atcs_rules.json` is present**, ATCS packets are decoded using your station/class/bit-map definitions (or an ApexBOS `PacketParser` JSON rule list) and applied to layout elements via `ctc_id` (supporting multiple comma-separated addresses) and `ctc_rules` (e.g., `K11 OR C11,K25`, bare letterless integers like `11` matching both `K` and `C`, and optional Out-of-Service `; Z<expr>` clauses matched on `K` packets).
 - **When `config/atcs_rules.json` is missing**, ApexBOS automatically applies default Spec 200 decoding (14-digit MCP address as `ctc_id` plus standard `K11`–`K48` indication / `C11`–`C48` control code-line bit tokens), displays the decoded packet in **Spy** and the **Layout Packet Scroller**, and attempts to apply matching `ctc_id` / `ctc_rules` to layout elements.
 
 Example `config/atcs_rules.json`:

@@ -27,6 +27,14 @@ import os
 import shutil
 import textwrap
 import re
+from functools import lru_cache
+
+_EVAL_GLOBALS = {"int": int}
+
+
+@lru_cache(maxsize=512)
+def _compile_eval_expr(expr: str):
+    return compile(expr, "<rule_expr>", "eval")
 
 class PacketValidationError(Exception):
     """Raised when a parsed value does not match the expected value in the rule."""
@@ -277,8 +285,8 @@ class PacketParser:
         elif rule_type == "calc":
             expr = rule.get("expression", "")
             try:
-                val = eval(expr, {"int": int}, self.flat_context)
-            except Exception:
+                val = eval(_compile_eval_expr(expr), _EVAL_GLOBALS, self.flat_context)
+            except Exception as ex:
                 val = 0
                 
             if "format" in rule:
@@ -360,7 +368,7 @@ class PacketParser:
 
     def _evaluate_condition(self, condition_str: str, context: dict) -> bool:
         try:
-            return eval(condition_str, {"int": int}, context)
+            return eval(_compile_eval_expr(condition_str), _EVAL_GLOBALS, context)
         except Exception:
             return False
 
@@ -544,7 +552,7 @@ class PacketParser:
         elif rule_type == "calc":
             expr = rule.get("expression", "")
             try:
-                val = eval(expr, {"int": int}, self.encode_flat_context)
+                val = eval(_compile_eval_expr(expr), _EVAL_GLOBALS, self.encode_flat_context)
             except Exception:
                 val = 0
                 

@@ -1250,6 +1250,15 @@ class BancServer:
                 self.whitelist = set(line.strip() for line in f if line.strip())
         
         self.db = DatabaseManager(config.get("db_path", "banc.db"), config.get("db_retention_sec", 86400))
+
+        # Privacy-preserving multi-SDR RF localization engine (strictly server-side)
+        self.localizer = None
+        try:
+            import rf_localizer
+            self.localizer = rf_localizer.RfLocalizer(self.db.db_path)
+            self._sync_localizer_context()
+        except Exception:
+            self.localizer = None
         
         self.active_connections = 0
         self.blocked_ips = {}
@@ -1309,6 +1318,35 @@ class BancServer:
                 os.makedirs(log_parent, exist_ok=True)
         except Exception:
             pass
+
+    def _sync_localizer_context(self):
+        """Syncs verified ground-truth WIU GPS and coarse feeder regions into RfLocalizer."""
+        loc = getattr(self, "localizer", None)
+        if loc is None:
+            return
+        try:
+            wiu_gps_map: Dict[str, Tuple[float, float]] = {}
+            for w in self.db.list_wius():
+                wid = _normalize_wiu_id(w.get("wiu_id"))
+                pt = _parse_gps_latlon(w.get("gps"))
+                if wid and pt is not None:
+                    wiu_gps_map[wid] = pt
+            loc.sync_known_wiu_gps(wiu_gps_map)
+        except Exception:
+            pass
+        try:
+            regions_map = self.db.get_all_feeder_regions_map()
+            loc.sync_blurred_feeder_regions(regions_map)
+        except Exception:
+            pass
+
+    def run_localizer_cycle(self) -> int:
+        """Refreshes localizer context and runs one calibration + estimation solver cycle."""
+        loc = getattr(self, "localizer", None)
+        if loc is None:
+            return 0
+        self._sync_localizer_context()
+        return loc.run_solver_cycle()
 
     def block_ip(self, ip: str, identity: str = "unknown", reason: str = "Authentication failed", duration: float = 60.0):
         """Places an IP in cooldown with identity and reason tracking."""
@@ -1799,6 +1837,17 @@ class BancServer:
         p_badge = f"{BG_PAUSED} PAUSED {C_RESET}" if self.put_paused else f"{BG_ACTIVE} ACTIVE {C_RESET}"
         g_badge = f"{BG_PAUSED} PAUSED {C_RESET}" if self.get_paused else f"{BG_ACTIVE} ACTIVE {C_RESET}"
         lines.append(f"  {C_BOLD}PUT Service:{C_RESET}    {p_badge}        {C_BOLD}GET Service:{C_RESET}   {g_badge}")
+        if getattr(self, "localizer", None) is not None:
+            try:
+                loc_s = self.localizer.get_internal_summary()
+                lines.append(
+                    f"  {C_BOLD}RF Localizer:{C_RESET}   {C_CYAN}{loc_s['sensors']} anchor(s){C_RESET}   "
+                    f"{C_BOLD}Estimates:{C_RESET} {C_GREEN}{loc_s['estimates_wiu']} WIU{C_RESET}, "
+                    f"{C_YELLOW}{loc_s['estimates_train']} Train{C_RESET}, "
+                    f"{C_DIM}{loc_s['estimates_other']} Other{C_RESET}"
+                )
+            except Exception:
+                pass
         
         # Mirror Display
         if self.mirrors:
@@ -1991,6 +2040,8 @@ async def client_handler(reader, writer, server: BancServer):
             
             if rows:
                 loop = asyncio.get_running_loop()
+                if getattr(server, "localizer", None) is not None:
+                    await loop.run_in_executor(None, server.localizer.ingest_put_rows, rows)
                 await loop.run_in_executor(None, server.db.insert_rows, rows)
                 server.packets_in += len(rows)
                 
@@ -2089,12 +2140,70 @@ async def client_handler(reader, writer, server: BancServer):
                 region_payload,
             )
             if updated > 0:
+                if getattr(server, "localizer", None) is not None:
+                    await loop.run_in_executor(None, server._sync_localizer_context)
                 server.set_status_message(f"Updated {updated} private SDR region(s) for '{identity}'")
                 if server.mirrors and not is_mirrored_hop:
                     relay_tok = mosfet_auth.generate_token(server.auth_secret)
                     relay_header = f"PUT_SDR_REGION:{identity}:{relay_tok}:MIRROR"
                     asyncio.create_task(server.relay_payload(relay_header, payload))
             await write_frame(writer, server.fernet, json.dumps({"ok": True, "updated": updated}))
+
+        elif action in ("PUT_SDR_SENSOR", "SDR_SENSOR_PUT"):
+            # Strictly private opt-in sensor coordinate registration for k>=3 localization.
+            # NEVER mirrored to third-party mirrors and NEVER returned to any GET client.
+            if server.put_paused:
+                await write_frame(writer, server.fernet, "ERROR:PAUSED:PUT service is paused")
+                return
+            payload = await asyncio.wait_for(read_frame(reader, server.fernet), timeout=15.0)
+            try:
+                sensor_payload = json.loads(payload)
+            except Exception:
+                await write_frame(writer, server.fernet, "ERROR:INVALID_JSON:Sensor payload is not valid JSON")
+                return
+            updated = 0
+            if getattr(server, "localizer", None) is not None:
+                loop = asyncio.get_running_loop()
+                updated = await loop.run_in_executor(
+                    None,
+                    server.localizer.upsert_private_sensors_payload,
+                    identity,
+                    sensor_payload,
+                )
+            await write_frame(writer, server.fernet, json.dumps({"ok": True, "updated": updated}))
+
+        elif action in ("GET_ESTIMATES", "ESTIMATES_GET"):
+            # Returns strictly anonymized transmitter location estimates (zero SDR metadata).
+            # Format: GET_ESTIMATES:<id>:<tok>[:<category>[:<since_ts>[:<lat>:<lon>:<radius_km>]]]
+            if server.get_paused or getattr(server, "localizer", None) is None:
+                await write_frame(writer, server.fernet, json.dumps([]))
+                return
+            cat_filter = extra[0].strip().lower() if len(extra) >= 1 and extra[0].strip() else None
+            since_ts = None
+            if len(extra) >= 2 and extra[1].strip():
+                try:
+                    sv = float(extra[1])
+                    since_ts = sv if sv > 0.0 else None
+                except (ValueError, TypeError):
+                    since_ts = None
+            geo_filter = None
+            if len(extra) >= 5:
+                try:
+                    glat, glon, grad = float(extra[2]), float(extra[3]), float(extra[4])
+                    if -85.0 <= glat <= 85.0 and -180.0 <= glon <= 180.0 and not (glat == 0.0 and glon == 0.0):
+                        q_lat, q_lon = quantize_geo_point(glat, glon, step_deg=GEO_QUERY_GRID_DEG)
+                        geo_filter = (q_lat, q_lon, max(MIN_GEO_QUERY_RADIUS_KM, min(2000.0, grad)))
+                except (ValueError, TypeError):
+                    geo_filter = None
+            loop = asyncio.get_running_loop()
+            ests = await loop.run_in_executor(
+                None,
+                server.localizer.get_public_estimates,
+                cat_filter,
+                since_ts,
+                geo_filter,
+            )
+            await write_frame(writer, server.fernet, json.dumps(ests))
 
         elif action in ("PUT_LAYOUT", "LAYOUT_PUT"):
             layout_name = ":".join(extra) if extra else "layout.json"
@@ -2155,6 +2264,8 @@ async def client_handler(reader, writer, server: BancServer):
             loop = asyncio.get_running_loop()
             upserted = await loop.run_in_executor(None, server.db.upsert_wius, wiu_payload, identity)
             if upserted > 0:
+                if getattr(server, "localizer", None) is not None:
+                    await loop.run_in_executor(None, server._sync_localizer_context)
                 server.set_status_message(f"Updated {upserted} WIU record(s) from '{identity}'")
                 if server.mirrors:
                     asyncio.create_task(server.relay_payload(header, payload))
@@ -2277,6 +2388,19 @@ async def db_cleanup_loop(server: BancServer):
         await asyncio.sleep(300)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, server.db.cleanup_old)
+
+
+async def rf_localizer_loop(server: BancServer):
+    """Periodically calibrates SDR gain offsets from verified WIUs and updates anonymized transmitter estimates."""
+    while True:
+        await asyncio.sleep(30)
+        if getattr(server, "localizer", None) is None:
+            continue
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, server.run_localizer_cycle)
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # UI Routines
@@ -2420,10 +2544,52 @@ def execute_ui_command(server: BancServer, raw_text: str):
 
 async def local_display_loop(server: BancServer):
     try:
+        import config_loader as _cfg_term
+    except Exception:
+        _cfg_term = None
+
+    no_tui = bool(getattr(server, "no_tui", False))
+    use_color = bool(getattr(server, "use_color", True))
+
+    if no_tui:
+        last_status = ""
+        last_print_ts = 0.0
+        try:
+            while True:
+                now_t = time.time()
+                if server.status_message and server.status_message != last_status:
+                    last_status = server.status_message
+                    sys.stdout.write(f"[{datetime.now().strftime('%H:%M:%S')}] Status: {last_status}\n")
+                    sys.stdout.flush()
+                if last_print_ts == 0.0 or (now_t - last_print_ts) >= 15.0:
+                    rows, size_kb = server.db.get_stats()
+                    rate_val = server.get_packet_rate()
+                    sys.stdout.write(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] ApexBOSBanc | "
+                        f"Conns:{server.active_connections} | In:{server.packets_in} Out:{server.packets_out} | "
+                        f"Rate:{rate_val:.1f}/min | DB:{rows} rows ({size_kb:.1f} KB)\n"
+                    )
+                    sys.stdout.flush()
+                    last_print_ts = now_t
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+        return
+
+    try:
         while True:
-            sys.stdout.write("\033[2J\033[H")
+            if use_color:
+                sys.stdout.write("\033[2J\033[H")
+            else:
+                try:
+                    os.system("cls" if os.name == "nt" else "clear")
+                except Exception:
+                    sys.stdout.write("\n" * 2)
             buf = getattr(server, "local_buffer", "")
-            sys.stdout.write(server.generate_ascii_screen(buf))
+            screen_txt = server.generate_ascii_screen(buf)
+            if not use_color and _cfg_term is not None:
+                screen_txt = _cfg_term.strip_ansi(screen_txt)
+            sys.stdout.write(screen_txt)
             sys.stdout.flush()
             await asyncio.sleep(1)
     except asyncio.CancelledError:
@@ -2632,6 +2798,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default="banc.json", help="Path to configuration file")
     parser.add_argument("--gen-config", action="store_true", help="Generate an example configuration file")
     parser.add_argument("--display", action="store_true", help="Display the UI locally in the console")
+    parser.add_argument("--no-tui", action="store_true", help="Run console display in plain text scrolling mode")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI terminal colors")
     parser.add_argument("--inspect-db", type=int, metavar="LIMIT", help="Print the latest N rows from the database and exit")
     parser.add_argument(
         "--mirror",
@@ -2902,12 +3070,26 @@ async def main():
 
     server = BancServer(config)
     asyncio.create_task(db_cleanup_loop(server))
+    asyncio.create_task(rf_localizer_loop(server))
     asyncio.create_task(identity_stats_loop(server))
 
     if args.display:
+        try:
+            import config_loader as _cfg_term
+            _use_tui, _use_color, _ = _cfg_term.init_terminal_mode(
+                no_tui=bool(getattr(args, "no_tui", False)),
+                no_color=bool(getattr(args, "no_color", False)),
+                announce_fallback=True,
+            )
+            server.no_tui = not _use_tui
+            server.use_color = _use_color
+        except Exception:
+            server.no_tui = bool(getattr(args, "no_tui", False))
+            server.use_color = not bool(getattr(args, "no_color", False))
         server.local_buffer = ""
         asyncio.create_task(local_display_loop(server))
-        asyncio.create_task(local_input_loop(server))
+        if not server.no_tui:
+            asyncio.create_task(local_input_loop(server))
 
     data_srvs, ui_srvs, data_desc, ui_desc = await start_banc_servers(server, config)
     all_srvs = data_srvs + ui_srvs
@@ -2928,14 +3110,20 @@ async def main():
                 pass
 
 if __name__ == "__main__":
+    _banc_vt_ok = False
+    try:
+        import config_loader as _cfg_term
+        _, _banc_vt_ok, _ = _cfg_term.init_terminal_mode(announce_fallback=False)
+    except Exception:
+        _banc_vt_ok = False
     if sys.platform == 'win32':
-        os.system('color')
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
+        if _banc_vt_ok:
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
         print("\nApexBOSBanc shut down successfully.")
 
 # ---------------------------------------------------------------------------

@@ -438,13 +438,23 @@ ID: T1 | 'Main 1' | WIU: 1001 | CTC: UP.1001.01 | Rules: K:1WG&1EG=1TE | GPS: (3
 Double-clicking any element (or pressing `Enter`) opens the In-Place Property Editor:
 
 ### Editing Element Properties
-- **ID & Display Label**: Assign canonical IDs (e.g. `CP_NEVADA_1`) and dispatcher display names.
+- **ID, Display Label & Relative Font Sizing (`<fn±N>`)**: Assign canonical IDs (e.g. `CP_NEVADA_1`) and dispatcher display names. Embed `<fn+N>` or `<fn-N>` inside any label (e.g. `<fn+6>Main Yard` or `<fn-2>Spur`) to scale its font size relative to the base font in both Creator and Viewer. Signals also display directional orientation arrows at high zoom.
 - **Orientation**: Sets track compass heading (`E-W`, `N-S`, `NE-SW`, `NW-SE`).
 - **Length in Miles**: Physical segment length used for train speed calculation.
 
-### Wayside Interface Unit (WIU ID) Assignment
+### Wayside Interface Unit (WIU ID) & Banc RF-Estimated GPS Hints
 - Assigns the 24-bit Wayside Interface Unit (WIU) hardware address.
 - Multiple signals and switches can share the same WIU ID to emulate integrated field controller bungalows.
+- When syncing WIU records from **ApexBOSBanc**, unlocated WIUs are automatically enriched with anonymized multi-SDR RF location estimates (`est_gps`, containment radius, and confidence from `rf_localizer.py`) without ever overwriting verified ground-truth GPS coordinates.
+
+### Multi-Address CTC IDs, CTC Rules & Out-of-Service (`; Z...`) Clauses
+- **Multiple `ctc_id` Addresses**: Enter one or more comma-separated CTC station/element addresses (matched against `config/ctc_rules.json` EMP packets or 900 MHz ATCS packets).
+- **`ctc_rules` Syntax**: Supports boolean expressions (`OR`, `AND`, `AND/OR`, `NOT`, parentheses, commas) with direction-aware bit tokens:
+  - `K<n>`: Matches Indication (`K`) packets only.
+  - `C<n>`: Matches Command (`C`) packets only.
+  - Bare integers (e.g. `11`, `25`): Wildcard bit numbers matching **both** `K` and `C` packets.
+  - `; Z<expr>`: Trailing Out-of-Service (OOS) clause (evaluated on `K` packets only) that renders tracks as dotted white-and-red segments with a centered `OOS` badge.
+- **PTC Priority Over CTC**: Elements configured with both a 220 MHz `wiu_id` and `ctc_rules` prioritize live PTC telemetry and automatically fall back to CTC if PTC goes stale.
 
 ### Bit Offsets: Signal Aspects, Switch Alignment & Track Occupancy
 - **`sig_bit_offset`**: Starting bit offset in the WIU status word for decoding 5-bit signal aspect codes.
@@ -459,7 +469,7 @@ Double-clicking any element (or pressing `Enter`) opens the In-Place Property Ed
 
 Clicking `Sim/Crank` in the HUD switches the Creator into simulation mode, allowing authors to manually test interlockings, route permissions, and train detection logic:
 - **Click Elements to Toggle Physical State**:
-  - **Tracks**: Cycles unallocated -> train occupied (Eastbound) -> clear.
+  - **Tracks**: Cycles through 4 states: Clear $\rightarrow$ Occupied (Eastbound) $\rightarrow$ **Out of Service (`OOS`, dotted white/red + centered `OOS` badge)** $\rightarrow$ Clear.
   - **Turnouts**: Toggles Normal (0) -> Reverse (1) -> Occupied.
   - **Signals**: Cycles aspects (Clear/Green -> Approach/Yellow -> Flashing Yellow -> Stop/Red -> MOW/Magenta -> Dark).
 - **Turn All Signals to Stop (`All Stop(S)` / `'S'`)**:
@@ -578,9 +588,9 @@ python ApexBOSCreator.py --lat 34.1234 --lon -118.6543 --radius 25.0 layouts/my_
 | `V` | Canvas | **Verify Layout**: Runs automated topological and syntax audit. |
 | `Ctrl+Z` | Canvas | **Undo**: Reverts last layout edit (up to 50 steps). |
 | `Ctrl+Y` / `Ctrl+Shift+Z`| Canvas | **Redo**: Re-applies reverted edit. |
-| `Ctrl+S` | Canvas | **Save Layout**: Writes active layout to disk. |
-| `Ctrl+Shift+S` | Canvas | **Save As**: Prompts for new destination layout filename. |
-| `Ctrl+O` | Canvas | **Open Layout**: Prompts to load an existing layout file. |
+| `Ctrl+S` | Canvas | **Save Layout**: Writes active layout to disk. On a brand-new unnamed layout (`New -> Save`), opens an empty `Save As` prompt requiring an explicit filename. |
+| `Ctrl+Shift+S` | Canvas | **Save As**: Opens an empty filename prompt and requires entering a filename (pressing `Enter` while empty keeps the prompt open; `Esc` cancels). |
+| `Ctrl+O` | Canvas | **Open Layout**: Prompts to load an existing layout file with live autocomplete suggestions drawn from both **`CWD/*_layout.json`** and **`layouts/*.json`** (excluding `config.json` and `prefs_*`). |
 | `Ctrl+F` | Canvas | **Load Fragment**: Opens reusable sub-layout fragment modal. |
 | `Ctrl+Shift+F` | Canvas | **Save Fragment**: Saves selected elements as a reusable fragment. |
 | `Ctrl+B` | Canvas | **Banc Coverage**: Opens regional cloud station coverage map modal. |
