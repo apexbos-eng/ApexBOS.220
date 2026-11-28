@@ -335,7 +335,7 @@ tail -f ~/ApexBOSBanc/banc.log
 
 Expected log output:
 ```text
-[*] Starting ApexBOSBanc v26.1127.08 (PID: 12450)
+[*] Starting ApexBOSBanc v26.1127.14 (PID: 12450)
 [INFO ] Initializing SQLite database at 'banc.db'...
 [INFO ] Data server listening on [::]:23009 (dual-stack / IPv6)
 [INFO ] Telnet UI server listening on [::1]:23010

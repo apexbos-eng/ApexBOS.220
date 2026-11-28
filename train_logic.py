@@ -1445,14 +1445,17 @@ class TrainTracker:
     def prune_inactive(self, active_elem_ids: set, now: float, max_age: float = 180.0):
         """Cleans up stale orphaned PTC records (max_age) and expired RF trains (7 minutes / 420s)."""
         self.prune_rf_trains(now=now, rf_max_age=RF_TRAIN_TIMEOUT_SEC)
-        to_delete = [
-            tname for tname, rec in self.trains.items()
-            if not rec.get("is_rf_train")
-            and rec.get("status") != "Potential"
-            and rec.get("current_element_id") not in active_elem_ids
-            and rec.get("last_element_id") not in active_elem_ids
-            and (now - rec.get("updated_ts", 0.0)) > max_age
-        ]
+        to_delete = []
+        for tname, rec in self.trains.items():
+            if rec.get("is_rf_train") or rec.get("status") == "Potential":
+                continue
+            if rec.get("current_element_id") in active_elem_ids or rec.get("last_element_id") in active_elem_ids:
+                continue
+            occ_elems = rec.get("occupied_elements") or []
+            if any(eid in active_elem_ids for eid in occ_elems):
+                continue
+            if (now - rec.get("updated_ts", 0.0)) > max_age:
+                to_delete.append(tname)
         for tname in to_delete:
             del self.trains[tname]
 
@@ -2353,6 +2356,705 @@ class TrainInferenceManager:
         return None
 
     @classmethod
+    def _build_aligned_rail_graph(
+        cls,
+        elements: Dict[str, Any],
+        resolve_jump_fn: Optional[Any] = None,
+    ) -> Dict[str, Set[str]]:
+        """
+        Builds an undirected physical rail adjacency graph over all TrackSegment and Turnout
+        elements following each Turnout's CURRENT alignment (common <-> active_branch):
+          - Track <-> Track via neighbors or paired TrackJumps.
+          - Turnout <-> common_neighbor and Turnout <-> active_branch_neighbor() only
+            (the inactive diverging/normal leg is disconnected by the switch points).
+          - Turnout <-> Turnout crossovers require reciprocal active-port alignment on both switches.
+        """
+        jump_fn = resolve_jump_fn or (lambda nid, ndir, cid: cls.resolve_through_jump(elements, nid, ndir, cid))
+        adj: Dict[str, Set[str]] = {}
+        turnout_ports: Dict[str, Set[str]] = {}
+
+        # 1. Resolve each Turnout's active 2-port endpoints (common & active branch)
+        for eid, el in elements.items():
+            if getattr(el, "elem_type", "") != "turnout":
+                continue
+            c_raw = getattr(el, "common_neighbor", None) or None
+            a_raw = el.active_branch_neighbor() if hasattr(el, "active_branch_neighbor") else None
+            orient = getattr(el, "orientation", "E") or "E"
+            c_dir = OPPOSITE_DIR.get(orient, "W")
+            a_dir = el.active_branch_dir() if hasattr(el, "active_branch_dir") else orient
+            ports: Set[str] = set()
+            if c_raw:
+                cid, _ = jump_fn(c_raw, c_dir, eid)
+                if cid and cid != eid and cid in elements:
+                    ports.add(cid)
+            if a_raw:
+                aid, _ = jump_fn(a_raw, a_dir, eid)
+                if aid and aid != eid and aid in elements:
+                    ports.add(aid)
+            turnout_ports[eid] = ports
+            adj.setdefault(eid, set())
+
+        # 2. Add Track <-> Track edges (never blindly connect Track -> Turnout inactive leg)
+        for eid, el in elements.items():
+            if getattr(el, "elem_type", "") != "track":
+                continue
+            adj.setdefault(eid, set())
+            neighbors = getattr(el, "neighbors", None) or {}
+            for ndir, nval in neighbors.items():
+                cands = [nval] if isinstance(nval, str) else list(nval or [])
+                for cid in cands:
+                    if not cid:
+                        continue
+                    rid, _ = jump_fn(cid, ndir, eid)
+                    if rid and rid != eid and rid in elements:
+                        if getattr(elements[rid], "elem_type", "") == "track":
+                            adj.setdefault(eid, set()).add(rid)
+                            adj.setdefault(rid, set()).add(eid)
+            # Check implicit TrackJump paired directly with this track
+            j_rid, _ = jump_fn(None, "E", eid)
+            if j_rid and j_rid != eid and j_rid in elements:
+                if getattr(elements[j_rid], "elem_type", "") == "track":
+                    adj.setdefault(eid, set()).add(j_rid)
+                    adj.setdefault(j_rid, set()).add(eid)
+
+        # 3. Add Turnout <-> aligned neighbor edges (with reciprocal check for Turnout <-> Turnout crossovers)
+        for wid, ports in turnout_ports.items():
+            for pid in ports:
+                p_el = elements.get(pid)
+                p_type = getattr(p_el, "elem_type", "")
+                if p_type == "track":
+                    adj.setdefault(wid, set()).add(pid)
+                    adj.setdefault(pid, set()).add(wid)
+                elif p_type == "turnout":
+                    if wid in turnout_ports.get(pid, ()):
+                        adj.setdefault(wid, set()).add(pid)
+                        adj.setdefault(pid, set()).add(wid)
+
+        return adj
+
+    @classmethod
+    def _order_cluster_chain(
+        cls,
+        occ_set: Set[str],
+        bridged_turnouts: Set[str],
+        adj: Dict[str, Set[str]],
+        elements: Dict[str, Any],
+    ) -> List[str]:
+        """Orders a connected cluster of occupied elements into a continuous linear chain."""
+        if len(occ_set) <= 1:
+            return list(occ_set)
+
+        sub_nodes = occ_set | bridged_turnouts
+        sub_adj: Dict[str, List[str]] = {}
+        for nid in sub_nodes:
+            nbrs = sorted(
+                (v for v in adj.get(nid, ()) if v in sub_nodes),
+                key=lambda k: (getattr(elements.get(k), "x", 0), getattr(elements.get(k), "y", 0), k),
+            )
+            sub_adj[nid] = nbrs
+
+        # Pick deterministic chain endpoint (prefer degree <= 1 occupied node, leftmost/topmost)
+        occ_endpoints = [nid for nid in occ_set if len(sub_adj.get(nid, ())) <= 1]
+        if occ_endpoints:
+            start = min(
+                occ_endpoints,
+                key=lambda k: (getattr(elements.get(k), "x", 0), getattr(elements.get(k), "y", 0), k),
+            )
+        else:
+            start = min(
+                occ_set,
+                key=lambda k: (getattr(elements.get(k), "x", 0), getattr(elements.get(k), "y", 0), k),
+            )
+
+        ordered: List[str] = []
+        visited: Set[str] = set()
+        stack: List[str] = [start]
+        while stack:
+            u = stack.pop()
+            if u in visited:
+                continue
+            visited.add(u)
+            if u in occ_set:
+                ordered.append(u)
+            # Push in reverse order so lowest (x, y, id) neighbor is explored first
+            for v in reversed(sub_adj.get(u, ())):
+                if v not in visited:
+                    stack.append(v)
+        for nid in sorted(occ_set, key=lambda k: (getattr(elements.get(k), "x", 0), getattr(elements.get(k), "y", 0), k)):
+            if nid not in ordered:
+                ordered.append(nid)
+        return ordered
+
+    @classmethod
+    def find_occupied_track_clusters(
+        cls,
+        elements: Dict[str, Any],
+        resolve_jump_fn: Optional[Any] = None,
+        include_inferred: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Groups all continuous occupied track/turnout elements into connected clusters,
+        bridging through any aligned Turnout along its current active route (Normal or Reverse)
+        and through paired TrackJumps.
+        """
+        occ_ids: Set[str] = set()
+        for eid, el in elements.items():
+            if getattr(el, "elem_type", "") not in ("track", "turnout"):
+                continue
+            if getattr(el, "_hw_occupied", False) or (include_inferred and getattr(el, "is_occupied", False)):
+                occ_ids.add(eid)
+        if not occ_ids:
+            return []
+
+        adj = cls._build_aligned_rail_graph(elements, resolve_jump_fn)
+        visited_occ: Set[str] = set()
+        clusters: List[Dict[str, Any]] = []
+
+        for start_id in sorted(occ_ids):
+            if start_id in visited_occ:
+                continue
+            # BFS across occupied nodes AND aligned turnouts (never across unoccupied TrackSegments)
+            comp_visited: Set[str] = {start_id}
+            queue: List[str] = [start_id]
+            comp_occ: Set[str] = {start_id}
+            comp_turnouts: Set[str] = set()
+            while queue:
+                u = queue.pop(0)
+                for v in adj.get(u, ()):
+                    if v in comp_visited:
+                        continue
+                    v_el = elements.get(v)
+                    if not v_el:
+                        continue
+                    if v in occ_ids:
+                        comp_visited.add(v)
+                        comp_occ.add(v)
+                        queue.append(v)
+                    elif getattr(v_el, "elem_type", "") == "turnout":
+                        comp_visited.add(v)
+                        comp_turnouts.add(v)
+                        queue.append(v)
+
+            visited_occ.update(comp_occ)
+
+            # Prune dead-end unoccupied turnouts that do not bridge between >=2 nodes in the component
+            bridged_turnouts = set(comp_turnouts)
+            changed = True
+            while changed and bridged_turnouts:
+                changed = False
+                sub_nodes = comp_occ | bridged_turnouts
+                for wid in list(bridged_turnouts):
+                    deg = sum(1 for nbr in adj.get(wid, ()) if nbr in sub_nodes)
+                    if deg < 2:
+                        bridged_turnouts.discard(wid)
+                        changed = True
+
+            ordered_occ = cls._order_cluster_chain(comp_occ, bridged_turnouts, adj, elements)
+            clusters.append({
+                "elements": ordered_occ,
+                "element_set": comp_occ,
+                "bridged_turnouts": sorted(bridged_turnouts),
+                "adj": adj,
+            })
+
+        return clusters
+
+    @classmethod
+    def get_connected_occupied_cluster(
+        cls,
+        elem_id: str,
+        elements: Dict[str, Any],
+        resolve_jump_fn: Optional[Any] = None,
+        include_inferred: bool = False,
+    ) -> List[str]:
+        """Returns the ordered list of continuous occupied elements connected to `elem_id` (through aligned turnouts)."""
+        if not elem_id or elem_id not in elements:
+            return []
+        for cl in cls.find_occupied_track_clusters(elements, resolve_jump_fn, include_inferred=include_inferred):
+            if elem_id in cl["element_set"]:
+                return list(cl["elements"])
+        return []
+
+    @classmethod
+    def _infer_direction_between_elements(
+        cls,
+        from_el: Any,
+        to_el: Any,
+        elements: Dict[str, Any],
+        adj: Optional[Dict[str, Set[str]]] = None,
+    ) -> Optional[str]:
+        """Infers compass travel direction from `from_el` toward `to_el` (direct, via bridged turnout, GPS, or x/y)."""
+        if not from_el or not to_el:
+            return None
+        from_id = getattr(from_el, "id", "")
+        to_id = getattr(to_el, "id", "")
+        if not from_id or not to_id or from_id == to_id:
+            return None
+
+        # 1. Direct neighbor check on from_el
+        if getattr(from_el, "elem_type", "") == "track":
+            for ndir, nval in (getattr(from_el, "neighbors", None) or {}).items():
+                cands = [nval] if isinstance(nval, str) else list(nval or [])
+                if to_id in cands:
+                    return ndir
+        elif getattr(from_el, "elem_type", "") == "turnout":
+            if hasattr(from_el, "active_branch_neighbor") and from_el.active_branch_neighbor() == to_id:
+                return from_el.active_branch_dir() if hasattr(from_el, "active_branch_dir") else getattr(from_el, "orientation", "E")
+            if getattr(from_el, "common_neighbor", None) == to_id:
+                return OPPOSITE_DIR.get(getattr(from_el, "orientation", "E"), "W")
+
+        # 2. First hop along aligned graph (when separated by one or more bridged turnouts)
+        if adj and from_id in adj:
+            parent: Dict[str, Optional[str]] = {from_id: None}
+            q: List[str] = [from_id]
+            found = False
+            while q and len(parent) <= 16:
+                u = q.pop(0)
+                if u == to_id:
+                    found = True
+                    break
+                for v in adj.get(u, ()):
+                    if v not in parent:
+                        parent[v] = u
+                        q.append(v)
+            if found:
+                hop = to_id
+                while parent.get(hop) is not None and parent[hop] != from_id:
+                    hop = parent[hop]
+                if hop and hop != from_id and getattr(from_el, "elem_type", "") == "track":
+                    for ndir, nval in (getattr(from_el, "neighbors", None) or {}).items():
+                        cands = [nval] if isinstance(nval, str) else list(nval or [])
+                        if hop in cands:
+                            return ndir
+
+        # 3. Reverse direct neighbor check on to_el
+        if getattr(to_el, "elem_type", "") == "track":
+            for ndir, nval in (getattr(to_el, "neighbors", None) or {}).items():
+                cands = [nval] if isinstance(nval, str) else list(nval or [])
+                if from_id in cands:
+                    return OPPOSITE_DIR.get(ndir, ndir)
+
+        # 4. GPS delta
+        g1 = get_element_gps_any(from_el, elements)
+        g2 = get_element_gps_any(to_el, elements)
+        if g1 and g2:
+            dlat = g2[0] - g1[0]
+            dlon = g2[1] - g1[1]
+            if abs(dlat) > 1e-6 or abs(dlon) > 1e-6:
+                if abs(dlon) >= abs(dlat):
+                    return "E" if dlon > 0 else "W"
+                return "N" if dlat > 0 else "S"
+
+        # 5. Logical canvas (x, y) delta (screen y increases downward = South)
+        dx = float(getattr(to_el, "x", 0) or 0) - float(getattr(from_el, "x", 0) or 0)
+        dy = float(getattr(to_el, "y", 0) or 0) - float(getattr(from_el, "y", 0) or 0)
+        if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+            if abs(dx) >= abs(dy):
+                return "E" if dx > 0 else "W"
+            return "S" if dy > 0 else "N"
+        return None
+
+    @classmethod
+    def _estimate_speed_between_elements(
+        cls,
+        from_el: Any,
+        to_el: Any,
+        dt_sec: float,
+        elements: Dict[str, Any],
+    ) -> Optional[float]:
+        """Estimates speed in MPH between two layout elements if distance and elapsed time are valid."""
+        if not from_el or not to_el or dt_sec < 1.0 or dt_sec > 600.0:
+            return None
+        dist_miles = None
+        g1 = get_element_gps_any(from_el, elements)
+        g2 = get_element_gps_any(to_el, elements)
+        if g1 and g2:
+            dist_miles = haversine_miles(g1, g2)
+        else:
+            mm1 = getattr(from_el, "mile_marker", None)
+            mm2 = getattr(to_el, "mile_marker", None)
+            if mm1 is not None and mm2 is not None:
+                try:
+                    dist_miles = abs(float(mm2) - float(mm1))
+                except (ValueError, TypeError):
+                    dist_miles = None
+        if dist_miles is not None and 0.001 <= dist_miles <= 25.0:
+            spd = (dist_miles / dt_sec) * 3600.0
+            if spd <= 150.0:
+                return round(spd, 1)
+        return None
+
+    @classmethod
+    def _merge_hw_train_records(
+        cls,
+        train_tracker: TrainTracker,
+        keep_key: str,
+        drop_key: str,
+        elements: Dict[str, Any],
+    ):
+        """Merges a duplicate occupied-track train (`drop_key`) into `keep_key`, preserving metadata."""
+        keep = train_tracker.trains.get(keep_key)
+        drop = train_tracker.trains.get(drop_key)
+        if not keep or not drop or keep_key == drop_key:
+            return
+
+        if not keep.get("assigned_name") and drop.get("assigned_name"):
+            keep["assigned_name"] = drop["assigned_name"]
+        if not keep.get("assigned_id") and drop.get("assigned_id"):
+            keep["assigned_id"] = drop["assigned_id"]
+        if keep.get("speed_mph") is None and drop.get("speed_mph") is not None:
+            keep["speed_mph"] = drop["speed_mph"]
+            keep["speed_str"] = drop.get("speed_str") or f"{drop['speed_mph']:.1f} MPH"
+        if keep.get("status") != "Confirmed" and drop.get("status") == "Confirmed":
+            keep["status"] = "Confirmed"
+        if not keep.get("initial_signal_id") and drop.get("initial_signal_id"):
+            keep["initial_signal_id"] = drop["initial_signal_id"]
+        if not keep.get("expected_signal_id") and drop.get("expected_signal_id"):
+            keep["expected_signal_id"] = drop["expected_signal_id"]
+        for fld in ("passed_elements", "ahead_elements", "passed_signals", "downstream_signals"):
+            dst = keep.setdefault(fld, [])
+            for item in (drop.get(fld) or []):
+                if item not in dst:
+                    dst.append(item)
+        keep["packets_received"] = int(keep.get("packets_received", 0)) + int(drop.get("packets_received", 0))
+        keep["is_receiving_packets"] = bool(keep.get("is_receiving_packets") or drop.get("is_receiving_packets"))
+        keep["last_packet_ts"] = max(float(keep.get("last_packet_ts") or 0.0), float(drop.get("last_packet_ts") or 0.0))
+        keep["updated_ts"] = max(float(keep.get("updated_ts") or 0.0), float(drop.get("updated_ts") or 0.0))
+        keep["created_ts"] = min(float(keep.get("created_ts") or keep["updated_ts"]), float(drop.get("created_ts") or keep["updated_ts"]))
+
+        # Clear any stale inferred occupancy left behind solely by drop's old element
+        drop_curr = elements.get(drop.get("current_element_id"))
+        if drop_curr and not getattr(drop_curr, "_hw_occupied", False) and getattr(drop_curr, "_inferred_occupied", False):
+            drop_curr._inferred_occupied = False
+            drop_curr._train_name = None
+            drop_curr._estimated_speed_mph = None
+            drop_curr._train_direction = None
+            drop_curr._is_dimmed = False
+
+        train_tracker.trains.pop(drop_key, None)
+
+    @classmethod
+    def consolidate_occupied_track_trains(
+        cls,
+        elements: Dict[str, Any],
+        train_tracker: TrainTracker,
+        now: float,
+        resolve_jump_fn: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Best-effort consolidation of continuous hardware-occupied tracks (including through
+        aligned turnouts, whichever way they point, and paired TrackJumps) into unified trains:
+          - Merges multiple trains spanning the same continuous occupied cluster into ONE train.
+          - Assigns one train per continuous occupied cluster (never creating duplicate trains
+            for adjacent occupied blocks or across aligned switches/crossovers).
+          - Splits cleanly into separate trains if an occupied cluster disconnects (middle clears
+            or switch throws against it).
+          - Infers head block (`current_element_id`), travel direction, and speed from block
+            occupancy timestamps & topology, and stamps consistent train metadata onto every
+            occupied element in the cluster (preventing false self-collisions).
+        """
+        # Sync _hw_occupied_since_ts for any tracks/turnouts toggled directly (e.g. Sim mode or tests)
+        hw_occ_ids: Set[str] = set()
+        for eid, el in elements.items():
+            if getattr(el, "elem_type", "") not in ("track", "turnout"):
+                continue
+            if getattr(el, "_hw_occupied", False):
+                hw_occ_ids.add(eid)
+                if float(getattr(el, "_hw_occupied_since_ts", 0.0) or 0.0) <= 0.0:
+                    el._hw_occupied_since_ts = float(getattr(el, "_last_packet_ts", 0.0) or now)
+            else:
+                if float(getattr(el, "_hw_occupied_since_ts", 0.0) or 0.0) > 0.0:
+                    el._hw_occupied_since_ts = 0.0
+
+        # Prune cleared elements from existing trains' occupied_elements lists
+        for trn in train_tracker.trains.values():
+            if trn.get("is_rf_train"):
+                continue
+            old_occ = trn.get("occupied_elements")
+            if old_occ:
+                still_occ = [eid for eid in old_occ if eid in hw_occ_ids]
+                cleared = [eid for eid in old_occ if eid not in hw_occ_ids]
+                if cleared:
+                    passed = trn.setdefault("passed_elements", [])
+                    for cid in cleared:
+                        if cid not in passed:
+                            passed.append(cid)
+                trn["occupied_elements"] = still_occ
+
+        clusters = cls.find_occupied_track_clusters(elements, resolve_jump_fn, include_inferred=False)
+        if not clusters:
+            return []
+
+        adj = clusters[0]["adj"]
+
+        # Map each non-RF active train to its currently known element footprint for cluster matching
+        def _train_priority(tkey: str) -> Tuple[int, int, int, float]:
+            trn = train_tracker.trains[tkey]
+            has_user = 0 if (trn.get("assigned_name") or trn.get("assigned_id")) else 1
+            st_rank = 0 if trn.get("status") == "Confirmed" else (1 if trn.get("status") == "Inferred" else 2)
+            return (has_user, st_rank, int(trn.get("board_order", 999999)), float(trn.get("created_ts", 0.0)))
+
+        # Sort clusters so those already containing a train's current_element_id claim first (for clean splits)
+        active_curr_ids = {
+            trn.get("current_element_id")
+            for trn in train_tracker.trains.values()
+            if not trn.get("is_rf_train") and trn.get("status") in ("Inferred", "Confirmed")
+        }
+        clusters.sort(
+            key=lambda cl: (
+                0 if (cl["element_set"] & active_curr_ids) else 1,
+                -len(cl["elements"]),
+                cl["elements"][0] if cl["elements"] else "",
+            )
+        )
+
+        claimed_keys: Set[str] = set()
+
+        for cl in clusters:
+            ordered = cl["elements"]
+            c_set = cl["element_set"]
+            bridged = cl["bridged_turnouts"]
+            c_and_bridges = c_set | set(bridged)
+
+            # Collect element _train_name tags already stamped on this cluster
+            stamped_names: Set[str] = set()
+            for eid in ordered:
+                tn = getattr(elements.get(eid), "_train_name", None)
+                if tn:
+                    stamped_names.add(str(tn))
+
+            # Find all unclaimed non-RF active trains overlapping or immediately handing off into this cluster
+            matched_keys: List[str] = []
+            for tkey, trn in list(train_tracker.trains.items()):
+                if tkey in claimed_keys or trn.get("is_rf_train"):
+                    continue
+                if trn.get("status") not in ("Inferred", "Confirmed"):
+                    continue
+                curr_id = trn.get("current_element_id")
+                last_id = trn.get("last_element_id")
+                occ_list = trn.get("occupied_elements") or []
+
+                direct_hit = (
+                    (curr_id in c_set)
+                    or (last_id in c_set)
+                    or bool(set(occ_list) & c_set)
+                    or (tkey in stamped_names)
+                    or (trn.get("train_name") in stamped_names)
+                    or (trn.get("assigned_name") and trn.get("assigned_name") in stamped_names)
+                )
+                if direct_hit:
+                    matched_keys.append(tkey)
+                    continue
+
+                # Smooth handoff: signal-inferred train (on an inferred block, not HW-occupied elsewhere)
+                # directly adjacent to this HW cluster along the aligned graph and along its forward path
+                if curr_id and curr_id not in hw_occ_ids:
+                    curr_el_obj = elements.get(curr_id)
+                    if curr_el_obj and getattr(curr_el_obj, "_inferred_occupied", False):
+                        # Adjacent directly or via an aligned turnout
+                        nbrs = set(adj.get(curr_id, ()))
+                        expanded_nbrs = set(nbrs)
+                        for n in nbrs:
+                            if getattr(elements.get(n), "elem_type", "") == "turnout":
+                                expanded_nbrs.update(adj.get(n, ()))
+                        if (expanded_nbrs & c_and_bridges) and (
+                            bool(c_set & set(trn.get("ahead_elements") or []))
+                            or bool(c_set & set(trn.get("path_element_ids") or []))
+                        ):
+                            matched_keys.append(tkey)
+
+            # Avoid falsely merging two distinct Confirmed signal-driven trains moving strictly head-on
+            if len(matched_keys) >= 2:
+                matched_keys.sort(key=_train_priority)
+                win_k = matched_keys[0]
+                win_t = train_tracker.trains[win_k]
+                filtered_merge: List[str] = [win_k]
+                for other_k in matched_keys[1:]:
+                    other_t = train_tracker.trains[other_k]
+                    is_opposing_sig_confirmed = (
+                        win_t.get("status") == "Confirmed"
+                        and other_t.get("status") == "Confirmed"
+                        and bool(win_t.get("initial_signal_id"))
+                        and bool(other_t.get("initial_signal_id"))
+                        and OPPOSITE_DIR.get(win_t.get("direction")) == other_t.get("direction")
+                        and win_t.get("current_element_id") != other_t.get("current_element_id")
+                    )
+                    if not is_opposing_sig_confirmed:
+                        filtered_merge.append(other_k)
+                matched_keys = filtered_merge
+
+            # Pick or create the single train owning this continuous occupied cluster
+            if not matched_keys:
+                # Infer head, direction, and speed purely from the cluster's block timestamps & topology
+                head_id = ordered[-1]
+                tail_id = ordered[0]
+                inferred_dir: Optional[str] = None
+                est_spd: Optional[float] = None
+                if len(ordered) >= 2:
+                    ts_first = float(getattr(elements.get(ordered[0]), "_hw_occupied_since_ts", 0.0) or 0.0)
+                    ts_last = float(getattr(elements.get(ordered[-1]), "_hw_occupied_since_ts", 0.0) or 0.0)
+                    if ts_first > ts_last + 0.05:
+                        head_id, tail_id = ordered[0], ordered[-1]
+                        prev_adj = ordered[1]
+                        inferred_dir = cls._infer_direction_between_elements(elements.get(prev_adj), elements.get(head_id), elements, adj)
+                        est_spd = cls._estimate_speed_between_elements(
+                            elements.get(prev_adj), elements.get(head_id),
+                            ts_first - float(getattr(elements.get(prev_adj), "_hw_occupied_since_ts", 0.0) or 0.0),
+                            elements,
+                        )
+                    elif ts_last > ts_first + 0.05:
+                        head_id, tail_id = ordered[-1], ordered[0]
+                        prev_adj = ordered[-2]
+                        inferred_dir = cls._infer_direction_between_elements(elements.get(prev_adj), elements.get(head_id), elements, adj)
+                        est_spd = cls._estimate_speed_between_elements(
+                            elements.get(prev_adj), elements.get(head_id),
+                            ts_last - float(getattr(elements.get(prev_adj), "_hw_occupied_since_ts", 0.0) or 0.0),
+                            elements,
+                        )
+                head_el = elements.get(head_id)
+                head_lbl = getattr(head_el, "label", "") if head_el else ""
+                win_key = train_tracker.update_or_assign_train(
+                    elem_id=head_id,
+                    elem_label=head_lbl,
+                    prev_elem_id=None,
+                    speed_mph=est_spd,
+                    direction=inferred_dir,
+                    timestamp=now,
+                )
+                win_trn = train_tracker.trains[win_key]
+                if len(ordered) >= 2 and inferred_dir is not None:
+                    win_trn["status"] = "Confirmed"
+            else:
+                matched_keys.sort(key=_train_priority)
+                win_key = matched_keys[0]
+                for drop_k in matched_keys[1:]:
+                    cls._merge_hw_train_records(train_tracker, win_key, drop_k, elements)
+                win_trn = train_tracker.trains[win_key]
+
+            claimed_keys.add(win_key)
+
+            # Determine best-effort head element, travel direction, and speed across this cluster
+            prev_head_id = win_trn.get("current_element_id")
+            cur_dir = win_trn.get("direction")
+            head_id = ordered[-1]
+            inferred_dir = None
+            est_spd = None
+
+            if len(ordered) == 1:
+                head_id = ordered[0]
+                if prev_head_id and prev_head_id != head_id and prev_head_id in elements:
+                    # Train advanced into a single new block while old block already vacated
+                    inferred_dir = cls._infer_direction_between_elements(elements.get(prev_head_id), elements.get(head_id), elements, adj)
+                    t_new = float(getattr(elements.get(head_id), "_hw_occupied_since_ts", 0.0) or now)
+                    t_old = float(win_trn.get("_last_head_ts") or win_trn.get("updated_ts") or 0.0)
+                    if t_old > 0.0 and t_new > t_old:
+                        est_spd = cls._estimate_speed_between_elements(elements.get(prev_head_id), elements.get(head_id), t_new - t_old, elements)
+                    if inferred_dir:
+                        win_trn["status"] = "Confirmed"
+            else:
+                e_start, e_end = ordered[0], ordered[-1]
+                ts_start = float(getattr(elements.get(e_start), "_hw_occupied_since_ts", 0.0) or 0.0)
+                ts_end = float(getattr(elements.get(e_end), "_hw_occupied_since_ts", 0.0) or 0.0)
+
+                if ts_start > ts_end + 0.05:
+                    head_id = e_start
+                    prev_blk = ordered[1]
+                    inferred_dir = cls._infer_direction_between_elements(elements.get(prev_blk), elements.get(head_id), elements, adj)
+                    win_trn["status"] = "Confirmed"
+                    if head_id != prev_head_id or win_trn.get("speed_mph") is None:
+                        t_prev = float(getattr(elements.get(prev_blk), "_hw_occupied_since_ts", 0.0) or 0.0)
+                        if t_prev > 0.0 and ts_start > t_prev:
+                            est_spd = cls._estimate_speed_between_elements(elements.get(prev_blk), elements.get(head_id), ts_start - t_prev, elements)
+                elif ts_end > ts_start + 0.05:
+                    head_id = e_end
+                    prev_blk = ordered[-2]
+                    inferred_dir = cls._infer_direction_between_elements(elements.get(prev_blk), elements.get(head_id), elements, adj)
+                    win_trn["status"] = "Confirmed"
+                    if head_id != prev_head_id or win_trn.get("speed_mph") is None:
+                        t_prev = float(getattr(elements.get(prev_blk), "_hw_occupied_since_ts", 0.0) or 0.0)
+                        if t_prev > 0.0 and ts_end > t_prev:
+                            est_spd = cls._estimate_speed_between_elements(elements.get(prev_blk), elements.get(head_id), ts_end - t_prev, elements)
+                else:
+                    # Simultaneous occupancy (e.g. single CTC packet): orient along existing direction if known
+                    d_forward = cls._infer_direction_between_elements(elements.get(e_start), elements.get(e_end), elements, adj)
+                    if cur_dir and d_forward:
+                        if cur_dir in COMPATIBLE_DIRS.get(d_forward, (d_forward,)):
+                            head_id = e_end
+                        elif OPPOSITE_DIR.get(cur_dir) in COMPATIBLE_DIRS.get(d_forward, (d_forward,)):
+                            head_id = e_start
+                        elif prev_head_id in (e_start, e_end):
+                            head_id = prev_head_id
+                    elif prev_head_id in c_set:
+                        head_id = prev_head_id
+
+            if inferred_dir:
+                win_trn["direction"] = inferred_dir
+            if est_spd is not None:
+                win_trn["speed_mph"] = est_spd
+                win_trn["speed_str"] = f"{est_spd:.1f} MPH"
+
+            if head_id != prev_head_id:
+                win_trn["_last_head_ts"] = float(getattr(elements.get(head_id), "_hw_occupied_since_ts", 0.0) or now)
+                if prev_head_id and prev_head_id not in c_set:
+                    passed = win_trn.setdefault("passed_elements", [])
+                    if prev_head_id not in passed:
+                        passed.append(prev_head_id)
+                win_trn["updated_ts"] = now
+                win_trn["time_str"] = time.strftime("%H:%M:%S", time.localtime(now))
+            elif "_last_head_ts" not in win_trn:
+                win_trn["_last_head_ts"] = float(getattr(elements.get(head_id), "_hw_occupied_since_ts", 0.0) or now)
+
+            head_el = elements.get(head_id)
+            head_lbl = getattr(head_el, "label", "") if head_el else ""
+            win_trn["occupied_elements"] = list(ordered)
+            win_trn["bridged_turnouts"] = list(bridged)
+            win_trn["current_element_id"] = head_id
+            win_trn["last_element_id"] = head_id
+            if len(ordered) > 1:
+                win_trn["last_location"] = (
+                    f"{head_id} ({head_lbl}) [+{len(ordered) - 1}]"
+                    if head_lbl else f"{head_id} [+{len(ordered) - 1}]"
+                )
+            else:
+                win_trn["last_location"] = f"{head_id} ({head_lbl})" if head_lbl else head_id
+
+            # Keep path_element_ids synchronized with all occupied blocks
+            path_ids = list(win_trn.get("passed_elements") or [])
+            for eid in ordered:
+                if eid not in path_ids:
+                    path_ids.append(eid)
+            for eid in (win_trn.get("ahead_elements") or []):
+                if eid not in path_ids:
+                    path_ids.append(eid)
+            win_trn["full_path"] = path_ids
+            win_trn["path_element_ids"] = list(path_ids)
+
+            # Active hardware-occupied cluster reactivates any dimmed/counting-down train
+            if ordered:
+                win_trn["is_dimmed"] = False
+                win_trn["timeout_start_ts"] = None
+
+            # Stamp unified train identity across EVERY occupied element in the cluster
+            stamp_name = win_trn.get("assigned_name") or win_trn.get("train_name")
+            stamp_dir = win_trn.get("direction")
+            stamp_spd = win_trn.get("speed_mph")
+            stamp_dim = bool(win_trn.get("is_dimmed", False))
+            for eid in ordered:
+                el = elements.get(eid)
+                if el is None:
+                    continue
+                if hasattr(el, "_train_name"):
+                    el._train_name = stamp_name
+                if hasattr(el, "_train_direction"):
+                    el._train_direction = stamp_dir
+                if hasattr(el, "_estimated_speed_mph"):
+                    el._estimated_speed_mph = stamp_spd
+                if hasattr(el, "_is_dimmed"):
+                    el._is_dimmed = stamp_dim
+
+        return clusters
+
+    @classmethod
     def evaluate_system_trains(
         cls,
         elements: Dict[str, Any],
@@ -2523,18 +3225,43 @@ class TrainInferenceManager:
 
         cls.merge_potential_trains_on_continuous_paths(train_tracker, elements, resolve_jump_fn)
 
+        # 2.5. Consolidate continuous hardware-occupied tracks (including through aligned turnouts) into unified trains
+        cls.consolidate_occupied_track_trains(elements, train_tracker, now, resolve_jump_fn)
+
         # 3. Rule 11: Timeout, Dimming, Reactivation, and Deletion
         trains_to_delete = []
         for tkey, trn in list(train_tracker.trains.items()):
             if trn.get("is_rf_train"):
                 continue
             if trn.get("status") in ("Inferred", "Confirmed"):
+                occ_chk_ids = list(trn.get("occupied_elements") or [])
+                curr_chk_id = trn.get("current_element_id")
+                if curr_chk_id and curr_chk_id not in occ_chk_ids:
+                    occ_chk_ids.append(curr_chk_id)
+                # CTC-driven hardware occupancy never times out or dims via inferred train timeout —
+                # it persists until ALL CTC-occupied blocks of the train are changed by PTC or another CTC packet.
+                ctc_hw_els = [
+                    elements.get(oid) for oid in occ_chk_ids
+                    if elements.get(oid) is not None
+                    and getattr(elements.get(oid), "_status_source", "") == "ctc"
+                    and getattr(elements.get(oid), "_hw_occupied", False)
+                ]
+                if ctc_hw_els:
+                    trn["is_dimmed"] = False
+                    trn["timeout_start_ts"] = None
+                    for cel in ctc_hw_els:
+                        cel._is_dimmed = False
+                    continue
+
                 at_edge = (trn.get("expected_signal_id") is None)
                 stale_signal = False
                 if not at_edge:
                     exp_sig = elements.get(trn.get("expected_signal_id"))
                     if exp_sig is None:
                         stale_signal = True
+                    elif getattr(exp_sig, "_status_source", "") == "ctc":
+                        # CTC-driven signals do not time out
+                        stale_signal = False
                     else:
                         sig_last_rx = getattr(exp_sig, "_last_packet_ts", 0.0) or 0.0
                         if sig_last_rx > 0:
@@ -2548,9 +3275,10 @@ class TrainInferenceManager:
                     if trn.get("timeout_start_ts") is None:
                         trn["timeout_start_ts"] = now
                         trn["is_dimmed"] = True
-                        curr_el = elements.get(trn.get("current_element_id"))
-                        if curr_el:
-                            curr_el._is_dimmed = True
+                        for oid in occ_chk_ids:
+                            el_o = elements.get(oid)
+                            if el_o:
+                                el_o._is_dimmed = True
                     else:
                         if (now - trn["timeout_start_ts"]) >= inferred_timeout_sec:
                             trains_to_delete.append(tkey)
@@ -2558,20 +3286,25 @@ class TrainInferenceManager:
                     if trn.get("is_dimmed") and not at_edge:
                         trn["is_dimmed"] = False
                         trn["timeout_start_ts"] = None
-                        curr_el = elements.get(trn.get("current_element_id"))
-                        if curr_el:
-                            curr_el._is_dimmed = False
+                        for oid in occ_chk_ids:
+                            el_o = elements.get(oid)
+                            if el_o:
+                                el_o._is_dimmed = False
 
         for tkey in trains_to_delete:
             deleted_trn = train_tracker.trains.pop(tkey, None)
             if deleted_trn:
-                curr_el = elements.get(deleted_trn.get("current_element_id"))
-                if curr_el:
-                    curr_el._inferred_occupied = False
-                    curr_el._train_name = None
-                    curr_el._estimated_speed_mph = None
-                    curr_el._train_direction = None
-                    curr_el._is_dimmed = False
+                clear_ids = set(deleted_trn.get("occupied_elements") or [])
+                if deleted_trn.get("current_element_id"):
+                    clear_ids.add(deleted_trn["current_element_id"])
+                for cid in clear_ids:
+                    el_c = elements.get(cid)
+                    if el_c:
+                        el_c._inferred_occupied = False
+                        el_c._train_name = None
+                        el_c._estimated_speed_mph = None
+                        el_c._train_direction = None
+                        el_c._is_dimmed = False
 
         train_tracker.prune_inactive(active_occ_ids, now)
         return active_occ_ids

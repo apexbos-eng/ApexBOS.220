@@ -1930,7 +1930,7 @@ class InPlaceElementEditor:
                 {"key": "wiu_id", "label": "WIU ID (if HW Occ)", "val": str(el.wiu_id or ""), "req": False, "choices": wiu_choices, "tooltip": "WIU address transmitting this track's hardware occupancy bit."},
                 {"key": "occ_bit_offset", "label": "Occ Bit Offset", "val": str(el.occ_bit_offset if el.occ_bit_offset is not None else ""), "req": False, "choices": [str(i) for i in range(32)], "tooltip": "Bit index (0-31) in the WIU payload for occupancy."},
                 {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": 'CTC ID(s): substring, comma-separated list (e.g., up.oak, bnsf.oak), or r"regex" matched against _ctc_id_.'},
-                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). Supports !, AND, OR, XOR, LSB-LT:."},
+                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). LSB-LT default; supports !, AND, OR, XOR, LSB-RT:."},
             ])
 
         elif isinstance(el, Turnout):
@@ -1947,7 +1947,7 @@ class InPlaceElementEditor:
                 {"key": "has_occ_bit", "label": "Has HW Occ Bit (Wheel)", "val": str(el.has_occ_bit), "req": True, "choices": ["False", "True"], "tooltip": "True if this switch has a dedicated hardware occupancy bit."},
                 {"key": "occ_bit_offset", "label": "Occ Bit Offset (1b)", "val": str(el.occ_bit_offset if el.occ_bit_offset is not None else ""), "req": False, "choices": [str(i) for i in range(32)], "tooltip": "Bit index (0-31) in the payload for hardware occupancy."},
                 {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": 'CTC ID(s): substring, comma-separated list (e.g., up.oak, bnsf.oak), or r"regex" matched against _ctc_id_.'},
-                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). Supports !, AND, OR, XOR, LSB-LT:."},
+                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). LSB-LT default; supports !, AND, OR, XOR, LSB-RT:."},
             ])
 
         elif isinstance(el, Signal):
@@ -1962,7 +1962,7 @@ class InPlaceElementEditor:
                 {"key": "occ_bit_offset", "label": "Occ Bit Offset (1b)", "val": str(el.occ_bit_offset if el.occ_bit_offset is not None else ""), "req": False, "choices": [str(i) for i in range(32)], "tooltip": "Bit index for OS hardware occupancy."},
                 {"key": "signal_rules", "label": "Signal Rules / RR Override", "val": getattr(el, "signal_rules", "") or "", "req": False, "choices": ["<DEF>", "<BNSF>", "<UP>", "<NS>", "<CSX>"], "tooltip": "Signal table override e.g. <RRR> or 32:\"t:flashing_green,m:magenta,b:black\"."},
                 {"key": "ctc_id", "label": "CTC ID (Optional)", "val": getattr(el, "ctc_id", "") or "", "req": False, "choices": [], "tooltip": 'CTC ID(s): substring, comma-separated list (e.g., up.oak, bnsf.oak), or r"regex" matched against _ctc_id_.'},
-                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). Supports !, AND, OR, XOR, LSB-LT:."},
+                {"key": "ctc_rules", "label": "CTC Rules (Optional)", "val": getattr(el, "ctc_rules", "") or "", "req": False, "choices": [], "tooltip": "CTC bit rules: K=indication, C=command, bare integer (e.g. 11)=both K & C, ; Z21 OR Z22=Out-of-Service (K only). LSB-LT default; supports !, AND, OR, XOR, LSB-RT:."},
             ])
 
         elif isinstance(el, Crossing):

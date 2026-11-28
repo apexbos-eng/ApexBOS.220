@@ -273,7 +273,7 @@ ApexBOSFlux supports both modern unified `config.json` files and standalone lega
 ### Modern Unified Structure (`config.json`):
 ```json
 {
-  "version": "v26.1127.08",
+  "version": "v26.1127.14",
   "common": {
     "deployment_mode": "cloud",
     "banc": {

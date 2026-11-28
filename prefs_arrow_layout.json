@@ -1,7 +1,7 @@
 {
   "version": "v26.1127.08",
   "layout_filename": "arrow_layout.json",
-  "updated_at": "2026-11-27 11:21:24",
+  "updated_at": "2026-11-27 17:05:43",
   "element_overrides": {
     "SYS_CHAT": {
       "width": 1228,

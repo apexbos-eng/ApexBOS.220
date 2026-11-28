@@ -102,12 +102,40 @@ import pygame
 import mosfet_client
 from banc_coverage_modal import BancCoverageMapModal
 try:
-    from dispatcher_engine import ctc_id_matches, parse_label_font_tag
+    from dispatcher_engine import (
+        ctc_id_matches,
+        ctc_n_to_bit_num,
+        evaluate_ctc_oos_rules,
+        evaluate_ctc_rules_optional,
+        extract_ctc_packet_bit_map,
+        parse_ctc_rule_bit_specs,
+        parse_label_font_tag,
+    )
 except Exception:
     def ctc_id_matches(element_ctc_spec: Any, packet_ctc_id: Any) -> bool:
         es = str(element_ctc_spec or "").strip().lower()
         ps = str(packet_ctc_id or "").strip().lower()
         return bool(es and ps and any(p.strip() in ps for p in es.split(",") if p.strip()))
+
+    def ctc_n_to_bit_num(n_val: Any) -> Optional[int]:
+        try:
+            n = int(n_val)
+            t, o = divmod(n, 10)
+            return ((t << 3) - o) if (t >= 1 and 1 <= o <= 8) else None
+        except Exception:
+            return None
+
+    def evaluate_ctc_rules_optional(*args, **kwargs):
+        return None
+
+    def evaluate_ctc_oos_rules(*args, **kwargs):
+        return None
+
+    def extract_ctc_packet_bit_map(bits_hex: str, bit_width: int = 128, lsb_left: bool = True) -> Dict[int, int]:
+        return {}
+
+    def parse_ctc_rule_bit_specs(rules_str: str) -> Dict[str, Any]:
+        return {"lsb_left": True, "primary_str": "", "oos_str": "", "bits": {}, "ordered_bits": []}
 
     def parse_label_font_tag(raw_label: Any) -> Tuple[str, int]:
         text = str(raw_label or "")
@@ -2001,6 +2029,16 @@ class DispatcherPygameRenderer:
         self.selected_id: Optional[str] = None
         self.map_selected_id: Optional[str] = None
         self.map_inset_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self.ctc_panel_elem_id: Optional[str] = None
+        self.ctc_panel_pos: Optional[Tuple[int, int]] = None
+        self.ctc_panel_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self.ctc_panel_close_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self.ctc_panel_lsb_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self.ctc_panel_lsb_override: Optional[bool] = None  # Display-only LSB override (None=element cfg, True=LSB-LT, False=LSB-RT)
+        self.ctc_panel_effective_lsb_left: bool = True
+        self.ctc_panel_dragging: bool = False
+        self.ctc_panel_drag_offset: Tuple[int, int] = (0, 0)
+        self.ctc_panel_cell_hits: List[Tuple[pygame.Rect, str]] = []
         self.dragging_id: Optional[str] = None
         self.drag_offset_logical: Tuple[float, float] = (0.0, 0.0)
         self.resizing_panel_id: Optional[str] = None
@@ -3253,11 +3291,47 @@ class DispatcherPygameRenderer:
         eid = str(el.get("id", ""))
         return (clean_name if clean_name else eid), font_delta
 
+    @staticmethod
+    def is_element_ctc_driven(el: dict) -> bool:
+        """True when this element's current status came from CTC (never times out, 5x fade window)."""
+        if not isinstance(el, dict):
+            return False
+        return bool(el.get("status_source") == "ctc" or el.get("ctc_status_driven"))
+
+    def get_element_fade_timeout(self, el: dict) -> float:
+        """CTC status fades over 5x the configured PTC timeout; PTC uses stale_timeout_sec."""
+        base = max(1.0, float(self.stale_timeout_sec))
+        return base * 5.0 if self.is_element_ctc_driven(el) else base
+
+    def get_element_fade_metrics(self, el: dict, ref_now: float) -> Tuple[bool, float, float, float]:
+        """
+        Returns (is_stale, age_sec, eff_age_sec, fade_ratio) for an element:
+          - PTC elements fade from 3.5s to `stale_timeout_sec` and become stale at `stale_timeout_sec`.
+          - CTC elements NEVER time out (`is_stale=False`) and stretch the entire fade curve 5x
+            (`eff_age = age / 5.0`, holding full color up to 17.5s and fading cleanly over `5 * stale_timeout_sec`).
+        """
+        last_ts = float(el.get("last_packet_ts", 0.0) or 0.0)
+        if last_ts <= 0.0:
+            return True, 999.0, 999.0, 1.0
+        age = max(0.0, ref_now - last_ts)
+        is_ctc = self.is_element_ctc_driven(el)
+        scale = 5.0 if is_ctc else 1.0
+        eff_age = age / scale
+        is_stale = False if is_ctc else (age >= self.stale_timeout_sec)
+        if eff_age < 3.5:
+            fade_ratio = 0.0
+        else:
+            fade_ratio = min(1.0, max(0.0, (eff_age - 3.5) / max(1.0, self.stale_timeout_sec - 3.5)))
+        return is_stale, age, eff_age, fade_ratio
+
     def get_element_inactivity(self, el: dict, ref_now: float) -> Tuple[bool, float]:
         last_ts = float(el.get("last_packet_ts", 0.0) or 0.0)
         if last_ts <= 0.0:
             return True, 999.0
         age = max(0.0, ref_now - last_ts)
+        # CTC status NEVER times out to stale — it persists until changed by PTC or another CTC packet.
+        if self.is_element_ctc_driven(el):
+            return False, age
         return (age >= self.stale_timeout_sec), age
 
     def _get_adjusted_font(self, base_size: int, font_delta: int = 0, bold: bool = False) -> pygame.font.Font:
@@ -3301,16 +3375,15 @@ class DispatcherPygameRenderer:
         return True
 
     def render_aged_label(self, text: str, el: dict, ref_now: float, active_rgb: Tuple[int, int, int] = (245, 250, 255), font_delta: int = 0) -> pygame.Surface:
-        is_stale, age = self.get_element_inactivity(el, ref_now)
+        is_stale, age, eff_age, ratio = self.get_element_fade_metrics(el, ref_now)
         use_zoom_font = el.get("elem_type") in ("track", "signal", "turnout")
-        if age < 3.5:
+        if eff_age < 3.5:
             if use_zoom_font:
                 font = self._get_element_label_font(bold=True, font_delta=font_delta)
             else:
                 font = self._get_adjusted_font(12, font_delta=font_delta, bold=True) if font_delta else self.font_sm_bold
             return self._render_cached_text(font, text, active_rgb)
 
-        ratio = min(1.0, max(0.0, (age - 3.5) / max(1.0, self.stale_timeout_sec)))
         barely_visible_gray = (52, 58, 68)
         r = int(active_rgb[0] * (1.0 - ratio) + barely_visible_gray[0] * ratio) & ~3
         g = int(active_rgb[1] * (1.0 - ratio) + barely_visible_gray[1] * ratio) & ~3
@@ -3584,8 +3657,10 @@ class DispatcherPygameRenderer:
                 if pygame.Rect(px, py, int(pw * self.zoom), int(ph * self.zoom)).collidepoint(mx, my):
                     return
 
-        # Don't show if mouse is over readonly inspector
+        # Don't show if mouse is over readonly inspector or CTC bits panel
         if getattr(self, "inspector_rect", None) and self.readonly_inspector_id and self.inspector_rect.collidepoint(mx, my):
+            return
+        if getattr(self, "ctc_panel_rect", None) and self.ctc_panel_elem_id and self.ctc_panel_rect.collidepoint(mx, my):
             return
 
         hov_id = self.pick_layout_element_at_screen(mx, my)
@@ -4269,6 +4344,10 @@ class DispatcherPygameRenderer:
                 self.inspector_active_field = None
                 self.inspector_dragging = False
                 closed_any = True
+            if self.ctc_panel_elem_id:
+                self.ctc_panel_elem_id = None
+                self.ctc_panel_dragging = False
+                closed_any = True
             if self.map_selected_id:
                 self.map_selected_id = None
                 closed_any = True
@@ -4281,6 +4360,9 @@ class DispatcherPygameRenderer:
                 return True
         if (event.mod & pygame.KMOD_CTRL) and event.key == pygame.K_c:
             self.copy_selected_scroller_packets()
+            return True
+        if event.key == pygame.K_c and not (event.mod & (pygame.KMOD_CTRL | pygame.KMOD_ALT)):
+            self._toggle_ctc_bits_panel()
             return True
         if event.key == pygame.K_HOME:
             mx, my = pygame.mouse.get_pos()
@@ -4412,6 +4494,21 @@ class DispatcherPygameRenderer:
             if consumed:
                 return
         if event.button == 1:
+            if self.ctc_panel_elem_id and self.ctc_panel_rect.width > 0:
+                if self.ctc_panel_close_rect.collidepoint(mx, my):
+                    self.ctc_panel_elem_id = None
+                    self.ctc_panel_dragging = False
+                    return
+                if self.ctc_panel_lsb_rect.collidepoint(mx, my):
+                    self.ctc_panel_lsb_override = not bool(self.ctc_panel_effective_lsb_left)
+                    lbl_lsb = "LSB-LT" if self.ctc_panel_lsb_override else "LSB-RT"
+                    self.status_toast = f"CTC Panel view flipped to {lbl_lsb} (display only)"
+                    return
+                if self.ctc_panel_rect.collidepoint(mx, my):
+                    self.ctc_panel_dragging = True
+                    self.ctc_panel_drag_offset = (self.ctc_panel_rect.x - mx, self.ctc_panel_rect.y - my)
+                    return
+
             if self.readonly_inspector_id and self.inspector_rect.width > 0:
                 if self.inspector_close_rect.collidepoint(mx, my):
                     self.readonly_inspector_id = None
@@ -4590,6 +4687,21 @@ class DispatcherPygameRenderer:
                         return
         mx, my = event.pos
         if event.button == 1:
+            if self.ctc_panel_elem_id and self.ctc_panel_rect.width > 0:
+                if self.ctc_panel_close_rect.collidepoint(mx, my):
+                    self.ctc_panel_elem_id = None
+                    self.ctc_panel_dragging = False
+                    return
+                if self.ctc_panel_lsb_rect.collidepoint(mx, my):
+                    self.ctc_panel_lsb_override = not bool(self.ctc_panel_effective_lsb_left)
+                    lbl_lsb = "LSB-LT" if self.ctc_panel_lsb_override else "LSB-RT"
+                    self.status_toast = f"CTC Panel view flipped to {lbl_lsb} (display only)"
+                    return
+                if self.ctc_panel_rect.collidepoint(mx, my):
+                    self.ctc_panel_dragging = True
+                    self.ctc_panel_drag_offset = (self.ctc_panel_rect.x - mx, self.ctc_panel_rect.y - my)
+                    return
+
             if self.readonly_inspector_id and self.inspector_rect.width > 0:
                 if self.inspector_close_rect.collidepoint(mx, my):
                     self.readonly_inspector_id = None
@@ -4734,6 +4846,8 @@ class DispatcherPygameRenderer:
                 self.scroller_selecting = False
             if self.inspector_dragging:
                 self.inspector_dragging = False
+            if self.ctc_panel_dragging:
+                self.ctc_panel_dragging = False
             if self.resizing_panel_id:
                 self.save_preferences()
                 self.status_toast = f"Saved panel size for {self.resizing_panel_id} in '{self.prefs.filepath}'"
@@ -4751,6 +4865,9 @@ class DispatcherPygameRenderer:
                 if l_rect.collidepoint(mx, my):
                     self.scroller_sel_end = abs_idx
                     break
+            return
+        if self.ctc_panel_dragging and self.ctc_panel_elem_id:
+            self.ctc_panel_pos = (mx + self.ctc_panel_drag_offset[0], my + self.ctc_panel_drag_offset[1])
             return
         if self.inspector_dragging and self.readonly_inspector_id:
             self.inspector_pos = (mx + self.inspector_drag_offset[0], my + self.inspector_drag_offset[1])
@@ -4787,20 +4904,17 @@ class DispatcherPygameRenderer:
         if el.get("collision_warning"):
             return COLOR_TRACK_RED if flash_on else COLOR_TRACK_FLASH_DARK_RED
 
-        is_stale, age = self.get_element_inactivity(el, ref_now)
+        is_stale, age, eff_age, fade_ratio = self.get_element_fade_metrics(el, ref_now)
         last_ts = float(el.get("last_packet_ts", 0.0) or 0.0)
-        fade_ratio = 0.0
-        if last_ts > 0.0 and age >= 3.5:
-            fade_ratio = min(1.0, max(0.0, (age - 3.5) / max(1.0, self.stale_timeout_sec - 3.5)))
 
         if el.get("occupied") or el.get("hw_occupied") or el.get("inferred_occupied"):
             active_col = COLOR_TRACK_RED
             dark_col = (120, 28, 28)
             if el.get("is_dimmed"):
                 return dark_col
-            if last_ts <= 0.0 or age < 3.5:
+            if last_ts <= 0.0 or eff_age < 3.5:
                 return active_col
-            if is_stale or age >= self.stale_timeout_sec:
+            if is_stale or fade_ratio >= 1.0:
                 return dark_col
             return (
                 int(round(active_col[0] * (1.0 - fade_ratio) + dark_col[0] * fade_ratio)),
@@ -4811,9 +4925,9 @@ class DispatcherPygameRenderer:
         if el.get("green_path") and not el.get("out_of_service"):
             active_col = COLOR_TRACK_GREEN
             dark_col = (18, 110, 48)
-            if last_ts <= 0.0 or age < 3.5:
+            if last_ts <= 0.0 or eff_age < 3.5:
                 return active_col
-            if is_stale or age >= self.stale_timeout_sec:
+            if is_stale or fade_ratio >= 1.0:
                 return dark_col
             return (
                 int(round(active_col[0] * (1.0 - fade_ratio) + dark_col[0] * fade_ratio)),
@@ -4821,9 +4935,9 @@ class DispatcherPygameRenderer:
                 int(round(active_col[2] * (1.0 - fade_ratio) + dark_col[2] * fade_ratio)),
             )
 
-        if last_ts <= 0.0 or is_stale or age >= self.stale_timeout_sec:
+        if last_ts <= 0.0 or is_stale or fade_ratio >= 1.0:
             return COLOR_TRACK_STALE_GRAY
-        if age < 3.5:
+        if eff_age < 3.5:
             return COLOR_TRACK_WHITE
         active_col = COLOR_TRACK_WHITE
         dark_col = COLOR_TRACK_STALE_GRAY
@@ -5016,10 +5130,10 @@ class DispatcherPygameRenderer:
             )
             t += step_len
 
-    def _draw_oos_center_badge(self, sx: int, sy: int, is_occupied: bool):
+    def _draw_oos_center_badge(self, sx: int, sy: int, is_occupied: bool, color: Optional[Tuple[int, int, int]] = None):
         """Draws centered 'OOS' letters at the midpoint of an Out-of-Service track segment."""
         oos_font = self._get_element_label_font(bold=True)
-        txt_col = COLOR_TRACK_RED if is_occupied else COLOR_TRACK_WHITE
+        txt_col = color if color is not None else (COLOR_TRACK_RED if is_occupied else COLOR_TRACK_WHITE)
         oos_surf = self._render_cached_text(oos_font, "OOS", txt_col)
         ow, oh = oos_surf.get_width(), oos_surf.get_height()
         bg_rect = pygame.Rect(sx - ow // 2 - 3, sy - oh // 2 - 1, ow + 6, oh + 2)
@@ -5105,9 +5219,7 @@ class DispatcherPygameRenderer:
                 if is_vis and self._is_seg_visible(s0, s1, margin=60):
                     visible_track_screen_pts.append((s0, s1))
                     if el.get("out_of_service"):
-                        oos_occ = bool(el.get("occupied") or el.get("hw_occupied") or el.get("inferred_occupied") or el.get("collision_warning"))
-                        oos_col = COLOR_TRACK_RED if oos_occ else COLOR_TRACK_WHITE
-                        self._draw_dotted_line(oos_col, s0, s1, line_w)
+                        self._draw_dotted_line(col1, s0, s1, line_w)
                     else:
                         pygame.draw.line(self.screen, col1, s0, s1, line_w)
                         if el.get("green_path") and el.get("green_path_dir"):
@@ -5306,16 +5418,16 @@ class DispatcherPygameRenderer:
                     (max(10, int(active_rgb[0] * 0.42)), max(10, int(active_rgb[1] * 0.42)), max(10, int(active_rgb[2] * 0.42)))
                 )
 
+                h_stale, age, h_eff_age, fade_ratio = self.get_element_fade_metrics(h_el, ref_now)
                 if float(h_el.get("last_packet_ts", 0.0) or 0.0) <= 0.0:
                     lamp_rgb = DARK_LAMP_COLORS.get(last_col_name, DARK_LAMP_COLORS["GRAY"])
-                elif age < 3.5:
+                elif h_eff_age < 3.5:
                     lamp_rgb = active_rgb
                     if h_el.get("flashing", False) and not flash_on:
                         lamp_rgb = LAMP_COLORS["BLACK"]
-                elif h_stale or age >= self.stale_timeout_sec:
+                elif h_stale or fade_ratio >= 1.0:
                     lamp_rgb = dark_rgb
                 else:
-                    fade_ratio = min(1.0, max(0.0, (age - 3.5) / max(1.0, self.stale_timeout_sec - 3.5)))
                     r_c = int(round(active_rgb[0] * (1.0 - fade_ratio) + dark_rgb[0] * fade_ratio))
                     g_c = int(round(active_rgb[1] * (1.0 - fade_ratio) + dark_rgb[1] * fade_ratio))
                     b_c = int(round(active_rgb[2] * (1.0 - fade_ratio) + dark_rgb[2] * fade_ratio))
@@ -5441,7 +5553,7 @@ class DispatcherPygameRenderer:
                 col = frame_colors.get(eid) or self._track_color(el, flash_on, ref_now)
                 if el.get("out_of_service"):
                     oos_occ = bool(el.get("occupied") or el.get("hw_occupied") or el.get("inferred_occupied") or el.get("collision_warning"))
-                    self._draw_oos_center_badge(sx, sy, oos_occ)
+                    self._draw_oos_center_badge(sx, sy, oos_occ, color=col)
                 elif self.zoom >= 0.55 or is_sel:
                     r = max(4, int(5 * self.zoom))
                     pygame.draw.circle(self.screen, col, (sx, sy), r)
@@ -5464,9 +5576,18 @@ class DispatcherPygameRenderer:
 
                         is_rx = False
                         trn_st = "INFERRED" if is_inferred else "CONFIRMED"
+                        matched_trn = None
                         if ts_data and "trains" in ts_data:
                             for trn in ts_data["trains"]:
-                                if trn.get("current_element_id") == eid or trn.get("last_element_id") == eid or trn.get("train_name") == tname or trn.get("assigned_name") == tname:
+                                occ_els = trn.get("occupied_elements") or []
+                                if (
+                                    trn.get("current_element_id") == eid
+                                    or trn.get("last_element_id") == eid
+                                    or eid in occ_els
+                                    or trn.get("train_name") == tname
+                                    or trn.get("assigned_name") == tname
+                                ):
+                                    matched_trn = trn
                                     is_dimmed = is_dimmed or trn.get("is_dimmed", False)
                                     is_rx = trn.get("is_receiving_packets", False)
                                     trn_st = trn.get("status", trn_st).upper()
@@ -5476,10 +5597,18 @@ class DispatcherPygameRenderer:
                                         spd = trn.get("speed_mph")
                                     break
 
+                        # For a multi-track continuous train, draw ONE clean badge on its lead element
+                        # instead of repeating identical badges on every trailing occupied block.
+                        occ_span = list(matched_trn.get("occupied_elements") or []) if matched_trn else []
+                        lead_id = matched_trn.get("current_element_id") if matched_trn else None
+                        if len(occ_span) > 1 and lead_id and lead_id != eid and lead_id in elements:
+                            continue
+
                         rx_dot = "● " if is_rx else ""
                         dim_tag = " (DIMMED)" if is_dimmed else ""
+                        span_tag = f" ({len(occ_span)}blk)" if len(occ_span) > 1 else ""
                         spd_txt = f"{spd:.1f}MPH" if spd is not None else ("Unk." if is_inferred else "")
-                        badge_txt = f"{rx_dot}{tname} [{trn_st[:4]}] {tdir} {spd_txt}{dim_tag}".strip()
+                        badge_txt = f"{rx_dot}{tname} [{trn_st[:4]}] {tdir} {spd_txt}{span_tag}{dim_tag}".strip()
 
                         b_col = (175, 185, 195) if is_dimmed else (240, 248, 255)
                         b_surf = self._render_cached_text(self.font_sm_bold, badge_txt, b_col)
@@ -5530,14 +5659,14 @@ class DispatcherPygameRenderer:
                 dark_col = (65, 72, 85)
                 last_ts = float(el.get("last_packet_ts", 0.0) or 0.0)
 
-                if last_ts <= 0.0 or is_stale or age >= self.stale_timeout_sec:
+                b_stale, b_age, b_eff_age, fade_ratio = self.get_element_fade_metrics(el, ref_now)
+                if last_ts <= 0.0 or b_stale or fade_ratio >= 1.0:
                     col = dark_col
                     is_active = False
-                elif age < 3.5:
+                elif b_eff_age < 3.5:
                     col = active_col
                     is_active = True
                 else:
-                    fade_ratio = min(1.0, max(0.0, (age - 3.5) / max(1.0, self.stale_timeout_sec - 3.5)))
                     r_c = int(round(active_col[0] * (1.0 - fade_ratio) + dark_col[0] * fade_ratio))
                     g_c = int(round(active_col[1] * (1.0 - fade_ratio) + dark_col[1] * fade_ratio))
                     b_c = int(round(active_col[2] * (1.0 - fade_ratio) + dark_col[2] * fade_ratio))
@@ -6624,15 +6753,20 @@ class DispatcherPygameRenderer:
                     pygame.draw.circle(overlay_surf, (*theme_rgb, 60), (psx, psy), p_rad + 3)
                     pygame.draw.circle(overlay_surf, (*theme_rgb, 120), (psx, psy), p_rad, 2)
 
-        # B. If target element is track, highlight entire track bar
-        if target_el.get("elem_type") == "track":
-            p0, p1 = self._get_track_endpoints_logical(target_el)
-            s0 = self.logical_to_screen(p0[0], p0[1])
-            s1 = self.logical_to_screen(p1[0], p1[1])
-            bar_w = max(4, int(6 * self.zoom))
-            pygame.draw.line(overlay_surf, (*theme_rgb, 70), s0, s1, bar_w + 12)
-            pygame.draw.line(overlay_surf, (*theme_rgb, 140), s0, s1, bar_w + 6)
-            pygame.draw.line(overlay_surf, (255, 255, 255, 230), s0, s1, bar_w + 2)
+        # B. Highlight entire track bar(s) occupied by this train (single or multi-block continuous span)
+        hl_track_ids = [oid for oid in (trn.get("occupied_elements") or []) if oid in elements]
+        if target_id not in hl_track_ids:
+            hl_track_ids.append(target_id)
+        for h_id in hl_track_ids:
+            h_el = elements.get(h_id)
+            if h_el and h_el.get("elem_type") == "track":
+                p0, p1 = self._get_track_endpoints_logical(h_el)
+                s0 = self.logical_to_screen(p0[0], p0[1])
+                s1 = self.logical_to_screen(p1[0], p1[1])
+                bar_w = max(4, int(6 * self.zoom))
+                pygame.draw.line(overlay_surf, (*theme_rgb, 70), s0, s1, bar_w + 12)
+                pygame.draw.line(overlay_surf, (*theme_rgb, 140), s0, s1, bar_w + 6)
+                pygame.draw.line(overlay_surf, (255, 255, 255, 230), s0, s1, bar_w + 2)
 
         # C. Pulsating radar reticle at (sx, sy)
         base_r = max(10, int(15 * self.zoom))
@@ -7335,6 +7469,601 @@ class DispatcherPygameRenderer:
         hint = self.font_sm_thin.render("" if has_editable else "Details Inspector (Drag panel to move)", True, COLOR_TEXT_DIM)
         self.screen.blit(hint, (px + 12, btn_y + 7))
 
+    # -----------------------------------------------------------------
+    # CTC Bits Diagnostic Panel (Invoked with 'c' on a highlighted element)
+    # -----------------------------------------------------------------
+    def _resolve_highlighted_layout_element(self, state: Optional[dict]) -> Optional[str]:
+        """Resolves the currently highlighted layout element: hovered under mouse -> inspector -> selected."""
+        if not state:
+            return None
+        elements = state.get("elements", {})
+        if not elements:
+            return None
+        mx, my = pygame.mouse.get_pos()
+        # Ignore mouse hover if cursor is over the CTC panel itself
+        over_ctc = bool(self.ctc_panel_elem_id and self.ctc_panel_rect.width > 0 and self.ctc_panel_rect.collidepoint(mx, my))
+        if not over_ctc:
+            hov_id = self.pick_layout_element_at_screen(mx, my)
+            if hov_id and hov_id in elements:
+                return hov_id
+        if self.readonly_inspector_id and self.readonly_inspector_id in elements:
+            return self.readonly_inspector_id
+        if self.selected_id and self.selected_id in elements:
+            return self.selected_id
+        return None
+
+    def _toggle_ctc_bits_panel(self):
+        """Invoked by pressing 'c': opens or toggles the CTC Bits Diagnostic Panel for the highlighted element."""
+        state = self.current_state()
+        target_id = self._resolve_highlighted_layout_element(state)
+        if target_id:
+            if self.ctc_panel_elem_id == target_id:
+                self.ctc_panel_elem_id = None
+                self.ctc_panel_dragging = False
+                self.status_toast = f"Closed CTC Bits panel for '{target_id}'"
+            else:
+                self.ctc_panel_elem_id = target_id
+                self.ctc_panel_lsb_override = None
+                self.ctc_panel_dragging = False
+                self.status_toast = f"CTC Bits panel opened for '{target_id}' (C or Esc to close)"
+        elif self.ctc_panel_elem_id:
+            self.ctc_panel_elem_id = None
+            self.ctc_panel_dragging = False
+            self.status_toast = "Closed CTC Bits panel"
+        else:
+            self.status_toast = "Highlight or select an element, then press 'c' to inspect CTC bits"
+
+    @staticmethod
+    def _collect_ctc_packets_for_element(state: Optional[dict], el: dict, limit: int = 6) -> List[dict]:
+        """Collects the most recent CTC packets matching this element's `ctc_id`, newest first."""
+        if not state or not el:
+            return []
+        el_cid = str(el.get("ctc_id") or "").strip()
+        hist = state.get("ctc_packet_history")
+        if not el_cid or not isinstance(hist, dict):
+            return []
+        matched: List[dict] = []
+        for cid_key, items in hist.items():
+            if not isinstance(items, list) or not items:
+                continue
+            sample_cid = str(items[-1].get("ctc_id") or cid_key)
+            if ctc_id_matches(el_cid, sample_cid):
+                for item in items:
+                    if isinstance(item, dict):
+                        matched.append(item)
+        matched.sort(key=lambda p: float(p.get("ts", 0.0) or 0.0), reverse=True)
+        return matched[:limit]
+
+    @staticmethod
+    def _eval_ctc_packet_effect(
+        el: dict,
+        pkt: dict,
+        k_int: Optional[int],
+        c_int: Optional[int],
+        display_lsb_left: Optional[bool] = None,
+    ) -> Tuple[str, Tuple[int, int, int]]:
+        """Evaluates how a CTC packet relates to an element's configured rules (optionally with display-only LSB) and returns (tag, rgb)."""
+        rules_str = str(el.get("ctc_rules") or "").strip()
+        if not rules_str:
+            return "NO RULES", (135, 145, 160)
+        if display_lsb_left is not None:
+            stripped = re.sub(r"^\s*LSB[-_]?(?:LT|RT)\s*:\s*", "", rules_str, flags=re.IGNORECASE).strip()
+            rules_str = f"{'LSB-LT' if display_lsb_left else 'LSB-RT'}:{stripped}" if stripped else rules_str
+        kc = str(pkt.get("kc") or "").strip().upper()
+        pkt_kc = kc if kc in ("K", "C") else None
+        bits_hex = str(pkt.get("bits_hex") or "").strip()
+        bit_width = int(pkt.get("bit_width") or 128)
+        pkt_int = int(bits_hex, 16) if bits_hex else None
+        toks = set(str(t).lower() for t in (pkt.get("tokens") or []))
+
+        prim = evaluate_ctc_rules_optional(
+            rules_str,
+            active_tokens=toks,
+            ctc_rules_int=pkt_int,
+            bit_width=bit_width,
+            pkt_kc=pkt_kc,
+            ctc_k_int=k_int if pkt_int is not None else None,
+            ctc_c_int=c_int if pkt_int is not None else None,
+        )
+        oos = evaluate_ctc_oos_rules(
+            rules_str,
+            active_tokens=toks,
+            ctc_rules_int=pkt_int,
+            bit_width=bit_width,
+            pkt_kc=pkt_kc,
+        )
+        if prim is None and oos is None:
+            return f"IGN({kc or '?'})", (115, 125, 142)
+
+        etype = str(el.get("elem_type") or "track").lower()
+        if etype == "track":
+            if oos is True and prim is True:
+                return "OCC+OOS", (255, 95, 185)
+            if oos is True:
+                return "OOS", (255, 85, 195)
+            if prim is True:
+                return "OCC", (255, 85, 85)
+            if oos is False and prim is None:
+                return "OOS:CLR", (135, 225, 165)
+            return "CLR", (135, 225, 165)
+        if etype == "turnout":
+            return ("REV", (255, 195, 70)) if prim else ("NRM", (135, 225, 165))
+        if etype == "signal":
+            return ("GRN", (60, 235, 110)) if prim else ("RED", (255, 85, 85))
+        return ("HIT", (80, 235, 150)) if prim else ("CLR", (150, 165, 185))
+
+    def draw_ctc_bits_panel(self, state: Optional[dict], ref_now: float):
+        """
+        Compact single-row 128-bit CTC Bits Inspector (invoked with 'c' on a highlighted element):
+          - Fits all 128 bits (16 byte groups: 11..18 through 161..168) in ONE row using 2x2 pixel blocks.
+          - Color encodes state & role:
+              * Static bits -> pale colors; Changed bits (flipped vs prior same-type packet) -> bright colors.
+              * K (Indication) = Cyan, C (Command) = Amber, *(Bare K|C) = Gold, Z (OOS) = Magenta.
+              * Both 0 and 1 bits are rendered as distinct 2x2 pixels.
+          - Includes a display-only [LSB-RT / LSB-LT] toggle button so the user can flip bit order on screen
+            and immediately see if packet bits align better with configured rules.
+        """
+        self.ctc_panel_cell_hits = []
+        if not state or not self.ctc_panel_elem_id:
+            self.ctc_panel_rect = pygame.Rect(0, 0, 0, 0)
+            return
+        target = self._lookup_any_element(state, self.ctc_panel_elem_id)
+        if not target:
+            self.ctc_panel_elem_id = None
+            self.ctc_panel_rect = pygame.Rect(0, 0, 0, 0)
+            return
+
+        # Distinct colors for K / C / *(K|C) / Z — Bright (changed / highlight) vs Pale (static)
+        COL_K_BRIGHT = (0, 245, 255)
+        COL_K_PALE   = (82, 152, 168)
+        COL_K_ZERO   = (34, 54, 62)
+
+        COL_C_BRIGHT = (255, 190, 45)
+        COL_C_PALE   = (176, 136, 82)
+        COL_C_ZERO   = (58, 46, 30)
+
+        COL_ANY_BRIGHT = (255, 245, 90)
+        COL_ANY_PALE   = (178, 170, 102)
+        COL_ANY_ZERO   = (58, 56, 34)
+
+        COL_Z_BRIGHT = (255, 80, 210)
+        COL_Z_PALE   = (174, 96, 148)
+        COL_Z_ZERO   = (58, 34, 50)
+
+        f_xs = self._get_adjusted_font(9, bold=False)
+        f_xs_b = self._get_adjusted_font(9, bold=True)
+        f_sm = self._get_adjusted_font(10, bold=False)
+        f_sm_b = self._get_adjusted_font(10, bold=True)
+
+        eid = str(target.get("id", ""))
+        etype = str(target.get("elem_type", "element")).upper()
+        el_lbl = str(self.get_elem_label(target) or "").strip()
+        el_cid = str(target.get("ctc_id") or "").strip()
+        el_rules = str(target.get("ctc_rules") or "").strip()
+        status_src = str(target.get("status_source") or "").upper()
+        last_status = str(target.get("last_status") or target.get("status") or "IDLE")
+
+        spec = parse_ctc_rule_bit_specs(el_rules)
+        cfg_lsb_left = bool(spec.get("lsb_left", True))
+        # Display-only LSB setting: defaults to element's configured LSB unless flipped by user
+        view_lsb_left = cfg_lsb_left if self.ctc_panel_lsb_override is None else bool(self.ctc_panel_lsb_override)
+        self.ctc_panel_effective_lsb_left = view_lsb_left
+        lsb_flipped = (view_lsb_left != cfg_lsb_left)
+
+        cfg_bits: Dict[int, List[dict]] = spec.get("bits", {})
+        pkts_desc = self._collect_ctc_packets_for_element(state, target, limit=6)
+
+        # Decode bit maps for each packet & track bit changes vs prior packet of the same K/C type
+        pkts_chrono = list(reversed(pkts_desc))
+        chrono_decoded: List[Dict[str, Any]] = []
+        run_k: Optional[int] = None
+        run_c: Optional[int] = None
+        prev_bits_by_kc: Dict[str, Dict[int, int]] = {}
+        for pkt in pkts_chrono:
+            kc = str(pkt.get("kc") or "?").upper()
+            bhex = str(pkt.get("bits_hex") or "").strip()
+            bw = int(pkt.get("bit_width") or 128)
+            bmap = extract_ctc_packet_bit_map(bhex, bit_width=bw, lsb_left=view_lsb_left) if bhex else {}
+            pkt_int = int(bhex, 16) if bhex else None
+            if pkt_int is not None:
+                if kc == "K":
+                    run_k = pkt_int
+                elif kc == "C":
+                    run_c = pkt_int
+                else:
+                    run_k = pkt_int
+                    run_c = pkt_int
+            prev_same = prev_bits_by_kc.get(kc, {})
+            changed = {bn for bn, bv in bmap.items() if bn in prev_same and prev_same[bn] != bv}
+            if bmap:
+                prev_bits_by_kc[kc] = bmap
+            eff_tag, eff_col = self._eval_ctc_packet_effect(
+                target, pkt, run_k, run_c, display_lsb_left=view_lsb_left
+            )
+            chrono_decoded.append({
+                "pkt": pkt,
+                "kc": kc,
+                "bmap": bmap,
+                "changed": changed,
+                "eff_tag": eff_tag,
+                "eff_col": eff_col,
+            })
+        rows_newest = list(reversed(chrono_decoded))
+
+        eff_k_map = extract_ctc_packet_bit_map(f"{run_k:032X}", bit_width=128, lsb_left=view_lsb_left) if run_k is not None else {}
+        eff_c_map = extract_ctc_packet_bit_map(f"{run_c:032X}", bit_width=128, lsb_left=view_lsb_left) if run_c is not None else {}
+
+        # Compact single-row 128-bit geometry: 16 groups * 8 bits @ 4px pitch + 3px group gap = 557px
+        left_col_w = 154
+        bit_pitch = 4
+        dot_sz = 2
+        group_gap = 3
+        grid_w = 16 * (8 * bit_pitch) + 15 * group_gap  # 557 px for all 128 bits in one row!
+        right_col_gap = 8
+        right_col_w = max(120, min(232, self.width - 16 - (left_col_w + grid_w + right_col_gap + 22)))
+        panel_w = min(self.width - 16, left_col_w + grid_w + right_col_gap + right_col_w + 22)
+
+        hdr_h = 56
+        grp_hdr_h = 14
+        cfg_row_h = 11
+        eff_row_h = 11
+        pkt_row_h = 13
+        n_pkt_rows = max(1, len(rows_newest))
+        footer_h = 22
+        panel_h = min(self.height - 80, hdr_h + grp_hdr_h + cfg_row_h + eff_row_h + n_pkt_rows * pkt_row_h + footer_h + 10)
+
+        if self.ctc_panel_pos is None:
+            px = max(10, (self.width - panel_w) // 2)
+            py = max(52, (self.height - panel_h) // 2)
+        else:
+            px, py = self.ctc_panel_pos
+        px = min(max(8, px), max(8, self.width - panel_w - 8))
+        py = min(max(50, py), max(50, self.height - panel_h - 36))
+        self.ctc_panel_pos = (px, py)
+        self.ctc_panel_rect = pygame.Rect(px, py, panel_w, panel_h)
+
+        # Panel frame
+        bg_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        bg_surf.fill((12, 16, 25, 245))
+        pygame.draw.rect(bg_surf, (0, 200, 235), (0, 0, panel_w, panel_h), 1, border_radius=6)
+        pygame.draw.rect(bg_surf, (20, 30, 46, 255), (1, 1, panel_w - 2, 23), border_top_left_radius=5, border_top_right_radius=5)
+        self.screen.blit(bg_surf, (px, py))
+
+        # Compact Title Bar + [LSB-RT / LSB-LT] display-only button + [X] Close
+        title_txt = f"CTC 128b: {eid} ({etype})" + (f" - {el_lbl}" if el_lbl else "")
+        self.screen.blit(f_sm_b.render(title_txt[:54], True, COL_K_BRIGHT), (px + 8, py + 5))
+
+        close_w = 56
+        lsb_w = 104
+        self.ctc_panel_close_rect = pygame.Rect(px + panel_w - close_w - 6, py + 3, close_w, 18)
+        self.ctc_panel_lsb_rect = pygame.Rect(self.ctc_panel_close_rect.x - lsb_w - 6, py + 3, lsb_w, 18)
+
+        lsb_txt = f"{'LSB-LT' if view_lsb_left else 'LSB-RT'}{'*' if lsb_flipped else ''} (Flip)"
+        lsb_bg = (82, 58, 22) if lsb_flipped else (28, 44, 66)
+        lsb_bd = COL_C_BRIGHT if lsb_flipped else (80, 145, 210)
+        pygame.draw.rect(self.screen, lsb_bg, self.ctc_panel_lsb_rect, border_radius=3)
+        pygame.draw.rect(self.screen, lsb_bd, self.ctc_panel_lsb_rect, 1, border_radius=3)
+        ls_btn = f_xs_b.render(lsb_txt, True, (255, 235, 160) if lsb_flipped else (210, 235, 255))
+        self.screen.blit(ls_btn, (self.ctc_panel_lsb_rect.x + (lsb_w - ls_btn.get_width()) // 2, self.ctc_panel_lsb_rect.y + 4))
+
+        pygame.draw.rect(self.screen, (130, 40, 44), self.ctc_panel_close_rect, border_radius=3)
+        pygame.draw.rect(self.screen, COLOR_HUD_BORDER, self.ctc_panel_close_rect, 1, border_radius=3)
+        cl_btn = f_xs_b.render("Close", True, (255, 255, 255))
+        self.screen.blit(cl_btn, (self.ctc_panel_close_rect.x + (close_w - cl_btn.get_width()) // 2, self.ctc_panel_close_rect.y + 4))
+
+        # Compact 2-line Status & Config Header
+        st_y = py + 27
+        if status_src == "CTC":
+            src_badge = f"CTC (No TO, {int(round(self.stale_timeout_sec * 5))}s fade)"
+            src_col = COL_K_BRIGHT
+        elif status_src == "PTC":
+            src_badge = f"PTC (Overrides CTC)"
+            src_col = (75, 235, 130)
+        else:
+            src_badge = "IDLE"
+            src_col = COLOR_TEXT_DIM
+
+        st_col = (255, 95, 95) if ("OCCUPIED" in last_status.upper() or "STOP" in last_status.upper()) else (
+            COL_Z_BRIGHT if "OUT OF SERVICE" in last_status.upper() else (
+                (85, 240, 135) if ("GO" in last_status.upper() or "GREEN" in last_status.upper() or "CLEAR" in last_status.upper()) else (235, 242, 250)
+            )
+        )
+        self.screen.blit(f_sm_b.render(f"Status: {last_status[:44]}", True, st_col), (px + 8, st_y))
+        s_src = f_sm_b.render(src_badge, True, src_col)
+        self.screen.blit(s_src, (px + panel_w - s_src.get_width() - 8, st_y))
+
+        cfg_y = py + 41
+        cid_disp = el_cid if el_cid else "(None)"
+        rules_disp = el_rules if el_rules else "(None)"
+        view_tag = f" [VIEW:{'LSB-LT' if view_lsb_left else 'LSB-RT'}*]" if lsb_flipped else ""
+        self.screen.blit(f_xs.render(f"ID: {cid_disp[:34]} | Rules: {rules_disp[:56]}{view_tag}", True, (190, 212, 235)), (px + 8, cfg_y))
+        pygame.draw.line(self.screen, (40, 58, 82), (px + 6, py + hdr_h - 2), (px + panel_w - 6, py + hdr_h - 2), 1)
+
+        def _role_palette(letter: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int, int, int]]:
+            """Returns (bright_1, pale_1, zero_static) for a CTC role letter ('K', 'C', '', 'Z')."""
+            if letter == "Z":
+                return COL_Z_BRIGHT, COL_Z_PALE, COL_Z_ZERO
+            if letter == "K":
+                return COL_K_BRIGHT, COL_K_PALE, COL_K_ZERO
+            if letter == "C":
+                return COL_C_BRIGHT, COL_C_PALE, COL_C_ZERO
+            return COL_ANY_BRIGHT, COL_ANY_PALE, COL_ANY_ZERO
+
+        def _cfg_bit_info(bn: int) -> Tuple[Optional[str], Tuple[int, int, int], str]:
+            entries = cfg_bits.get(bn)
+            if not entries:
+                return None, (50, 60, 74), ""
+            letters = [e["letter"] for e in entries]
+            desc = ", ".join(
+                f"{e['token']}({'OOS' if e['clause'] == 'oos' else ('K-Ind' if e['letter'] == 'K' else ('C-Cmd' if e['letter'] == 'C' else 'K|C'))})"
+                for e in entries
+            )
+            if "Z" in letters:
+                lt = "Z"
+            elif "" in letters or ("K" in letters and "C" in letters):
+                lt = ""
+            elif "K" in letters:
+                lt = "K"
+            else:
+                lt = "C"
+            b_col, _, _ = _role_palette(lt)
+            return lt, b_col, desc
+
+        def _bit_applies_to_kc(bn: int, pkt_kc: str) -> Tuple[bool, str]:
+            entries = cfg_bits.get(bn)
+            if not entries:
+                return False, ""
+            for e in entries:
+                lt = e["letter"]
+                if lt == "" or pkt_kc not in ("K", "C"):
+                    return True, lt
+                if lt in ("K", "Z") and pkt_kc == "K":
+                    return True, lt
+                if lt == "C" and pkt_kc == "C":
+                    return True, lt
+            return False, entries[0]["letter"]
+
+        # Grid coordinates
+        grid_x0 = px + left_col_w + 8
+        bits_str_x = grid_x0 + grid_w + right_col_gap
+        bits_str_w = max(60, (px + panel_w - 8) - bits_str_x)
+        grp_y = py + hdr_h
+        cfg_row_y = grp_y + grp_hdr_h
+        eff_row_y = cfg_row_y + cfg_row_h
+        pkt_y0 = eff_row_y + eff_row_h
+        grid_bot_y = pkt_y0 + n_pkt_rows * pkt_row_h
+
+        # Precompute x position for each of the 128 CTC bit numbers (11..18 through 161..168)
+        bit_x_map: List[Tuple[int, int]] = []
+        for g_idx in range(16):
+            g_num = g_idx + 1
+            gx = grid_x0 + g_idx * (8 * bit_pitch + group_gap)
+            # Subtle alternating byte-group background tint
+            if g_idx % 2 == 1:
+                pygame.draw.rect(self.screen, (16, 22, 34), (gx - 1, cfg_row_y, 8 * bit_pitch + 1, grid_bot_y - cfg_row_y))
+            # Byte group header number (1..16 -> bits 11..18 to 161..168)
+            gl = f_xs_b.render(str(g_num), True, (125, 178, 220))
+            self.screen.blit(gl, (gx + (8 * bit_pitch - gl.get_width()) // 2, grp_y + 2))
+            for ones in range(1, 9):
+                bn = g_num * 10 + ones
+                cx = gx + (ones - 1) * bit_pitch
+                bit_x_map.append((bn, cx))
+                # Subtle vertical column guide for configured bits so alignment jumps out immediately!
+                if bn in cfg_bits:
+                    _, c_col, _ = _cfg_bit_info(bn)
+                    guide_surf = pygame.Surface((bit_pitch, max(1, grid_bot_y - cfg_row_y)), pygame.SRCALPHA)
+                    guide_surf.fill((c_col[0], c_col[1], c_col[2], 26))
+                    self.screen.blit(guide_surf, (cx, cfg_row_y))
+
+        mx, my = pygame.mouse.get_pos()
+        hover_detail: Optional[str] = None
+        hover_col_x: Optional[int] = None
+
+        # Row labels on left & right column header
+        self.screen.blit(f_xs_b.render("Byte Group (1x..16x):", True, (130, 152, 180)), (px + 8, grp_y + 2))
+        self.screen.blit(f_xs_b.render("Active Bits (K/C)", True, (130, 175, 215)), (bits_str_x, grp_y + 2))
+        self.screen.blit(f_xs_b.render("CFG (K/C/*/Z)", True, (215, 228, 245)), (px + 8, cfg_row_y + 1))
+        eff_k_s = "K" if run_k is not None else "-"
+        eff_c_s = "C" if run_c is not None else "-"
+        self.screen.blit(f_xs_b.render(f"EFF [{eff_k_s}|{eff_c_s}]", True, (165, 208, 232)), (px + 8, eff_row_y + 1))
+
+        def _blit_clipped_bits_str(text: str, y_pos: int, row_h: int, color: Tuple[int, int, int], hover_prefix: str):
+            nonlocal hover_detail
+            clip_r = pygame.Rect(bits_str_x, y_pos, bits_str_w, row_h)
+            prev_clip = self.screen.get_clip()
+            self.screen.set_clip(clip_r)
+            self.screen.blit(f_xs.render(text, True, color), (bits_str_x, y_pos + 1))
+            self.screen.set_clip(prev_clip)
+            if clip_r.collidepoint(mx, my):
+                hover_detail = f"{hover_prefix}: {text}"
+
+        cfg_tok_list = [e["token"] for bn in sorted(cfg_bits.keys()) for e in cfg_bits[bn]]
+        _blit_clipped_bits_str(
+            ",".join(cfg_tok_list) if cfg_tok_list else "(none)",
+            cfg_row_y,
+            cfg_row_h,
+            (205, 220, 240) if cfg_tok_list else (85, 95, 112),
+            "CFG bits",
+        )
+        eff_tok_parts: List[str] = []
+        if eff_k_map:
+            eff_tok_parts.extend(f"K{bn}" for bn in sorted(eff_k_map.keys()) if eff_k_map[bn] == 1)
+        if eff_c_map:
+            eff_tok_parts.extend(f"C{bn}" for bn in sorted(eff_c_map.keys()) if eff_c_map[bn] == 1)
+        _blit_clipped_bits_str(
+            ",".join(eff_tok_parts) if eff_tok_parts else "(none)",
+            eff_row_y,
+            eff_row_h,
+            (155, 198, 225) if eff_tok_parts else (80, 90, 108),
+            "EFF active bits",
+        )
+
+        # Draw CFG row (2x2 pixel markers)
+        cfg_dot_y = cfg_row_y + (cfg_row_h - dot_sz) // 2
+        for bn, cx in bit_x_map:
+            lt, b_col, desc = _cfg_bit_info(bn)
+            if lt is not None:
+                # 4x4 soft halo + 2x2 bright pixel for configured bit
+                pygame.draw.rect(self.screen, (b_col[0] // 3, b_col[1] // 3, b_col[2] // 3), (cx, cfg_dot_y - 1, 4, 4))
+                pygame.draw.rect(self.screen, b_col, (cx + 1, cfg_dot_y, dot_sz, dot_sz))
+            else:
+                pygame.draw.rect(self.screen, (28, 34, 46), (cx + 1, cfg_dot_y, dot_sz, dot_sz))
+            if cx <= mx < cx + bit_pitch and cfg_row_y <= my < cfg_row_y + cfg_row_h:
+                hover_col_x = cx
+                bnum = ctc_n_to_bit_num(bn)
+                hover_detail = f"Bit {bn} (raw b{bnum}) | {'CFG: ' + desc if desc else 'Unconfigured'}"
+
+        # Draw EFF (K|C) row (2x2 pixel markers)
+        eff_dot_y = eff_row_y + (eff_row_h - dot_sz) // 2
+        for bn, cx in bit_x_map:
+            kv = eff_k_map.get(bn)
+            cv = eff_c_map.get(bn)
+            lt, _, desc = _cfg_bit_info(bn)
+            if lt is not None:
+                entries = cfg_bits.get(bn, [])
+                lset = {e["letter"] for e in entries}
+                if "" in lset or ("K" in lset and "C" in lset):
+                    ev = 1 if (kv == 1 or cv == 1) else (0 if (kv is not None or cv is not None) else None)
+                elif "K" in lset or "Z" in lset:
+                    ev = kv
+                elif "C" in lset:
+                    ev = cv
+                else:
+                    ev = None
+                b_col, p_col, z_col = _role_palette(lt)
+                pix_col = (24, 28, 38) if ev is None else (b_col if ev == 1 else z_col)
+            else:
+                ev = 1 if (kv == 1 or cv == 1) else (0 if (kv is not None or cv is not None) else None)
+                pix_col = (24, 28, 38) if ev is None else ((98, 128, 162) if ev == 1 else (32, 38, 48))
+            pygame.draw.rect(self.screen, pix_col, (cx + 1, eff_dot_y, dot_sz, dot_sz))
+            if cx <= mx < cx + bit_pitch and eff_row_y <= my < eff_row_y + eff_row_h:
+                hover_col_x = cx
+                bnum = ctc_n_to_bit_num(bn)
+                ks = "-" if kv is None else str(kv)
+                cs = "-" if cv is None else str(cv)
+                hover_detail = f"Bit {bn} (raw b{bnum}) | Latest K={ks} C={cs}" + (f" | CFG: {desc}" if desc else "")
+
+        # Draw Last Received CTC Messages (all 128 bits as 2x2 pixels in one row each!)
+        ry = pkt_y0
+        if not rows_newest:
+            msg = "No CTC packets received yet for this CTC ID." if el_cid else "No CTC ID configured (set in Inspector)."
+            self.screen.blit(f_xs.render(msg, True, (140, 155, 175)), (px + 8, ry + 1))
+        else:
+            for p_idx, row in enumerate(rows_newest):
+                pkt = row["pkt"]
+                kc = row["kc"]
+                bmap = row["bmap"]
+                changed = row["changed"]
+                eff_tag = row["eff_tag"]
+                eff_col = row["eff_col"]
+
+                ts_val = float(pkt.get("ts", 0.0) or 0.0)
+                t_str = time.strftime("%H:%M:%S", time.localtime(ts_val)) if ts_val > 0 else "--:--:--"
+
+                # Compact left metadata: #1 14:52:01 [K] OCC
+                kc_col = COL_K_BRIGHT if kc == "K" else (COL_C_BRIGHT if kc == "C" else (150, 165, 185))
+                self.screen.blit(f_xs.render(f"#{p_idx + 1} {t_str}", True, (168, 186, 208)), (px + 8, ry + 1))
+                kc_rect = pygame.Rect(px + 72, ry + 1, 14, pkt_row_h - 2)
+                pygame.draw.rect(self.screen, (kc_col[0] // 4, kc_col[1] // 4, kc_col[2] // 4), kc_rect, border_radius=2)
+                pygame.draw.rect(self.screen, kc_col, kc_rect, 1, border_radius=2)
+                ks_s = f_xs_b.render(kc[:1], True, kc_col)
+                self.screen.blit(ks_s, (kc_rect.x + (kc_rect.width - ks_s.get_width()) // 2, kc_rect.y + 1))
+                self.screen.blit(f_xs_b.render(eff_tag[:9], True, eff_col), (px + 90, ry + 1))
+
+                # 128 bits rendered as 2x2 pixels (static = pale, changed = bright!)
+                dot_y = ry + (pkt_row_h - dot_sz) // 2
+                for bn, cx in bit_x_map:
+                    bv = bmap.get(bn)
+                    is_chg = bn in changed
+                    is_cfg = bn in cfg_bits
+                    applies, role_lt = _bit_applies_to_kc(bn, kc)
+
+                    if bv is None:
+                        pix_col = (22, 26, 36)
+                        halo_col = None
+                    elif bv == 1:
+                        if is_cfg and applies:
+                            b_col, p_col, _ = _role_palette(role_lt)
+                            pix_col = b_col if is_chg else p_col
+                            halo_col = (b_col[0] // 3, b_col[1] // 3, b_col[2] // 3) if is_chg else None
+                        elif is_cfg and not applies:
+                            pix_col = (170, 180, 198) if is_chg else (96, 104, 118)
+                            halo_col = None
+                        else:
+                            # Unconfigured 1: pale slate-blue when static, bright cyan-white when changed!
+                            pix_col = (150, 245, 255) if is_chg else (90, 118, 148)
+                            halo_col = (42, 85, 108) if is_chg else None
+                    else:
+                        # Bit == 0 (both 0 and 1 shown; changed 1->0 is brighter than static 0!)
+                        if is_cfg and applies:
+                            _, _, z_col = _role_palette(role_lt)
+                            pix_col = (165, 210, 228) if is_chg else z_col
+                            halo_col = (55, 78, 92) if is_chg else None
+                        elif is_cfg and not applies:
+                            pix_col = (95, 105, 120) if is_chg else (32, 38, 48)
+                            halo_col = None
+                        else:
+                            pix_col = (145, 105, 122) if is_chg else (32, 38, 48)
+                            halo_col = None
+
+                    if halo_col is not None:
+                        pygame.draw.rect(self.screen, halo_col, (cx, dot_y - 1, 4, 4))
+                    pygame.draw.rect(self.screen, pix_col, (cx + 1, dot_y, dot_sz, dot_sz))
+
+                    if cx <= mx < cx + bit_pitch and ry <= my < ry + pkt_row_h:
+                        hover_col_x = cx
+                        bnum = ctc_n_to_bit_num(bn)
+                        _, _, desc = _cfg_bit_info(bn)
+                        chg_s = " [CHANGED]" if is_chg else " [static]"
+                        match_s = (
+                            "MATCHED" if (is_cfg and applies) else
+                            ("IGNORED(dir)" if is_cfg else "uncfg")
+                        )
+                        cfg_s = f" | CFG:{desc}" if desc else ""
+                        hover_detail = (
+                            f"Bit {bn} (b{bnum})={bv}{chg_s} | #{p_idx + 1} [{kc}] {t_str} -> {eff_tag} ({match_s}){cfg_s}"
+                        )
+
+                # Right of dots: actual active K/C bits string for this packet (respects display-only LSB flip)
+                if bmap:
+                    kc_pfx = kc if kc in ("K", "C") else ""
+                    active_toks = [f"{kc_pfx}{bn}" for bn in sorted(bmap.keys()) if bmap[bn] == 1]
+                    pkt_bits_str = ",".join(active_toks) if active_toks else "(all 0)"
+                else:
+                    pkt_bits_str = str(pkt.get("str_rules") or ",".join(pkt.get("tokens") or []) or "(all 0)")
+                str_col = (140, 225, 245) if kc == "K" else ((248, 198, 110) if kc == "C" else (180, 195, 215))
+                if pkt_bits_str == "(all 0)":
+                    str_col = (85, 95, 112)
+                _blit_clipped_bits_str(pkt_bits_str, ry, pkt_row_h, str_col, f"#{p_idx + 1} [{kc}] {t_str}")
+                ry += pkt_row_h
+
+        # Vertical hairline on hovered bit column for instant alignment check
+        if hover_col_x is not None:
+            pygame.draw.rect(self.screen, (255, 255, 255), (hover_col_x, cfg_row_y - 1, bit_pitch, grid_bot_y - cfg_row_y + 1), 1)
+
+        # Compact Footer: hovered bit readout OR color legend
+        fy = py + panel_h - footer_h + 3
+        pygame.draw.line(self.screen, (40, 58, 82), (px + 6, fy - 3), (px + panel_w - 6, fy - 3), 1)
+        if hover_detail:
+            self.screen.blit(f_xs_b.render(hover_detail[:112], True, (235, 245, 255)), (px + 8, fy + 2))
+        else:
+            legend = [
+                ("K:Ind", COL_K_BRIGHT),
+                ("C:Cmd", COL_C_BRIGHT),
+                ("*:K|C", COL_ANY_BRIGHT),
+                ("Z:OOS", COL_Z_BRIGHT),
+                ("Pale=Static", (125, 145, 168)),
+                ("Bright=Changed", (150, 245, 255)),
+                ("| Hover bit / Flip LSB / Drag / C=Close", COLOR_TEXT_DIM),
+            ]
+            lx_cur = px + 8
+            for l_txt, l_col in legend:
+                ls = f_xs_b.render(l_txt, True, l_col) if l_col != COLOR_TEXT_DIM else f_xs.render(l_txt, True, l_col)
+                if lx_cur + ls.get_width() > px + panel_w - 6:
+                    break
+                self.screen.blit(ls, (lx_cur, fy + 2))
+                lx_cur += ls.get_width() + 9
+
     def draw_gps_map_inset_if_selected(self, state: Optional[dict]):
         self.map_inset_rect = pygame.Rect(0, 0, 0, 0)
         if not state or not self.map_selected_id: return
@@ -7491,11 +8220,11 @@ class DispatcherPygameRenderer:
                 gps_info = f" | GPS: {target['gps']}" if target.get("gps") else ""
                 info = (
                     f"[{VERSION}] Selected: {self.selected_id} ({target.get('elem_type')}) | "
-                    f"Label: '{lbl}' | Pos: ({lx:.1f},{ly:.1f}) | WIU: {target.get('wiu_id', 'None')}{gps_info}"
+                    f"Label: '{lbl}' | Pos: ({lx:.1f},{ly:.1f}) | WIU: {target.get('wiu_id', 'None')}{gps_info} | C=CTC Bits"
                 )
                 self.screen.blit(self.font_sm_bold.render(info, True, COLOR_SELECT_RING), (14, self.height - 23))
         else:
-            help_txt = f"[{VERSION}] {self.status_toast}  |  Right-Click=GPS Map | Dbl-Click=Details | Home=Scroller Top"
+            help_txt = f"[{VERSION}] {self.status_toast}  |  Right-Click=GPS Map | Dbl-Click=Details | C=CTC Bits | Home=Scroller Top"
             self.screen.blit(self.font_sm_thin.render(help_txt, True, COLOR_TEXT_DIM), (14, self.height - 23))
 
     def close(self):
@@ -7549,6 +8278,7 @@ class DispatcherPygameRenderer:
                     self.draw_hovered_wiu_locator(state)
                     self.draw_gps_map_inset_if_selected(state)
                     self.draw_readonly_inspector(state, ref_now)
+                    self.draw_ctc_bits_panel(state, ref_now)
 
                 if self.show_coverage_map:
                     self.coverage_map_view.draw(

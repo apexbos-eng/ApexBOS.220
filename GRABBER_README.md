@@ -275,9 +275,9 @@ Reference guide matching the fields shown in [`GrabberMainScreen.png`](images/Gr
 
 ### 1. Header Bar
 ```
-ApexBOSGrabber (v26.1127.08) | Elapsed: 00:04:12 | SDR: PIPE | Rate: 960000 S/s [AUTO] | Gain: AGC | Bias: ON | PPM: 6 | Err: 8 | Center: 220.4875 MHz
+ApexBOSGrabber (v26.1127.14) | Elapsed: 00:04:12 | SDR: PIPE | Rate: 960000 S/s [AUTO] | Gain: AGC | Bias: ON | PPM: 6 | Err: 8 | Center: 220.4875 MHz
 ```
-- **`v26.1127.08`**: Active unified ApexBOS release version (from `version.py`).
+- **`v26.1127.14`**: Active unified ApexBOS release version (from `version.py`).
 - **`Elapsed: 00:04:12`**: Elapsed execution time since Grabber launched (`HH:MM:SS`).
 - **`SDR: PIPE`**: Active ingestion mode (`PIPE`, `TCP`, `RTLSDR`, `RSPTCP`, `SOAPY`, or `STDIN`).
 - **`Rate: 960000 S/s [AUTO]`**: Hardware sampling rate. `[AUTO]` denotes that Grabber automatically expanded the sample rate from 192 kS/s to 960 kS/s to span all requested channels.

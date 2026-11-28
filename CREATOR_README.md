@@ -449,7 +449,7 @@ Double-clicking any element (or pressing `Enter`) opens the In-Place Property Ed
 
 ### Multi-Address CTC IDs, CTC Rules & Out-of-Service (`; Z...`) Clauses
 - **Multiple `ctc_id` Addresses**: Enter one or more comma-separated CTC station/element addresses (matched against `config/ctc_rules.json` EMP packets or 900 MHz ATCS packets).
-- **`ctc_rules` Syntax**: Supports boolean expressions (`OR`, `AND`, `AND/OR`, `NOT`, parentheses, commas) with direction-aware bit tokens:
+- **`ctc_rules` Syntax**: Supports boolean expressions (`OR`, `AND`, `AND/OR`, `NOT`, parentheses, commas) with direction-aware bit tokens (bit order defaults to **`LSB-LT`** / LSB transmitted first; prefix **`LSB-RT:`** for LSB transmitted last):
   - `K<n>`: Matches Indication (`K`) packets only.
   - `C<n>`: Matches Command (`C`) packets only.
   - Bare integers (e.g. `11`, `25`): Wildcard bit numbers matching **both** `K` and `C` packets.

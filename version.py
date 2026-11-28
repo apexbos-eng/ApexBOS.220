@@ -5,6 +5,6 @@ All user-facing applications and engine modules import and display
 their version from this single module.
 """
 
-VERSION = "v26.1127.08"
+VERSION = "v26.1127.14"
 __version__ = VERSION
 VERSION_NUMBER = VERSION.lstrip("vV")

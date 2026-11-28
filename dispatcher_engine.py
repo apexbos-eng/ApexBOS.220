@@ -454,7 +454,7 @@ def ctc_n_to_bit_num(n: int) -> Optional[int]:
     return ((tens << 3) - ones) if (1 <= ones <= 8) else None
 
 
-def _ctc_bit_mask(bit_n: int, lsb_left: bool = False, bit_width: int = 128) -> int:
+def _ctc_bit_mask(bit_n: int, lsb_left: bool = True, bit_width: int = 128) -> int:
     """Returns precomputed/computed integer bitmask (1 << shift) for CTC bit label N, or 0 if invalid."""
     if bit_width == 128 and type(bit_n) is int:
         return (_CTC_BIT_MASK_LT_128 if lsb_left else _CTC_BIT_MASK_RT_128).get(bit_n, 0)
@@ -498,14 +498,14 @@ def coerce_ctc_rules_int(raw_val: Any) -> Optional[int]:
 def ctc_bit_is_set(
     ctc_rules_int: int,
     bit_n: int,
-    lsb_left: bool = False,
+    lsb_left: bool = True,
     bit_width: int = 128,
 ) -> bool:
     """
     Tests bit N (from KN / CN / ZN) in a packet's `_ctc_rules_` integer:
       bitNum = (tens << 3) - ones
-      - LSB-RT (lsb_left=False, default): LSB is on the right -> (val & (1 << bitNum)) != 0
-      - LSB-LT (lsb_left=True):           LSB is on the left  -> (val & (1 << (bit_width - 1 - bitNum))) != 0
+      - LSB-LT (lsb_left=True, default): LSB is on the left (transmitted first) -> (val & (1 << (bit_width - 1 - bitNum))) != 0
+      - LSB-RT (lsb_left=False):         LSB is on the right (transmitted last) -> (val & (1 << bitNum)) != 0
     """
     mask = _ctc_bit_mask(bit_n, lsb_left=lsb_left, bit_width=bit_width)
     return bool(mask and (int(ctc_rules_int) & mask))
@@ -856,8 +856,8 @@ def split_ctc_rules_and_oos(rules_str: str) -> Tuple[str, str]:
     raw = str(rules_str).strip()
     if not raw:
         return "", ""
-    body, lsb_left = _strip_lsb_prefix(raw, default_lsb_left=False)
-    has_explicit_prefix = bool(re.match(r"^(?:LSB-(?:LT|RT))\s*:\s*", raw, re.IGNORECASE))
+    body, lsb_left = _strip_lsb_prefix(raw, default_lsb_left=True)
+    has_explicit_prefix = bool(re.match(r"^(?:LSB[-_]?(?:LT|RT))\s*:\s*", raw, re.IGNORECASE))
     prefix = ("LSB-LT:" if lsb_left else "LSB-RT:") if has_explicit_prefix else ""
 
     parts = [p.strip() for p in body.split(";") if p.strip()]
@@ -889,7 +889,7 @@ def _compile_ctc_expr_group(
 ) -> Optional[Tuple[tuple, Optional[Tuple[str, int]]]]:
     if not expr_str:
         return None
-    body, lsb_left = _strip_lsb_prefix(expr_str, default_lsb_left=False)
+    body, lsb_left = _strip_lsb_prefix(expr_str, default_lsb_left=True)
     if not body:
         return None
     clauses = _split_top_level_commas(body)
@@ -933,17 +933,90 @@ def _compile_ctc_rule_bundle(
     return primary_prog, oos_prog
 
 
+def _eval_ctc_ast_combined(
+    node: tuple,
+    k_int: Optional[int],
+    c_int: Optional[int],
+    active_tokens: set,
+) -> Optional[bool]:
+    """
+    Evaluates a full-scope CTC AST against latest K (indication) and C (command) bitfields:
+      - 'k' / 'z' bits read from `k_int` (None if no K packet received yet).
+      - 'c' bits read from `c_int` (None if no C packet received yet).
+      - '' (bare letterless integer, e.g. '11') reads from `(k_int | c_int)` so it acts
+        whenever bit N is 1 in EITHER K or C!
+    """
+    op = node[0]
+    if op == "BIT":
+        m = node[1]
+        al = node[2]
+        letter = node[3] if len(node) > 3 else ""
+        if letter == "":
+            if k_int is not None or c_int is not None:
+                eff = (int(k_int) if k_int is not None else 0) | (int(c_int) if c_int is not None else 0)
+                return bool(m and (eff & m))
+            return (al in active_tokens) or (f"k{al}" in active_tokens) or (f"c{al}" in active_tokens)
+        if letter in ("k", "z"):
+            if k_int is not None:
+                return bool(m and (int(k_int) & m))
+            return None
+        if letter == "c":
+            if c_int is not None:
+                return bool(m and (int(c_int) & m))
+            return None
+        return False
+    if op == "KC_MISMATCH":
+        return None
+    if op == "NOT":
+        child = _eval_ctc_ast_combined(node[1], k_int, c_int, active_tokens)
+        return None if child is None else (not child)
+    if op == "OR":
+        lv = _eval_ctc_ast_combined(node[1], k_int, c_int, active_tokens)
+        if lv is True:
+            return True
+        rv = _eval_ctc_ast_combined(node[2], k_int, c_int, active_tokens)
+        if rv is True:
+            return True
+        if lv is None and rv is None:
+            return None
+        return False
+    if op == "AND":
+        lv = _eval_ctc_ast_combined(node[1], k_int, c_int, active_tokens)
+        if lv is False:
+            return False
+        rv = _eval_ctc_ast_combined(node[2], k_int, c_int, active_tokens)
+        if rv is False:
+            return False
+        if lv is True and rv is True:
+            return True
+        return False
+    if op == "XOR":
+        lv = _eval_ctc_ast_combined(node[1], k_int, c_int, active_tokens)
+        rv = _eval_ctc_ast_combined(node[2], k_int, c_int, active_tokens)
+        return bool(lv) ^ bool(rv)
+    if op == "TOK":
+        return node[1] in active_tokens
+    if op == "CONST":
+        return bool(node[1])
+    return False
+
+
 def evaluate_ctc_rules_optional(
     rules_str: str,
     active_tokens: Optional[set] = None,
     ctc_rules_int: Optional[int] = None,
     bit_width: int = 128,
     pkt_kc: Optional[str] = None,
+    ctc_k_int: Optional[int] = None,
+    ctc_c_int: Optional[int] = None,
 ) -> Optional[bool]:
     """
     Evaluates the primary (non-Z) CTC rule string scoped to `pkt_kc` ('K', 'C', or None).
     Returns None if no primary rule is defined OR if the rule's bit letters do not apply to `pkt_kc`
     (e.g., a 'K11' indication rule receiving a '_kc_ == C' command packet), so callers preserve existing state.
+    When `ctc_k_int` / `ctc_c_int` are supplied, bare letterless bits (e.g. '11') evaluate True if bit N is
+    1 in EITHER the latest K or latest C packet (`(k_int | c_int)`), and mixed K/C rules evaluate each
+    direction against its respective latest bitfield.
     """
     if not rules_str:
         return None
@@ -952,6 +1025,13 @@ def evaluate_ctc_rules_optional(
     primary_prog, _ = _compile_ctc_rule_bundle(str(rules_str), width, kc)
     if primary_prog is None:
         return None
+    if ctc_k_int is not None or ctc_c_int is not None:
+        full_prog, _ = _compile_ctc_rule_bundle(str(rules_str), width, None)
+        if full_prog is None:
+            return None
+        toks = active_tokens if isinstance(active_tokens, set) else set()
+        res = _eval_ctc_ast_combined(full_prog[0], ctc_k_int, ctc_c_int, toks)
+        return None if res is None else bool(res)
     return _eval_compiled_ctc_program(primary_prog, active_tokens, ctc_rules_int)
 
 
@@ -961,15 +1041,17 @@ def evaluate_ctc_rules(
     ctc_rules_int: Optional[int] = None,
     bit_width: int = 128,
     pkt_kc: Optional[str] = None,
+    ctc_k_int: Optional[int] = None,
+    ctc_c_int: Optional[int] = None,
 ) -> bool:
     """
     Evaluates the primary (non-Z) CTC rule string against either:
       1. A packet's 128-bit integer `_ctc_rules_` (when `ctc_rules_int` is provided):
          - KN matches only `_kc_ == 'K'` (indications); CN matches only `_kc_ == 'C'` (commands);
-           bare integer N (e.g. `11`) matches BOTH 'K' and 'C' packets.
+           bare integer N (e.g. `11`) matches BOTH 'K' and 'C' packets (1 in either K or C).
          - bitNum = (tens << 3) - ones
-         - Optional prefix `LSB-LT:` puts LSB on the left (transmitted first);
-           `LSB-RT:` or no prefix puts LSB on the right (transmitted last).
+         - Default or `LSB-LT:` puts LSB on the left (transmitted first);
+           optional prefix `LSB-RT:` puts LSB on the right (transmitted last).
          - Any `; Z...` out-of-service clauses are excluded from primary logic.
       2. Legacy symbolic `active_tokens` set (when `ctc_rules_int` is None).
     """
@@ -979,6 +1061,8 @@ def evaluate_ctc_rules(
         ctc_rules_int=ctc_rules_int,
         bit_width=bit_width,
         pkt_kc=pkt_kc,
+        ctc_k_int=ctc_k_int,
+        ctc_c_int=ctc_c_int,
     )
     return bool(res)
 
@@ -1005,6 +1089,99 @@ def evaluate_ctc_oos_rules(
         return None
     return _eval_compiled_ctc_program(oos_prog, active_tokens, ctc_rules_int)
 
+
+def parse_ctc_rule_bit_specs(rules_str: str) -> Dict[str, Any]:
+    """
+    Parses a CTC rules string into structured per-bit metadata for visual inspection:
+      - lsb_left: bool
+      - primary_str: str
+      - oos_str: str
+      - bits: {bit_n (int): [{"letter": "K"|"C"|""|"Z", "negated": bool, "clause": "primary"|"oos", "token": str}]}
+      - ordered_bits: sorted list of unique CTC bit numbers configured
+    """
+    raw = str(rules_str or "").strip()
+    _, lsb_left = _strip_lsb_prefix(raw, default_lsb_left=True)
+    primary_str, oos_str = split_ctc_rules_and_oos(raw)
+    bits_map: Dict[int, List[Dict[str, Any]]] = {}
+
+    def _scan_expr(expr: str, clause_kind: str):
+        if not expr:
+            return
+        body, _ = _strip_lsb_prefix(expr, default_lsb_left=lsb_left)
+        pos = 0
+        n_len = len(body)
+        pending_not = False
+        while pos < n_len:
+            m = _CTC_TOKEN_RE.match(body, pos)
+            if not m:
+                pos += 1
+                continue
+            pos = m.end()
+            if m.group(3):  # NOT
+                pending_not = not pending_not
+            elif m.group(8):  # ATOM
+                atom = m.group(8).strip()
+                al = atom.lower()
+                mb = _RE_CTC_BIT_ATOM.fullmatch(al)
+                if mb:
+                    letter = mb.group(1).upper()
+                    n_val = int(mb.group(2))
+                    if ctc_n_to_bit_num(n_val) is not None:
+                        entry = {
+                            "letter": letter,  # "K", "C", "Z", or ""
+                            "negated": pending_not,
+                            "clause": clause_kind,
+                            "token": f"{'!' if pending_not else ''}{letter}{n_val}",
+                        }
+                        lst = bits_map.setdefault(n_val, [])
+                        if not any(
+                            x["letter"] == entry["letter"]
+                            and x["negated"] == entry["negated"]
+                            and x["clause"] == entry["clause"]
+                            for x in lst
+                        ):
+                            lst.append(entry)
+                pending_not = False
+            elif not m.group(1):  # reset NOT unless opening paren right after NOT
+                pending_not = False
+
+    _scan_expr(primary_str, "primary")
+    _scan_expr(oos_str, "oos")
+    return {
+        "lsb_left": lsb_left,
+        "primary_str": primary_str,
+        "oos_str": oos_str,
+        "bits": bits_map,
+        "ordered_bits": sorted(bits_map.keys()),
+    }
+
+
+def extract_ctc_packet_bit_map(
+    bits_hex: str,
+    bit_width: int = 128,
+    lsb_left: bool = True,
+) -> Dict[int, int]:
+    """
+    Decodes a hex-encoded CTC bitfield into `{bit_n: 0|1}` for every valid CTC bit number
+    (11..18, 21..28, ..., up to `bit_width // 8` byte groups).
+    """
+    width = max(8, int(bit_width or 128))
+    groups = max(1, min(16, width // 8))
+    try:
+        val = int(str(bits_hex or "0").strip(), 16) if str(bits_hex or "").strip() else 0
+    except ValueError:
+        val = 0
+    out: Dict[int, int] = {}
+    for tens in range(1, groups + 1):
+        base = tens * 10
+        row_shift = tens << 3
+        for ones in range(1, 9):
+            bit_num = row_shift - ones
+            if bit_num < width:
+                shift = (width - 1 - bit_num) if lsb_left else bit_num
+                out[base + ones] = (val >> shift) & 1
+    return out
+
 @dataclass
 class BaseElement:
     id: str
@@ -1024,6 +1201,11 @@ class BaseElement:
     _last_raw_hex: str = field(default="", repr=False)
     _last_ptc_ts: float = field(default=0.0, repr=False)
     _last_ctc_ts: float = field(default=0.0, repr=False)
+    _status_source: str = field(default="", repr=False)
+    _ctc_k_int: Optional[int] = field(default=None, repr=False)
+    _ctc_k_bits: int = field(default=128, repr=False)
+    _ctc_c_int: Optional[int] = field(default=None, repr=False)
+    _ctc_c_bits: int = field(default=128, repr=False)
     _last_rssi: Optional[float] = field(default=None, repr=False)
     _rssi_samples: Any = field(default_factory=lambda: deque(maxlen=20), repr=False)
 
@@ -1111,7 +1293,8 @@ class BaseElement:
                 self.add_rssi_sample(rssi)
         return matched
 
-    def _extract_ctc_tokens(self, parsed_pkt: dict) -> set:
+    @staticmethod
+    def _extract_ctc_tokens(parsed_pkt: dict) -> set:
         pkt_ctc = parsed_pkt.get("_ctc_id_") or parsed_pkt.get("ctc_id")
         active_tokens = set()
         if pkt_ctc:
@@ -1174,10 +1357,30 @@ class BaseElement:
                 return True
         return False
 
+    def _record_ctc_kc_bits(self, parsed_pkt: dict, ctc_int: Optional[int], ctc_bits: int):
+        """Caches the latest K (indication) and C (command) bitfields received for this element."""
+        if ctc_int is None:
+            return
+        pkt_kc = extract_packet_kc(parsed_pkt)
+        if pkt_kc == "K":
+            self._ctc_k_int = int(ctc_int)
+            self._ctc_k_bits = int(ctc_bits or 128)
+        elif pkt_kc == "C":
+            self._ctc_c_int = int(ctc_int)
+            self._ctc_c_bits = int(ctc_bits or 128)
+        else:
+            # Packet omits _kc_ (legacy format) -> update both so evaluation stays consistent
+            self._ctc_k_int = int(ctc_int)
+            self._ctc_k_bits = int(ctc_bits or 128)
+            self._ctc_c_int = int(ctc_int)
+            self._ctc_c_bits = int(ctc_bits or 128)
+
     def _evaluate_ctc_rule_for_packet(self, parsed_pkt: dict) -> Optional[bool]:
         """
         Evaluates primary (non-Z) `self.ctc_rules` against packet `_ctc_rules_` int or tokens,
         honoring packet `_kc_` ('K' indication vs 'C' command).
+        For bare letterless bits (e.g. '11'), evaluates against combined `(last K | last C)`
+        so the element acts whenever bit N is 1 in EITHER K or C.
         Returns None if no primary rules exist or if the rule does not apply to this packet's `_kc_`.
         """
         if not self.ctc_rules:
@@ -1185,12 +1388,21 @@ class BaseElement:
         ctc_int, ctc_bits = self._extract_ctc_rules_int_and_width(parsed_pkt)
         active_tokens = self._extract_ctc_tokens(parsed_pkt)
         pkt_kc = extract_packet_kc(parsed_pkt)
+        use_k = self._ctc_k_int if ctc_int is not None else None
+        use_c = self._ctc_c_int if ctc_int is not None else None
+        if ctc_int is not None and use_k is None and use_c is None:
+            if pkt_kc == "K":
+                use_k = int(ctc_int)
+            elif pkt_kc == "C":
+                use_c = int(ctc_int)
         return evaluate_ctc_rules_optional(
             self.ctc_rules,
             active_tokens=active_tokens,
             ctc_rules_int=ctc_int,
             bit_width=ctc_bits,
             pkt_kc=pkt_kc,
+            ctc_k_int=use_k,
+            ctc_c_int=use_c,
         )
 
     def _evaluate_ctc_oos_for_packet(self, parsed_pkt: dict) -> Optional[bool]:
@@ -1266,6 +1478,7 @@ class BaseElement:
         if parsed_pkt.get("protocol") != "atcs" and self._matches_wiu(parsed_pkt.get("_node_id_")):
             self._last_ptc_ts = ts
             self._last_ctc_ts = 0.0
+            self._status_source = "ptc"
             self._last_packet_ts = ts
             self._packets_received += 1
             raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
@@ -1382,6 +1595,10 @@ class BaseElement:
         d["ctc_id"] = self.ctc_id
         d["ctc_rules"] = self.ctc_rules
         d["ctc_active"] = (time.time() - self._last_ctc_ts < 5.0) if self._last_ctc_ts > 0 else False
+        d["status_source"] = self._status_source
+        d["ctc_status_driven"] = (self._status_source == "ctc")
+        d["last_ctc_ts"] = self._last_ctc_ts
+        d["last_ptc_ts"] = self._last_ptc_ts
         r_avg = self.rssi_avg
         d["last_rssi"] = self._last_rssi
         d["avg_rssi"] = r_avg
@@ -1400,6 +1617,7 @@ class TrackSegment(BaseElement):
     occ_bit_offset: Optional[int] = None
 
     _hw_occupied: bool = field(default=False, repr=False)
+    _hw_occupied_since_ts: float = field(default=0.0, repr=False)
     _inferred_occupied: bool = field(default=False, repr=False)
     _inferred_timestamp: float = field(default=0.0, repr=False)
     _green_path: bool = field(default=False, repr=False)
@@ -1420,6 +1638,7 @@ class TrackSegment(BaseElement):
         if parsed_pkt.get("protocol") != "atcs" and self._matches_wiu(parsed_pkt.get("_node_id_")):
             self._last_ptc_ts = ts
             self._last_ctc_ts = 0.0
+            self._status_source = "ptc"
             self._out_of_service = False
             self._last_packet_ts = ts
             self._packets_received += 1
@@ -1443,8 +1662,10 @@ class TrackSegment(BaseElement):
                 if self._hw_occupied:
                     self._inferred_occupied = False
                     if not prev_occ:
+                        self._hw_occupied_since_ts = ts
                         engine.record_train_sighting(self.id, ts)
                 else:
+                    self._hw_occupied_since_ts = 0.0
                     self._estimated_speed_mph = None
                     self._train_direction = None
                     self._train_name = None
@@ -1460,12 +1681,16 @@ class TrackSegment(BaseElement):
 
         # Direct 128-bit _ctc_rules_ packet addressed to this element by _ctc_id_
         if ctc_int is not None and cid_match is True:
+            _, ctc_bits = self._extract_ctc_rules_int_and_width(parsed_pkt)
+            self._record_ctc_kc_bits(parsed_pkt, ctc_int, ctc_bits)
             primary_eval = self._evaluate_ctc_rule_for_packet(parsed_pkt)
             oos_eval = self._evaluate_ctc_oos_for_packet(parsed_pkt)
             # If this track has CTC rules and none apply to the packet's _kc_ (e.g. K/Z rules on a C packet),
             # preserve existing track state untouched.
             if self.ctc_rules and primary_eval is None and oos_eval is None:
                 return
+            self._last_ctc_ts = ts
+            self._status_source = "ctc"
             self._last_packet_ts = ts
             self._packets_received += 1
             raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
@@ -1481,8 +1706,10 @@ class TrackSegment(BaseElement):
                 if self._hw_occupied:
                     self._inferred_occupied = False
                     if not prev_occ:
+                        self._hw_occupied_since_ts = ts
                         engine.record_train_sighting(self.id, ts)
                 else:
+                    self._hw_occupied_since_ts = 0.0
                     self._estimated_speed_mph = None
                     self._train_direction = None
                     self._train_name = None
@@ -1492,6 +1719,8 @@ class TrackSegment(BaseElement):
 
         if parsed_pkt.get("protocol") == "atcs":
             if cid_match is True or (cid_match is None and ctc_hit):
+                self._last_ctc_ts = ts
+                self._status_source = "ctc"
                 self._last_packet_ts = ts
                 self._packets_received += 1
                 raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
@@ -1513,8 +1742,10 @@ class TrackSegment(BaseElement):
                     if self._hw_occupied:
                         self._inferred_occupied = False
                         if not prev_occ:
+                            self._hw_occupied_since_ts = ts
                             engine.record_train_sighting(self.id, ts)
                     else:
+                        self._hw_occupied_since_ts = 0.0
                         self._estimated_speed_mph = None
                         self._train_direction = None
                         self._train_name = None
@@ -1605,6 +1836,7 @@ class Turnout(BaseElement):
     _out_of_corr: bool = field(default=False, repr=False)
     _raw_occ_val: Optional[int] = field(default=None, repr=False)
     _hw_occupied: bool = field(default=False, repr=False)
+    _hw_occupied_since_ts: float = field(default=0.0, repr=False)
     _inferred_occupied: bool = field(default=False, repr=False)
     _inferred_timestamp: float = field(default=0.0, repr=False)
     _green_path: bool = field(default=False, repr=False)
@@ -1625,6 +1857,7 @@ class Turnout(BaseElement):
         if parsed_pkt.get("protocol") != "atcs" and self._matches_wiu(parsed_pkt.get("_node_id_")):
             self._last_ptc_ts = ts
             self._last_ctc_ts = 0.0
+            self._status_source = "ptc"
             self._out_of_service = False
             self._last_packet_ts = ts
             self._packets_received += 1
@@ -1660,8 +1893,10 @@ class Turnout(BaseElement):
                 if self._hw_occupied:
                     self._inferred_occupied = False
                     if not prev_occ:
+                        self._hw_occupied_since_ts = ts
                         engine.record_train_sighting(self.id, ts)
                 else:
+                    self._hw_occupied_since_ts = 0.0
                     self._estimated_speed_mph = None
                     self._train_direction = None
                     self._train_name = None
@@ -1677,11 +1912,15 @@ class Turnout(BaseElement):
 
         # Direct 128-bit _ctc_rules_ packet addressed to this turnout by _ctc_id_:
         # Rule evaluates True -> Reversed (_state=1), False -> Normal (_state=0).
-        # E.g. 'K11' -> reversed if bit=1 on K packet; '!K11' -> normal if bit=1 on K packet; '11' -> matches K & C.
+        # E.g. 'K11' -> reversed if bit=1 on K packet; '!K11' -> normal if bit=1 on K packet; '11' -> matches K or C.
         if ctc_int is not None and cid_match is True:
+            _, ctc_bits = self._extract_ctc_rules_int_and_width(parsed_pkt)
+            self._record_ctc_kc_bits(parsed_pkt, ctc_int, ctc_bits)
             primary_eval = self._evaluate_ctc_rule_for_packet(parsed_pkt)
             if self.ctc_rules and primary_eval is None:
                 return
+            self._last_ctc_ts = ts
+            self._status_source = "ctc"
             self._last_packet_ts = ts
             self._packets_received += 1
             raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
@@ -1696,6 +1935,8 @@ class Turnout(BaseElement):
 
         if parsed_pkt.get("protocol") == "atcs":
             if cid_match is True or (cid_match is None and ctc_hit):
+                self._last_ctc_ts = ts
+                self._status_source = "ctc"
                 self._last_packet_ts = ts
                 self._packets_received += 1
                 raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
@@ -1722,8 +1963,10 @@ class Turnout(BaseElement):
                     if self._hw_occupied:
                         self._inferred_occupied = False
                         if not prev_occ:
+                            self._hw_occupied_since_ts = ts
                             engine.record_train_sighting(self.id, ts)
                     else:
+                        self._hw_occupied_since_ts = 0.0
                         self._estimated_speed_mph = None
                         self._train_direction = None
                         self._train_name = None
@@ -1794,6 +2037,7 @@ class Signal(BaseElement):
         if parsed_pkt.get("protocol") != "atcs" and self._matches_wiu(parsed_pkt.get("_node_id_")):
             self._last_ptc_ts = ts
             self._last_ctc_ts = 0.0
+            self._status_source = "ptc"
             self._last_packet_ts = ts
             self._packets_received += 1
             raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
@@ -1846,11 +2090,15 @@ class Signal(BaseElement):
 
         # Direct 128-bit _ctc_rules_ packet addressed to this signal by _ctc_id_:
         # Rule evaluates True -> Green, False -> Red.
-        # E.g. 'K32' -> Green if bit=1 on K packet; '!K32' -> Red if bit=1 on K packet; '32' -> matches K & C.
+        # E.g. 'K32' -> Green if bit=1 on K packet; '!K32' -> Red if bit=1 on K packet; '32' -> matches K or C.
         if ctc_int is not None and cid_match is True:
+            _, ctc_bits = self._extract_ctc_rules_int_and_width(parsed_pkt)
+            self._record_ctc_kc_bits(parsed_pkt, ctc_int, ctc_bits)
             primary_eval = self._evaluate_ctc_rule_for_packet(parsed_pkt)
             if self.ctc_rules and primary_eval is None:
                 return
+            self._last_ctc_ts = ts
+            self._status_source = "ctc"
             self._last_packet_ts = ts
             self._packets_received += 1
             raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
@@ -1872,6 +2120,8 @@ class Signal(BaseElement):
 
         if parsed_pkt.get("protocol") == "atcs":
             if cid_match is True or (cid_match is None and ctc_hit):
+                self._last_ctc_ts = ts
+                self._status_source = "ctc"
                 self._last_packet_ts = ts
                 self._packets_received += 1
                 raw_hex = parsed_pkt.get("raw_hex", parsed_pkt.get("_raw_hex_", ""))
@@ -2726,6 +2976,9 @@ class DispatcherEngine:
         self._orig_element_bindings: Dict[str, dict] = {}
         self.last_packets_by_wiu: Dict[int, dict] = {}
         self.last_packets_by_ctc: Dict[str, dict] = {}
+        self.last_packets_by_ctc_kc: Dict[Tuple[str, str], dict] = {}
+        self.ctc_packet_history: Dict[str, deque] = {}
+        self._ctc_history_seq: int = 0
         self.elements: Dict[str, BaseElement] = {}
         self._sorted_element_ids: List[str] = []
 
@@ -4238,36 +4491,131 @@ class DispatcherEngine:
 
     def record_train_sighting(self, elem_id: str, timestamp: float, direction_hint: Optional[str] = None):
         curr_el = self.elements.get(elem_id)
-        if not curr_el: return
-        matched_prev_id, speed_mph, inferred_dir = None, None, direction_hint
+        if not curr_el:
+            return
+        if getattr(curr_el, "_hw_occupied", False) and float(getattr(curr_el, "_hw_occupied_since_ts", 0.0) or 0.0) <= 0.0:
+            curr_el._hw_occupied_since_ts = timestamp
 
-        for prev_id, prev_ts in reversed(self.recent_sightings):
-            if prev_id == elem_id: continue
-            dt_real = timestamp - prev_ts
-            if dt_real <= 0.05 or dt_real > 60.0: continue
-            prev_el = self.elements.get(prev_id)
-            if not prev_el: continue
+        # 1. Topology-first check: see if `elem_id` is continuously connected (directly or through
+        #    aligned turnouts) to any already-occupied track/turnout belonging to an active train.
+        cluster_ids = TrainInferenceManager.get_connected_occupied_cluster(
+            elem_id, self.elements, resolve_jump_fn=self._resolve_through_jump, include_inferred=False
+        )
+        cluster_set = set(cluster_ids) if cluster_ids else {elem_id}
+        other_in_cluster = [cid for cid in cluster_ids if cid != elem_id]
 
-            dist_miles = None
-            curr_gps = self._get_element_gps_any(curr_el)
-            prev_gps = self._get_element_gps_any(prev_el)
-            if curr_gps and prev_gps:
-                dist_miles = self._haversine_miles(prev_gps, curr_gps)
-            elif curr_el.mile_marker is not None and prev_el.mile_marker is not None:
-                dist_miles = abs(curr_el.mile_marker - prev_el.mile_marker)
+        matched_prev_id: Optional[str] = None
+        speed_mph: Optional[float] = None
+        inferred_dir: Optional[str] = direction_hint
+        known_train_name: Optional[str] = None
 
-            if dist_miles and 0.001 <= dist_miles <= 25.0:
-                calc_spd = (dist_miles / dt_real) * 3600.0
-                speed_mph = round(calc_spd, 1) if calc_spd <= 150.0 else None
-                inferred_dir = direction_hint or self._infer_direction_between(prev_el, curr_el) or "E"
+        if other_in_cluster:
+            # Prefer an existing active train already owning any connected block in this cluster
+            for tkey, trn in self.train_scroller.trains.items():
+                if trn.get("is_rf_train") or trn.get("status") not in ("Inferred", "Confirmed"):
+                    continue
+                if (
+                    trn.get("current_element_id") in cluster_set
+                    or trn.get("last_element_id") in cluster_set
+                    or bool(set(trn.get("occupied_elements") or []) & cluster_set)
+                ):
+                    known_train_name = tkey
+                    break
+
+            # Estimate direction & speed from the most recently occupied connected block before this one
+            prev_cands = [
+                (float(getattr(self.elements.get(cid), "_hw_occupied_since_ts", 0.0) or 0.0), cid)
+                for cid in other_in_cluster
+                if cid in self.elements
+            ]
+            prev_cands.sort(reverse=True)
+            adj_graph = TrainInferenceManager._build_aligned_rail_graph(self.elements, self._resolve_through_jump)
+            for prev_ts, prev_id in prev_cands:
+                prev_el = self.elements.get(prev_id)
+                if not prev_el:
+                    continue
+                dt_real = timestamp - prev_ts if prev_ts > 0.0 else 0.0
+                if dt_real > 0.05:
+                    inferred_dir = inferred_dir or TrainInferenceManager._infer_direction_between_elements(
+                        prev_el, curr_el, self.elements, adj_graph
+                    )
+                    speed_mph = TrainInferenceManager._estimate_speed_between_elements(
+                        prev_el, curr_el, dt_real, self.elements
+                    )
+                    matched_prev_id = prev_id
+                    break
+            if matched_prev_id is None and prev_cands:
+                matched_prev_id = prev_cands[0][1]
+
+        # 2. Fallback: correlate with recent sightings ONLY when `prev_id` has already vacated
+        #    AND is physically reachable from `elem_id` along the aligned rail graph (never hijack
+        #    a train that is still occupying a disconnected block or behind a switch lined against it!).
+        if matched_prev_id is None and known_train_name is None:
+            adj_graph = TrainInferenceManager._build_aligned_rail_graph(self.elements, self._resolve_through_jump)
+            # Compute small aligned neighborhood (up to 3 hops, bridging turnouts) around elem_id
+            reachable_from_curr = {elem_id}
+            frontier = {elem_id}
+            for _ in range(3):
+                nxt_frontier = set()
+                for u in frontier:
+                    for v in adj_graph.get(u, ()):
+                        if v not in reachable_from_curr:
+                            reachable_from_curr.add(v)
+                            nxt_frontier.add(v)
+                frontier = nxt_frontier
+                if not frontier:
+                    break
+
+            for prev_id, prev_ts in reversed(self.recent_sightings):
+                if prev_id == elem_id:
+                    continue
+                dt_real = timestamp - prev_ts
+                if dt_real <= 0.05 or dt_real > 60.0:
+                    continue
+                prev_el = self.elements.get(prev_id)
+                if not prev_el:
+                    continue
+                # Never steal a train still occupying a disconnected block, and never jump across unaligned switches
+                if getattr(prev_el, "_hw_occupied", False):
+                    continue
+                if prev_id not in reachable_from_curr:
+                    continue
+
+                dist_miles = None
+                curr_gps = self._get_element_gps_any(curr_el)
+                prev_gps = self._get_element_gps_any(prev_el)
+                if curr_gps and prev_gps:
+                    dist_miles = self._haversine_miles(prev_gps, curr_gps)
+                elif curr_el.mile_marker is not None and prev_el.mile_marker is not None:
+                    dist_miles = abs(curr_el.mile_marker - prev_el.mile_marker)
+
+                inferred_dir = direction_hint or TrainInferenceManager._infer_direction_between_elements(
+                    prev_el, curr_el, self.elements, adj_graph
+                ) or self._infer_direction_between(prev_el, curr_el) or "E"
+                if dist_miles and 0.001 <= dist_miles <= 25.0:
+                    calc_spd = (dist_miles / dt_real) * 3600.0
+                    speed_mph = round(calc_spd, 1) if calc_spd <= 150.0 else None
                 matched_prev_id = prev_id
                 break
 
-        train_name = self.train_scroller.update_or_assign_train(elem_id, curr_el.label, matched_prev_id, speed_mph, inferred_dir, timestamp)
-        if hasattr(curr_el, "_train_name"): curr_el._train_name = train_name
-        if hasattr(curr_el, "_estimated_speed_mph"): curr_el._estimated_speed_mph = speed_mph or self.train_scroller.trains[train_name].get("speed_mph")
-        if hasattr(curr_el, "_train_direction"): curr_el._train_direction = inferred_dir or self.train_scroller.trains[train_name].get("direction")
+        train_name = self.train_scroller.update_or_assign_train(
+            elem_id, curr_el.label, matched_prev_id, speed_mph, inferred_dir, timestamp, known_name=known_train_name
+        )
+        if hasattr(curr_el, "_train_name"):
+            curr_el._train_name = train_name
+        if hasattr(curr_el, "_estimated_speed_mph"):
+            curr_el._estimated_speed_mph = speed_mph or self.train_scroller.trains[train_name].get("speed_mph")
+        if hasattr(curr_el, "_train_direction"):
+            curr_el._train_direction = inferred_dir or self.train_scroller.trains[train_name].get("direction")
         self.recent_sightings.append((elem_id, timestamp))
+
+        # Immediately consolidate any multi-track / turnout-bridged clusters into a single train
+        TrainInferenceManager.consolidate_occupied_track_trains(
+            elements=self.elements,
+            train_tracker=self.train_scroller,
+            now=timestamp,
+            resolve_jump_fn=self._resolve_through_jump,
+        )
 
     def notify_signal_dropped(self, sig: Signal, timestamp: float):
         if not getattr(self, "enable_train_inference", True):
@@ -4493,6 +4841,12 @@ class DispatcherEngine:
         if not force and self.train_logic_interval_sec > 0:
             if (now - self.last_train_eval_ts) < self.train_logic_interval_sec:
                 self.train_scroller.prune_rf_trains(now=now)
+                TrainInferenceManager.consolidate_occupied_track_trains(
+                    elements=self.elements,
+                    train_tracker=self.train_scroller,
+                    now=now,
+                    resolve_jump_fn=self._resolve_through_jump,
+                )
                 self._refresh_green_paths_and_crossings(now)
                 return
         self.last_train_eval_ts = now
@@ -4539,13 +4893,17 @@ class DispatcherEngine:
     def delete_train(self, train_key: str) -> dict:
         deleted = self.train_scroller.delete_train(train_key)
         if deleted:
-            curr_el = self.elements.get(deleted.get("current_element_id"))
-            if curr_el:
-                curr_el._inferred_occupied = False
-                curr_el._train_name = None
-                curr_el._estimated_speed_mph = None
-                curr_el._train_direction = None
-                curr_el._is_dimmed = False
+            clear_ids = set(deleted.get("occupied_elements") or [])
+            if deleted.get("current_element_id"):
+                clear_ids.add(deleted["current_element_id"])
+            for cid in clear_ids:
+                curr_el = self.elements.get(cid)
+                if curr_el:
+                    curr_el._inferred_occupied = False
+                    curr_el._train_name = None
+                    curr_el._estimated_speed_mph = None
+                    curr_el._train_direction = None
+                    curr_el._is_dimmed = False
             self._last_transmitted_signature = self._compute_logical_signature()
             self.broadcast_state(self.get_render_state())
             return {"ok": True, "deleted": deleted.get("train_key")}
@@ -4608,7 +4966,7 @@ class DispatcherEngine:
             parts.append(f"ts:{len(self.train_scroller.trains)}:{ts_summary}")
         if getattr(self, "chat_enabled", False) or (hasattr(self, "chat_panel") and len(self.chat_panel.messages) > 0):
             parts.append(f"chat:{self.chat_panel.total_messages}:{len(self.chat_panel.messages)}")
-        parts.append(f"cache:{len(self.packet_cache)}")
+        parts.append(f"cache:{len(self.packet_cache)}:ctc:{getattr(self, '_ctc_history_seq', 0)}")
         return "|".join(parts)
 
     def ingest_raw_packet(self, raw_packet: Any, meta: Optional[dict] = None) -> dict:
@@ -4881,9 +5239,9 @@ class DispatcherEngine:
             return None
 
         wiu_node_id = parsed_data.get("_node_id_")
-        raw_ctc_id = parsed_data.get("_ctc_id_") or parsed_data.get("ctc_id")
+        raw_ctc_id = parsed_data.get("_ctc_id_") or parsed_data.get("ctc_id") or parsed_data.get("mcp_addr")
         if raw_ctc_id is not None and str(raw_ctc_id).strip():
-            self.last_packets_by_ctc[str(raw_ctc_id).strip().lower()] = parsed_data
+            self._record_ctc_packet_history(parsed_data, str(raw_ctc_id).strip())
         if wiu_node_id is not None:
             try:
                 self.last_packets_by_wiu[int(wiu_node_id)] = parsed_data
@@ -4973,10 +5331,7 @@ class DispatcherEngine:
             el.ctc_rules = "" if v in (None, "") else str(v).strip()
         if el.wiu_id is not None and int(el.wiu_id) in self.last_packets_by_wiu:
             el.process_packet(self.last_packets_by_wiu[int(el.wiu_id)], self)
-        if getattr(el, "ctc_id", "") and getattr(self, "last_packets_by_ctc", None):
-            for c_pkt in list(self.last_packets_by_ctc.values()):
-                if el._ctc_id_matches_packet(c_pkt) is True:
-                    el.process_packet(c_pkt, self)
+        self._replay_ctc_packets_for_element(el)
         self._evaluate_system_logic(time.time())
         self.broadcast_state(self.get_render_state())
 
@@ -4990,12 +5345,89 @@ class DispatcherEngine:
                 setattr(el, k, v)
         if el.wiu_id is not None and int(el.wiu_id) in self.last_packets_by_wiu:
             el.process_packet(self.last_packets_by_wiu[int(el.wiu_id)], self)
-        if getattr(el, "ctc_id", "") and getattr(self, "last_packets_by_ctc", None):
-            for c_pkt in list(self.last_packets_by_ctc.values()):
-                if el._ctc_id_matches_packet(c_pkt) is True:
-                    el.process_packet(c_pkt, self)
+        self._replay_ctc_packets_for_element(el)
         self._evaluate_system_logic(time.time())
         self.broadcast_state(self.get_render_state())
+
+    def _record_ctc_packet_history(self, parsed_data: dict, cid_raw: str):
+        """Records compact per-CTC-ID packet history (last 8 packets) for Viewer CTC Bits panel & replay."""
+        cid_key = cid_raw.lower()
+        self.last_packets_by_ctc[cid_key] = parsed_data
+        kc = extract_packet_kc(parsed_data) or "?"
+        self.last_packets_by_ctc_kc[(cid_key, kc)] = parsed_data
+
+        ctc_int, ctc_bits = BaseElement._extract_ctc_rules_int_and_width(parsed_data)
+        tokens: List[str] = []
+        if ctc_int is None:
+            tokens = sorted(BaseElement._extract_ctc_tokens(parsed_data))[:24]
+            if not tokens and parsed_data.get("protocol") != "atcs":
+                return
+
+        hex_digits = (max(8, int(ctc_bits or 128)) + 3) // 4
+        entry = {
+            "ts": round(float(parsed_data.get("timestamp", time.time())), 3),
+            "kc": kc,
+            "ctc_id": cid_raw,
+            "bits_hex": f"{int(ctc_int):0{hex_digits}X}" if ctc_int is not None else "",
+            "bit_width": int(ctc_bits) if ctc_int is not None else 0,
+            "str_rules": str(parsed_data.get("_str_rules_") or "")[:120],
+            "channel": int(parsed_data.get("channel_meta") or parsed_data.get("Channel") or 0),
+            "rssi": round(float(parsed_data["rssi"]), 1) if parsed_data.get("rssi") is not None else None,
+            "tokens": tokens,
+        }
+        dq = self.ctc_packet_history.get(cid_key)
+        if dq is None:
+            dq = deque(maxlen=8)
+            self.ctc_packet_history[cid_key] = dq
+        dq.append(entry)
+        self._ctc_history_seq = int(getattr(self, "_ctc_history_seq", 0)) + 1
+        if len(self.ctc_packet_history) > 256:
+            oldest_key = next(iter(self.ctc_packet_history))
+            if oldest_key != cid_key:
+                self.ctc_packet_history.pop(oldest_key, None)
+
+    def _replay_ctc_packets_for_element(self, el: BaseElement):
+        """Replays latest K and C packets chronologically for an element after temp override/revert."""
+        el._ctc_k_int = None
+        el._ctc_c_int = None
+        if not getattr(el, "ctc_id", ""):
+            return
+        pool = list(getattr(self, "last_packets_by_ctc_kc", {}).values())
+        if not pool and getattr(self, "last_packets_by_ctc", None):
+            pool = list(self.last_packets_by_ctc.values())
+        matched_pkts = [p for p in pool if el._ctc_id_matches_packet(p) is True]
+        matched_pkts.sort(key=lambda p: float(p.get("timestamp", 0.0) or 0.0))
+        for c_pkt in matched_pkts:
+            el.process_packet(c_pkt, self)
+
+    def _export_ctc_packet_history_for_state(self) -> Dict[str, List[dict]]:
+        """Exports compact recent CTC packet history (up to 6 packets per CTC ID) for Viewer CTC Bits panel."""
+        hist = getattr(self, "ctc_packet_history", None)
+        if not hist:
+            return {}
+        layout_specs = [
+            str(getattr(el, "ctc_id", "")).strip()
+            for el in self.elements.values()
+            if getattr(el, "ctc_id", None) and str(getattr(el, "ctc_id", "")).strip()
+        ]
+        out: Dict[str, List[dict]] = {}
+        unmatched: List[Tuple[float, str, List[dict]]] = []
+        for cid_key, dq in hist.items():
+            if not dq:
+                continue
+            items = list(dq)[-6:]
+            cid_raw = str(items[-1].get("ctc_id") or cid_key)
+            if any(ctc_id_matches(spec, cid_raw) for spec in layout_specs):
+                out[cid_key] = items
+            else:
+                last_ts = float(items[-1].get("ts", 0.0) or 0.0)
+                unmatched.append((last_ts, cid_key, items))
+        # Include up to 24 most recent unmatched CTC IDs so live temp-override tests see recent packets too
+        if unmatched:
+            unmatched.sort(key=lambda x: x[0], reverse=True)
+            for _, cid_key, items in unmatched[:24]:
+                out[cid_key] = items
+        return out
 
 
     # -----------------------------------------------------------------
@@ -5439,6 +5871,9 @@ class DispatcherEngine:
                     self.last_packets_by_wiu[int(wiu_node_id)] = pkt
                 except (ValueError, TypeError):
                     pass
+            raw_ctc_id = pkt.get("_ctc_id_") or pkt.get("ctc_id") or pkt.get("mcp_addr")
+            if raw_ctc_id is not None and str(raw_ctc_id).strip():
+                self._record_ctc_packet_history(pkt, str(raw_ctc_id).strip())
 
             self.address_table.check_and_update_sequence(pkt, self.rrdata)
             self.scroller.add_packet(pkt)
@@ -5698,6 +6133,7 @@ class DispatcherEngine:
             "train_scroller": self.train_scroller.to_state_dict(now=time.time()) if getattr(self, "train_scroller_enabled", False) else None,
             "chat": self.chat_panel.to_state_dict(active_identity=self.get_active_chat_identity()) if (getattr(self, "chat_enabled", False) or len(self.chat_panel.messages) > 0) else None,
             "chat_identity": self.get_active_chat_identity(),
+            "ctc_packet_history": self._export_ctc_packet_history_for_state(),
         }
 
     def broadcast_state(self, state: dict):

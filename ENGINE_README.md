@@ -163,7 +163,7 @@ The Engine host interface ([ApexBOS.220.py](ApexBOS.220.py)) provides a high-den
 The dashboard is structured into nine operational zones:
 
 1. **Pinned Header & Operator Action Bar (Row 0)**:
-   - Version identifier: `ApexBOS.220 Dispatcher Engine Host (v26.1127.08)`.
+   - Version identifier: `ApexBOS.220 Dispatcher Engine Host (v26.1127.14)`.
    - Active layout file: `Layout: arrow_layout.json`.
    - Single-key commands: `'o' Load Banc`, `'i' Src [MCAST]`, `'d' Dedup (0.40s)`, `'p' Scroll [OFF]`, `'r' Reload`, `'R' Parsers`, `'s' Save`, `'b' Broadcast`.
 2. **Network & Engine Endpoints Bar (Row 1, Cyan)**:
@@ -357,6 +357,7 @@ Track circuits, turnouts, and signals support both **220 MHz PTC WIU status word
 - **Direction-Aware CTC Boolean Rule Engine (`ctc_rules`)**:
   - Uses precomputed 128-bit lookup tables, compiled `@lru_cache` AST evaluation, and single-mask bit folding for minimal CPU overhead.
   - Supports boolean operators (`OR`, `AND`, `AND/OR`, `NOT`, parentheses, and commas).
+  - Defaults to **`LSB-LT`** (LSB on the left / transmitted first); prepend optional **`LSB-RT:`** to decode packets whose LSB is on the right (transmitted last).
   - Honors the packet's `_kc_` field: **`K<n>`** bits match only Indication (`K`) packets, **`C<n>`** bits match only Command (`C`) packets, and **bare letterless integers** (e.g. `11`, `25`) match **both `K` and `C`** packets. Packets whose `_kc_` does not match an element's rule preserve the element's previous state cleanly.
   - **Out-of-Service (OOS) Clause (`; Z<expr>`)**: Trailing `; Z...` bit expressions (matched on `K` indication packets only) place a track block into an **Out-of-Service** state rendered in the Viewer as dotted white-and-red track with a centered `OOS` badge.
 - **Live Session-Only Temporary Overrides**: Accepts `SET_TEMP_OVERRIDE` and `REVERT_TEMP_OVERRIDE` requests from Viewer's Element Inspector so operators can test `wiu_id`, bit offsets, `ctc_id`, and `ctc_rules` live without editing the layout JSON on disk.
